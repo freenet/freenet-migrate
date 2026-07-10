@@ -1,0 +1,51 @@
+[package]
+name = "freenet-migrate"
+version = "0.1.0"
+edition = "2021"
+license = "LGPL-3.0-only"
+description = "Reusable contract/delegate upgrade-migration machinery for Freenet dApps"
+repository = "https://github.com/freenet/freenet-migrate"
+readme = "README.md"
+keywords = ["freenet", "migration", "upgrade", "contract", "delegate"]
+categories = ["cryptography::cryptocurrencies", "web-programming"]
+
+[features]
+# Target profiles, mirroring freenet-stdlib's wasm/native split.
+#
+# * `contract`  — a contract WASM crate (wasm, no networking). Exposes the
+#   contract carry-forward surface.
+# * `delegate`  — a delegate WASM crate (wasm, no networking). Additionally
+#   enables the `SecretStore` bridge over `freenet_stdlib::prelude::DelegateCtx`
+#   (which is only linkable on `wasm` targets, so it is double-gated below).
+# * `ui`        — native + wasm UI / release tooling. Exposes the backward-probe
+#   and signing helpers.
+#
+# The pure carry-forward / probe / successor / delegate-handler logic is
+# available in every profile; the features select dependency wiring and the
+# wasm-only `DelegateCtx` bridge, not the API surface, so the whole crate is
+# testable natively.
+default = ["ui"]
+contract = []
+delegate = []
+ui = []
+
+[dependencies]
+# Pin 0.8.2: DelegateCtx::list_secrets (used by the delegate SecretStore bridge)
+# does not exist before 0.8.2, so a lockfile resolving 0.8.1 would fail the
+# `--features delegate --target wasm32` build.
+freenet-stdlib = { version = "0.8.2", default-features = false }
+freenet-scaffold = "0.2.2"
+serde = { version = "1", features = ["derive"] }
+serde_with = { version = "3", default-features = false, features = ["macros", "alloc"] }
+ciborium = "0.2.2"
+blake3 = "1"
+bs58 = "0.5"
+ed25519-dalek = { version = "2.1.1", default-features = false, features = ["alloc"] }
+
+[dev-dependencies]
+# The real stdlib key-derivation functions, used to generate known test vectors
+# that our from-scratch reconstruction must reproduce. Kept in lockstep with the
+# pinned normal dependency above.
+freenet-stdlib = { version = "0.8.2", default-features = false }
+# The build-side hashing, cross-checked against stdlib + our runtime reconstruction.
+freenet-migrate-build = { path = "../freenet-migrate-build" }

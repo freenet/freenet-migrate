@@ -1,0 +1,16 @@
+[package]
+name = "freenet-migrate-build"
+version = "0.1.0"
+edition = "2021"
+license = "LGPL-3.0-only"
+description = "Build-time codegen and CI hash-guard for the freenet-migrate upgrade-migration crate"
+repository = "https://github.com/freenet/freenet-migrate"
+readme = "README.md"
+keywords = ["freenet", "migration", "upgrade", "build", "codegen"]
+categories = ["development-tools::build-utils"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+blake3 = "1"
+bs58 = "0.5"

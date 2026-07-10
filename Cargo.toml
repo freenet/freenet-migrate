@@ -1,0 +1,9 @@
+[workspace]
+members = ["freenet-migrate", "freenet-migrate-build"]
+resolver = "2"
+
+# The two crates are independent: `freenet-migrate-build` is a *build-dependency*
+# for consumers (their `build.rs`), not a runtime dependency of `freenet-migrate`.
+# `freenet-migrate` depends on it only as a dev-dependency, to cross-check that
+# the build-side hashing, the runtime reconstruction, and stdlib's real key
+# derivation all agree.
