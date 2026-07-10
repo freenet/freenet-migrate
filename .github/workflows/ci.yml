@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Pinned stable toolchain: bump deliberately so clippy's lint set is stable.
+  RUST_TOOLCHAIN: "1.96.0"
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+
+  test:
+    name: test (native)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --all-features
+
+  wasm:
+    name: wasm build (contract / delegate / ui)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      # The WASM target profiles must all compile; the `delegate` build also
+      # exercises the wasm-only `DelegateCtx` SecretStore bridge.
+      - name: contract feature
+        run: cargo build -p freenet-migrate --no-default-features --features contract --target wasm32-unknown-unknown
+      - name: delegate feature
+        run: cargo build -p freenet-migrate --no-default-features --features delegate --target wasm32-unknown-unknown
+      - name: ui feature
+        run: cargo build -p freenet-migrate --no-default-features --features ui --target wasm32-unknown-unknown
