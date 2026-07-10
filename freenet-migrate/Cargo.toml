@@ -30,7 +30,10 @@ delegate = []
 ui = []
 
 [dependencies]
-freenet-stdlib = { version = "0.8", default-features = false }
+# Pin 0.8.2: DelegateCtx::list_secrets (used by the delegate SecretStore bridge)
+# does not exist before 0.8.2, so a lockfile resolving 0.8.1 would fail the
+# `--features delegate --target wasm32` build.
+freenet-stdlib = { version = "0.8.2", default-features = false }
 freenet-scaffold = "0.2.2"
 serde = { version = "1", features = ["derive"] }
 serde_with = { version = "3", default-features = false, features = ["macros", "alloc"] }
@@ -41,7 +44,8 @@ ed25519-dalek = { version = "2.1.1", default-features = false, features = ["allo
 
 [dev-dependencies]
 # The real stdlib key-derivation functions, used to generate known test vectors
-# that our from-scratch reconstruction must reproduce.
-freenet-stdlib = { version = "0.8", default-features = false }
+# that our from-scratch reconstruction must reproduce. Kept in lockstep with the
+# pinned normal dependency above.
+freenet-stdlib = { version = "0.8.2", default-features = false }
 # The build-side hashing, cross-checked against stdlib + our runtime reconstruction.
 freenet-migrate-build = { path = "../freenet-migrate-build" }

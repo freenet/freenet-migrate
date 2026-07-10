@@ -44,7 +44,9 @@ pub struct SuccessorPointer {
     /// Monotonic generation of the successor. Must strictly exceed the current
     /// generation for a client to follow the pointer.
     pub generation: u32,
-    /// Ed25519 signature over `successor_code_hash ‖ generation_le ‖ app_id`.
+    /// Ed25519 signature over
+    /// `SIGNING_DOMAIN ‖ successor_code_hash ‖ generation_le ‖ app_id`, where
+    /// `SIGNING_DOMAIN` is the domain-separation tag `b"freenet-migrate/successor-v1"`.
     #[serde_as(as = "[_; 64]")]
     pub sig: [u8; 64],
 }
@@ -52,6 +54,11 @@ pub struct SuccessorPointer {
 impl SuccessorPointer {
     /// Verify **only the signature** against the app's release public key and
     /// `app_id`.
+    ///
+    /// The verified message is
+    /// `SIGNING_DOMAIN ‖ successor_code_hash ‖ generation_le ‖ app_id`, with the
+    /// domain-separation tag `b"freenet-migrate/successor-v1"` prepended (an
+    /// independent verifier must include it, or every signature fails).
     ///
     /// `app_id` binds the pointer to a specific application (e.g. the app's
     /// stable contract instance id bytes or a domain string) so a signature

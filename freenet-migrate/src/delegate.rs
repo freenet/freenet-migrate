@@ -972,6 +972,93 @@ mod tests {
     }
 
     #[test]
+    fn import_phase1_wip_marker_write_failure_imports_nothing() {
+        // The phase-1 branch: if the in-progress marker itself can't be written
+        // we cannot record migration state, so nothing is imported and a partial
+        // import is surfaced (a retry re-runs from scratch).
+        let exported = ExportedSecrets {
+            source_generation: 4,
+            secrets: vec![(b"a".to_vec(), b"va".to_vec())],
+        };
+        let mut v2 = MemStore::default();
+        v2.fail_writes_to(&wip_marker(4)); // storage error on the intent marker
+
+        let err = import_secrets_once(&mut v2, &exported, 5).unwrap_err();
+        assert_eq!(
+            err,
+            MigrateError::PartialImport {
+                generation: 4,
+                imported: 0,
+                skipped: 0,
+                failed: 0,
+            }
+        );
+        assert!(
+            v2.list_secrets(b"").is_empty(),
+            "no secret and no marker may be written when phase 1 fails"
+        );
+
+        // Once the store recovers, a retry runs the full import to completion.
+        v2.stop_failing();
+        let retry = import_secrets_once(&mut v2, &exported, 5).unwrap();
+        assert_eq!(
+            retry,
+            ImportOutcome::Imported {
+                generation: 4,
+                imported: 1,
+                skipped: 0,
+            }
+        );
+        assert_eq!(v2.get_secret(b"a").unwrap(), b"va");
+        assert!(v2.has_secret(&done_marker(4)));
+    }
+
+    #[test]
+    fn import_done_marker_write_failure_withholds_completion() {
+        // The phase-2 branch with `failed == 0`: every secret wrote fine, but the
+        // completion marker write itself fails, so completion must be WITHHELD
+        // (the in-progress marker stays, a retry completes) — never reported as
+        // a successful import.
+        let exported = ExportedSecrets {
+            source_generation: 4,
+            secrets: vec![(b"a".to_vec(), b"va".to_vec())],
+        };
+        let mut v2 = MemStore::default();
+        v2.fail_writes_to(&done_marker(4)); // secrets + wip marker write; done marker fails
+
+        let err = import_secrets_once(&mut v2, &exported, 5).unwrap_err();
+        assert_eq!(
+            err,
+            MigrateError::PartialImport {
+                generation: 4,
+                imported: 1,
+                skipped: 0,
+                failed: 0,
+            }
+        );
+        assert_eq!(v2.get_secret(b"a").unwrap(), b"va", "the secret did land");
+        assert!(v2.has_secret(&wip_marker(4)), "in-progress marker remains");
+        assert!(
+            !v2.has_secret(&done_marker(4)),
+            "completion must be withheld when the done-marker write fails"
+        );
+
+        // Retry after recovery: the secret is already present (skipped) and the
+        // completion marker is now written.
+        v2.stop_failing();
+        let retry = import_secrets_once(&mut v2, &exported, 5).unwrap();
+        assert_eq!(
+            retry,
+            ImportOutcome::Imported {
+                generation: 4,
+                imported: 0,
+                skipped: 1,
+            }
+        );
+        assert!(v2.has_secret(&done_marker(4)));
+    }
+
+    #[test]
     fn import_rejects_implausible_source_generation() {
         // Finding 10: a source_generation >= the successor's own generation is
         // implausible and must be refused, so it can't stamp a poisoning marker.
