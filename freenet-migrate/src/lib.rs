@@ -26,8 +26,14 @@
 //! | Precondition | Enforcement |
 //! |---|---|
 //! | mergeable | the compile-time [`CarryForward`]`: `[`ComposableState`](freenet_scaffold::ComposableState) bound |
-//! | self-authorizing | the forced fail-closed `verify()` after merge; the un-`Default`, `#[must_use]` [`PermissiveValidatorAck`] opt-out |
+//! | self-authorizing | the crate's carry-forward *path* forces a fail-closed, atomic `verify()` after merge; the un-`Default`, `#[must_use]` [`PermissiveValidatorAck`] opt-out |
 //! | signing identity | [`ReleaseSigner::from_key`] is the only constructor |
+//!
+//! The self-authorizing guarantee is about the crate's carry-forward *path*:
+//! `ComposableState::merge` is itself a public trait method, so the crate cannot
+//! make skipping `verify()` physically impossible — it guarantees that
+//! [`CarryForward::carry_forward`] always runs it, and that the only in-crate
+//! bypass is the loudly-named [`PermissiveValidatorAck`].
 //!
 //! ## Features
 //!
@@ -51,8 +57,9 @@ pub use contract::{
 };
 pub use delegate::{
     handle_export_request, import_secrets_once, predecessor_delegate_keys,
-    predecessor_delegate_keys_checked, ExportRequest, ExportedSecrets, ImportOutcome, OriginPolicy,
-    ReRunOldWasm, SecretStore, SecretTransport,
+    predecessor_delegate_keys_checked, ExportRequest, ExportScope, ExportedSecrets, ImportOutcome,
+    OriginPolicy, ReRunOldWasm, SecretStore, SecretTransport, SingleAppDelegateAck,
+    HOST_ENUMERATION_CAP,
 };
 pub use error::MigrateError;
 pub use lineage::{ContractLineageEntry, DelegateLineageEntry, Lineage};

@@ -49,12 +49,20 @@ one into something the compiler or the API enforces, rather than a footnote:
 | Precondition | What it means | How it's enforced |
 |---|---|---|
 | **mergeable** | the state has a defined fold, so two versions can be combined deterministically | the compile-time `CarryForward: `[`ComposableState`](https://docs.rs/freenet-scaffold) bound — a state with no fold can't call `carry_forward` |
-| **self-authorizing** | the merged state must pass the successor's own validator; a permissionless PUT can't smuggle in bad state | a **fail-closed** `verify()` gate forced after every `merge()`; the opt-out (`carry_forward_unverified`) needs a `#[must_use]`, un-`Default` `PermissiveValidatorAck` whose only constructor is loudly named |
+| **self-authorizing** | the merged state must pass the successor's own validator; a permissionless PUT can't smuggle in bad state | the crate's carry-forward **path** enforces a **fail-closed** `verify()` after `merge()`, applied atomically (a failed verify leaves your state unchanged); the opt-out (`carry_forward_unverified`) needs a `#[must_use]`, un-`Default` `PermissiveValidatorAck` whose only constructor is loudly named |
 | **signing identity** | a successor release is vouched for by the app author, not anyone who can build WASM | `ReleaseSigner::from_key(SigningKey)` is the *only* constructor for the author-signed `SuccessorPointer` |
 
 If your state is not a `ComposableState` (not mergeable) or your contract has no
 meaningful validator (not self-authorizing), carry-forward is **not** safe and
 this crate will not paper over that.
+
+> **Scope of the verify guarantee.** `ComposableState::merge` is itself a
+> *public* trait method, so this crate cannot make skipping `verify()`
+> physically impossible — a consumer can always call `merge` directly. What it
+> guarantees is that the crate's own carry-forward *path* (`carry_forward`)
+> always runs the fail-closed `verify()`, and that the only in-crate way to skip
+> it is the loudly-named `PermissiveValidatorAck` opt-out. Stay on the
+> carry-forward path and the gate is unavoidable.
 
 ## Usage sketch: v1 → v2
 
@@ -127,34 +135,53 @@ the successor:
 use freenet_migrate::ReleaseSigner;
 
 let signer  = ReleaseSigner::from_key(app_signing_key); // the ONLY constructor
-let pointer = signer.sign(successor_code_hash, generation, app_id);
-// clients embed `signer.public_key()` and verify (returns Result, fail-closed):
-pointer.verify(&signer.public_key(), app_id)?;
+// `sign` returns Result (rejects an empty app_id); pointers carry a
+// domain-separated, app-bound signature.
+let pointer = signer.sign(successor_code_hash, generation, app_id)?;
+// The accept path (deciding whether to FOLLOW a pointer) must check BOTH the
+// signature and the anti-rollback ordering, so use verify_and_check_supersedes,
+// not a bare verify() (which checks the signature only):
+pointer.verify_and_check_supersedes(&signer.public_key(), app_id, current_generation)?;
 ```
 
 ### 3. Delegate secret carry-forward (runtime)
 
-The export enumerates **every** secret generically via
-`SecretStore::list_secrets(b"")`, which structurally eliminates the per-type
-omission that cost Delta its data — copying all secrets by construction can't
-miss a type. The v2 side imports exactly once, guarded by a `"migrated:<gen>"`
+The export enumerates secrets *generically* via `SecretStore::list_secrets`
+instead of a hand-maintained per-type fan-out, removing the per-**type** omission
+that cost Delta its data. It is **not** an unconditional "copy every secret": the
+host caps key enumeration per scope (`HOST_ENUMERATION_CAP`, 4096) and truncates
+silently beyond it, so the export **detects** cap saturation and refuses with
+`TruncatedExport` rather than shipping a partial set (which would then be locked
+in by the completion marker). You choose an `ExportScope`: a key prefix (safe on a
+delegate shared by multiple web-apps), or the whole scope via a loudly-named
+single-app acknowledgement. The v2 side imports once, guarded by a two-phase
 anti-resurrection marker (idempotent, never clobbers existing keys):
 
 ```rust,ignore
-use freenet_migrate::{handle_export_request, import_secrets_once, OriginPolicy};
+use freenet_migrate::{
+    handle_export_request, import_secrets_once, ExportScope, OriginPolicy,
+    SingleAppDelegateAck,
+};
 
-// v1 delegate (old WASM): authorize the caller, export all secrets.
+// v1 delegate (old WASM): authorize the caller (origin is Option<_>, `None`
+// fails closed), export the requesting app's slice.
 let out = handle_export_request(
     &ctx,                                 // impl SecretStore
-    &origin,
+    origin.as_ref(),                      // Option<&MessageOrigin> from `process`
     &OriginPolicy::SameWebApp(app_id),    // safe default: same web-app only
+    &ExportScope::Prefix(my_key_prefix),  // isolate this app's slice…
+    // …or, on a delegate you certify serves ONE web-app:
+    // &ExportScope::EntireDelegate(
+    //     SingleAppDelegateAck::i_certify_this_delegate_serves_a_single_web_app()),
     &export_request,
 )?;
 
-// v2 delegate (new WASM): import exactly once.
-match import_secrets_once(&mut ctx, &exported)? {
+// v2 delegate (new WASM): import once. `successor_generation` is this delegate's
+// own generation; the export's source_generation must be strictly older.
+match import_secrets_once(&mut ctx, &exported, successor_generation)? {
     ImportOutcome::Imported { imported, skipped, .. } => { /* wrote `imported` */ }
     ImportOutcome::AlreadyMigrated { .. }             => { /* no-op */ }
+    ImportOutcome::StaleGeneration { .. }             => { /* older gen refused */ }
 }
 ```
 
@@ -163,6 +190,24 @@ match import_secrets_once(&mut ctx, &exported)? {
 > `TransportUnavailable`. Today apps carry the export app-side via
 > `DelegateRequest::ApplicationMessages` round-trips (as River/Delta do); the
 > stub is the seam a future node-mediated transport drops into with no API break.
+
+### Known limitations
+
+- **`ExportedSecrets` is not authenticated.** Its `source_generation` is echoed
+  from the request and travels in an app-level envelope the crate does not sign.
+  `import_secrets_once` bounds it against the successor's own generation so an
+  injected export cannot poison the completion marker for an implausibly-high
+  generation, but full authentication (signing the payload) is future work —
+  tracked in [freenet-core#2776](https://github.com/freenet/freenet-core/issues/2776).
+- **Pre-registry secret keys.** Secrets written before the host's key-enumeration
+  registry (freenet-core #4355) are not returned by `list_secrets` until
+  rewritten, and this is undetectable from inside the delegate. Migrating off
+  such a delegate must rewrite those keys first or carry them app-side.
+- **Interrupted-then-retried import.** The two-phase marker fully blocks
+  resurrection after a *completed* migration, but a migration interrupted mid-way
+  and then retried re-imports the still-missing keys and cannot distinguish "never
+  imported" from "imported then user-deleted", so a key deleted during that narrow
+  window can be resurrected by the completing retry.
 
 ## Building & testing
 

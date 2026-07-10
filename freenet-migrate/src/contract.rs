@@ -50,17 +50,31 @@ pub trait CarryForward: ComposableState + Serialize + DeserializeOwned {
     /// Fold `predecessor` into `self`, then re-validate `self` against its own
     /// validator. The `verify()` failure path is [`MigrateError::Verify`] — the
     /// carry-forward is rejected rather than a bad state adopted.
+    ///
+    /// **Atomic on `self`.** The fold and verify run against a candidate *copy*
+    /// (cloned via serde, which the trait bounds guarantee); `self` is mutated
+    /// only after `verify()` passes. On **any** error path — merge failure,
+    /// verify failure, or a serialization error building the candidate — `self`
+    /// is left byte-for-byte unchanged. So a caller that ignores the `Result`
+    /// still holds its original state and cannot accidentally PUT a half-merged
+    /// or invalid one.
     fn carry_forward(
         &mut self,
         predecessor: &Self,
         parent: &Self::ParentState,
         params: &Self::Parameters,
     ) -> Result<(), MigrateError> {
-        self.merge(parent, params, predecessor)
+        let mut candidate = serde_clone(self)?;
+        candidate
+            .merge(parent, params, predecessor)
             .map_err(MigrateError::Merge)?;
         // Self-authorizing gate, fail-closed: the successor's validator is the
         // only integrity check on a permissionless carry-forward PUT.
-        self.verify(parent, params).map_err(MigrateError::Verify)?;
+        candidate
+            .verify(parent, params)
+            .map_err(MigrateError::Verify)?;
+        // Commit only after verify passed — `self` was untouched until here.
+        *self = candidate;
         Ok(())
     }
 
@@ -71,6 +85,8 @@ pub trait CarryForward: ComposableState + Serialize + DeserializeOwned {
     ///
     /// Only correct for a contract whose validator is *known* permissive and
     /// which has some other out-of-band authorization for the incoming state.
+    /// Atomic on `self` in the same sense as [`carry_forward`](Self::carry_forward):
+    /// a merge failure leaves `self` unchanged.
     fn carry_forward_unverified(
         &mut self,
         predecessor: &Self,
@@ -78,12 +94,27 @@ pub trait CarryForward: ComposableState + Serialize + DeserializeOwned {
         params: &Self::Parameters,
         _ack: PermissiveValidatorAck,
     ) -> Result<(), MigrateError> {
-        self.merge(parent, params, predecessor)
-            .map_err(MigrateError::Merge)
+        let mut candidate = serde_clone(self)?;
+        candidate
+            .merge(parent, params, predecessor)
+            .map_err(MigrateError::Merge)?;
+        *self = candidate;
+        Ok(())
     }
 }
 
 impl<T: ComposableState + Serialize + DeserializeOwned> CarryForward for T {}
+
+/// Clone a state through serde (CBOR), so carry-forward can fold+verify a
+/// candidate copy and commit to `self` only on success. Uses only the
+/// `Serialize + DeserializeOwned` bounds `CarryForward` already requires (no
+/// added `Clone` bound). A serialization failure surfaces as
+/// [`MigrateError::Codec`], leaving `self` untouched.
+fn serde_clone<T: Serialize + DeserializeOwned>(value: &T) -> Result<T, MigrateError> {
+    let mut buf = Vec::new();
+    ciborium::ser::into_writer(value, &mut buf).map_err(|e| MigrateError::Codec(e.to_string()))?;
+    ciborium::de::from_reader(&buf[..]).map_err(|e| MigrateError::Codec(e.to_string()))
+}
 
 /// Opt-out token for [`CarryForward::carry_forward_unverified`].
 ///
@@ -304,6 +335,22 @@ mod tests {
         assert!(
             matches!(err, MigrateError::Verify(_)),
             "merge that fails verify must be refused, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn carry_forward_leaves_self_unchanged_on_verify_failure() {
+        // Atomicity regression (finding 1a): on a verify() failure `self` must be
+        // byte-for-byte unchanged, so a caller that ignores the Result never
+        // holds (and never PUTs) the invalid merged state.
+        let mut new_state = Counter { value: 5 };
+        // merge sets value := predecessor.value (-3), which then fails verify.
+        let predecessor = Counter { value: -3 };
+        let err = new_state.carry_forward(&predecessor, &(), &()).unwrap_err();
+        assert!(matches!(err, MigrateError::Verify(_)));
+        assert_eq!(
+            new_state.value, 5,
+            "self must retain its pre-merge value when verify() rejects the fold"
         );
     }
 

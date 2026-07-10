@@ -32,8 +32,52 @@ pub enum MigrateError {
         current: u32,
     },
     /// The requesting origin is not authorized by the configured
-    /// [`crate::delegate::OriginPolicy`].
+    /// [`crate::delegate::OriginPolicy`]. Also returned (fail-closed) when the
+    /// runtime supplied no origin at all (`origin: None`).
     UnauthorizedOrigin,
+    /// The host's per-scope key enumeration was truncated at its cap
+    /// (freenet-core `MAX_REGISTERED_KEYS_PER_SCOPE`), so an export over the
+    /// whole scope could silently omit keys. Refused rather than exported —
+    /// exporting a truncated set and then writing the completion marker would
+    /// permanently block a corrected re-import. See
+    /// [`crate::delegate::HOST_ENUMERATION_CAP`].
+    TruncatedExport {
+        /// Number of keys the host returned (>= `cap`).
+        returned: usize,
+        /// The host enumeration cap that was hit.
+        cap: usize,
+    },
+    /// A secret import did not fully complete: at least one `set_secret` write
+    /// failed (or the completion marker could not be written). The completion
+    /// marker was deliberately NOT written, so the migration is left in its
+    /// in-progress state and a retry re-runs it. Never counts a failed write as
+    /// imported (the bug this replaced silently lost the secret).
+    PartialImport {
+        /// Generation being imported from.
+        generation: u32,
+        /// Secrets successfully written on this attempt.
+        imported: usize,
+        /// Secrets skipped because the successor already held that key.
+        skipped: usize,
+        /// Secrets whose write failed.
+        failed: usize,
+    },
+    /// An [`crate::delegate::ExportedSecrets`] carried a `source_generation`
+    /// that is not a plausible predecessor of the importing successor (>= the
+    /// successor's own generation). `source_generation` is echoed from the
+    /// (unauthenticated) request, so bounding it stops an injected export from
+    /// stamping a completion marker for an implausibly-high generation and
+    /// thereby blocking every real future migration via the monotonicity guard.
+    ImplausibleGeneration {
+        /// The generation the export claimed to be migrating from.
+        source: u32,
+        /// The successor's own generation (the exclusive upper bound).
+        ceiling: u32,
+    },
+    /// A [`crate::SuccessorPointer`] was signed or verified with an empty
+    /// `app_id`. Refused fail-closed: an empty binding lets a signature be
+    /// replayed across apps that share a release key.
+    EmptyAppId,
     /// The secret transport could not produce the predecessor's secrets.
     /// [`crate::delegate::ReRunOldWasm`] returns this today (see its docs).
     TransportUnavailable(String),
@@ -60,6 +104,30 @@ impl fmt::Display for MigrateError {
             ),
             MigrateError::UnauthorizedOrigin => {
                 write!(f, "export request origin is not authorized by policy")
+            }
+            MigrateError::TruncatedExport { returned, cap } => write!(
+                f,
+                "secret enumeration truncated at host cap ({returned} keys returned, cap {cap}); \
+                 refusing to export a possibly-incomplete secret set"
+            ),
+            MigrateError::PartialImport {
+                generation,
+                imported,
+                skipped,
+                failed,
+            } => write!(
+                f,
+                "secret import from generation {generation} did not complete \
+                 (imported {imported}, skipped {skipped}, failed {failed}); \
+                 completion marker withheld so a retry re-runs the import"
+            ),
+            MigrateError::ImplausibleGeneration { source, ceiling } => write!(
+                f,
+                "exported source_generation {source} is not a plausible predecessor \
+                 (must be < successor generation {ceiling})"
+            ),
+            MigrateError::EmptyAppId => {
+                write!(f, "successor pointer app_id must not be empty")
             }
             MigrateError::TransportUnavailable(e) => {
                 write!(f, "secret transport unavailable: {e}")

@@ -18,9 +18,17 @@ use serde_with::serde_as;
 
 use crate::error::MigrateError;
 
-/// The bytes signed by a [`ReleaseSigner`]: `successor_code_hash ‖ generation_le ‖ app_id`.
+/// Domain-separation tag prefixed to every signed message, so a
+/// `freenet-migrate` successor-pointer signature can never be confused with a
+/// signature the same release key produced for another purpose (or a future
+/// message layout). Bump the version suffix if the signed layout changes.
+const SIGNING_DOMAIN: &[u8] = b"freenet-migrate/successor-v1";
+
+/// The bytes signed by a [`ReleaseSigner`]:
+/// `DOMAIN ‖ successor_code_hash ‖ generation_le ‖ app_id`.
 fn signing_message(successor_code_hash: &[u8; 32], generation: u32, app_id: &[u8]) -> Vec<u8> {
-    let mut m = Vec::with_capacity(32 + 4 + app_id.len());
+    let mut m = Vec::with_capacity(SIGNING_DOMAIN.len() + 32 + 4 + app_id.len());
+    m.extend_from_slice(SIGNING_DOMAIN);
     m.extend_from_slice(successor_code_hash);
     m.extend_from_slice(&generation.to_le_bytes());
     m.extend_from_slice(app_id);
@@ -42,12 +50,28 @@ pub struct SuccessorPointer {
 }
 
 impl SuccessorPointer {
-    /// Verify the signature against the app's release public key and `app_id`.
+    /// Verify **only the signature** against the app's release public key and
+    /// `app_id`.
     ///
     /// `app_id` binds the pointer to a specific application (e.g. the app's
     /// stable contract instance id bytes or a domain string) so a signature
-    /// cannot be replayed across apps sharing a release key.
+    /// cannot be replayed across apps sharing a release key; an empty `app_id`
+    /// is rejected ([`MigrateError::EmptyAppId`]) because it provides no binding.
+    ///
+    /// # ⚠ Not sufficient for the accept path
+    ///
+    /// This checks authenticity but **not** anti-rollback ordering. A validly
+    /// signed *older*-generation pointer passes `verify`, so a peer that decides
+    /// whether to *follow* a pointer using `verify` alone can be rolled back to a
+    /// superseded generation. For the accept path use
+    /// [`verify_and_check_supersedes`](Self::verify_and_check_supersedes), which
+    /// also enforces `generation` monotonicity. Reach for bare `verify` only when
+    /// you are not making an accept decision (e.g. displaying or relaying a
+    /// pointer) and will check ordering separately.
     pub fn verify(&self, release_pk: &VerifyingKey, app_id: &[u8]) -> Result<(), MigrateError> {
+        if app_id.is_empty() {
+            return Err(MigrateError::EmptyAppId);
+        }
         let msg = signing_message(&self.successor_code_hash, self.generation, app_id);
         let sig = Signature::from_bytes(&self.sig);
         release_pk
@@ -57,11 +81,21 @@ impl SuccessorPointer {
 
     /// Whether this pointer's generation strictly supersedes `current_generation`.
     /// Bounds backward replay only.
+    ///
+    /// This is an ordering check with **no** authenticity check; on the accept
+    /// path use [`verify_and_check_supersedes`](Self::verify_and_check_supersedes)
+    /// rather than pairing this with a bare [`verify`](Self::verify) by hand.
     pub fn supersedes(&self, current_generation: u32) -> bool {
         self.generation > current_generation
     }
 
     /// Verify the signature **and** the anti-rollback ordering in one call.
+    ///
+    /// This is **the** method a peer should use to decide whether to follow a
+    /// successor pointer: it is the only path that enforces both authenticity
+    /// (signature) and monotonicity (anti-rollback) together. Prefer it over
+    /// composing [`verify`](Self::verify) and [`supersedes`](Self::supersedes)
+    /// by hand, where forgetting the ordering check silently reopens rollback.
     pub fn verify_and_check_supersedes(
         &self,
         release_pk: &VerifyingKey,
@@ -98,19 +132,26 @@ impl ReleaseSigner {
     }
 
     /// Sign a pointer to `successor_code_hash` at `generation`, bound to `app_id`.
+    ///
+    /// `app_id` must be non-empty ([`MigrateError::EmptyAppId`]) so the pointer
+    /// is bound to a specific application and cannot be replayed across apps that
+    /// share this release key.
     pub fn sign(
         &self,
         successor_code_hash: [u8; 32],
         generation: u32,
         app_id: &[u8],
-    ) -> SuccessorPointer {
+    ) -> Result<SuccessorPointer, MigrateError> {
+        if app_id.is_empty() {
+            return Err(MigrateError::EmptyAppId);
+        }
         let msg = signing_message(&successor_code_hash, generation, app_id);
         let sig: Signature = self.key.sign(&msg);
-        SuccessorPointer {
+        Ok(SuccessorPointer {
             successor_code_hash,
             generation,
             sig: sig.to_bytes(),
-        }
+        })
     }
 }
 
@@ -127,15 +168,32 @@ mod tests {
     fn sign_then_verify_roundtrips() {
         let s = signer(42);
         let pk = s.public_key();
-        let ptr = s.sign([9u8; 32], 5, b"app-1");
+        let ptr = s.sign([9u8; 32], 5, b"app-1").unwrap();
         ptr.verify(&pk, b"app-1").expect("valid signature verifies");
+    }
+
+    #[test]
+    fn empty_app_id_is_rejected_on_sign_and_verify() {
+        let s = signer(42);
+        let pk = s.public_key();
+        // Signing with an empty app_id is refused (no cross-app binding).
+        assert!(matches!(
+            s.sign([9u8; 32], 5, b"").unwrap_err(),
+            MigrateError::EmptyAppId
+        ));
+        // And verifying against an empty app_id is refused fail-closed.
+        let ptr = s.sign([9u8; 32], 5, b"app-1").unwrap();
+        assert!(matches!(
+            ptr.verify(&pk, b"").unwrap_err(),
+            MigrateError::EmptyAppId
+        ));
     }
 
     #[test]
     fn verify_rejects_wrong_app_id_wrong_key_and_tamper() {
         let s = signer(42);
         let pk = s.public_key();
-        let ptr = s.sign([9u8; 32], 5, b"app-1");
+        let ptr = s.sign([9u8; 32], 5, b"app-1").unwrap();
 
         assert!(matches!(
             ptr.verify(&pk, b"app-2").unwrap_err(),
@@ -164,7 +222,7 @@ mod tests {
 
     #[test]
     fn supersedes_is_strictly_monotonic() {
-        let ptr = signer(7).sign([0u8; 32], 5, b"a");
+        let ptr = signer(7).sign([0u8; 32], 5, b"a").unwrap();
         assert!(ptr.supersedes(4));
         assert!(!ptr.supersedes(5));
         assert!(!ptr.supersedes(6));
@@ -174,7 +232,7 @@ mod tests {
     fn verify_and_check_supersedes_enforces_ordering() {
         let s = signer(7);
         let pk = s.public_key();
-        let ptr = s.sign([0u8; 32], 5, b"a");
+        let ptr = s.sign([0u8; 32], 5, b"a").unwrap();
 
         ptr.verify_and_check_supersedes(&pk, b"a", 4).unwrap();
         let err = ptr.verify_and_check_supersedes(&pk, b"a", 5).unwrap_err();
@@ -189,7 +247,7 @@ mod tests {
 
     #[test]
     fn serde_roundtrip_preserves_the_64_byte_signature() {
-        let ptr = signer(3).sign([255u8; 32], 9, b"round-trip");
+        let ptr = signer(3).sign([255u8; 32], 9, b"round-trip").unwrap();
         let mut bytes = Vec::new();
         ciborium::ser::into_writer(&ptr, &mut bytes).unwrap();
         let back: SuccessorPointer = ciborium::de::from_reader(&bytes[..]).unwrap();
