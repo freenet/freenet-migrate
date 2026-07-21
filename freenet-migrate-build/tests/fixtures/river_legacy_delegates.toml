@@ -1,0 +1,204 @@
+# Verbatim copy of freenet/river's legacy_delegates.toml (2026-07-21), plus
+# `irregular_key = true` on V1 — the one edit River's adoption PR makes
+# (V1's recorded key predates the standard derivation; V2+ all derive).
+
+# Legacy Delegate Registry
+#
+# Single source of truth for all previous delegate versions.
+# When the delegate WASM changes, add the OLD delegate's keys here
+# so the migration system can transfer user data to the new delegate.
+#
+# Fields:
+#   code_hash    = BLAKE3 hash of the raw delegate WASM bytes (hex)
+#   delegate_key = BLAKE3(code_hash_bytes) — the delegate key (hex)
+#
+# To add a new entry:  cargo make add-migration
+# To validate entries: cargo make check-migration
+# To sync all WASMs:   cargo make sync-wasm
+
+[[entry]]
+version = "V1"
+description = "Before signing API was added"
+date = "2026-01-15"
+delegate_key = "1a9330820e806cda54eca7dab22b84f20cfa793ebe61a2615312cc6e6ebcfff6"
+code_hash = "783996bde3bc2235affec9deb8a0f7e9d21fa131dcf003000bb03f467db0f831"
+irregular_key = true
+
+[[entry]]
+version = "V2"
+description = "After scaffold 0.2.2 update with relaxed verify"
+date = "2026-02-11"
+delegate_key = "e3ad5c5b1a821089536be84d674329b37f46d2fba3e7026008fae85f3556511f"
+code_hash = "cfb9774c03cd95424955adab70a41d7575cd3312f09fd3f16d6ef548ba8cf051"
+
+[[entry]]
+version = "V3"
+description = "Before stdlib 0.1.40 bump, stdlib 0.1.35 with scaffold 0.2.2"
+date = "2026-02-27"
+delegate_key = "1da41b5e49067bce3804a52ea7b1b7bbdffd326a4c734e00a946ed23ec41dab6"
+code_hash = "f399f3bfb435d51a6f233b4201e71ee5f6c5c2a4dd8c96e9d36e5c907317bed5"
+
+# V4, V5, V6 removed on 2026-04-12 — their WASMs were built against a
+# freenet-stdlib version whose InboundDelegateMsg bincode layout is no longer
+# compatible with the current host runtime. The node logged
+# `de/serialization error: Invalid size 7212619361848683800` on every
+# migration probe. Data under those keys is unrecoverable via automatic
+# migration; users have to rejoin via invite. See freenet/river#204.
+#
+# Removed entries (kept here for audit/history):
+#   V4 delegate_key=b830586c6efe577fce61b4a81fd3c12d8741320c79402c97694a2d86067f6dd1
+#      code_hash=c75b61d301fbd6a13cb0b707cb4e4e59f12af497908245e78886261877853941
+#      "Feb 28 delegate on technic, rebuilt from cargo make build"
+#   V5 delegate_key=3ad276deed28facebfe941f23dac9e07524d29824517662a76ddd7aac7b45b81
+#      code_hash=f02e7da3d32e2f01e19d0a79c47616d472172f8655bd15ddba79787643b95c57
+#      "Before identity-export feature"
+#   V6 delegate_key=d6afa7de40a06b73b7c27bd1f2f72d9ef806a290bc8d5185880d3b1a5a75e771
+#      code_hash=37f4f51536821b38a3a5978bc51581e20aa0de5c8099435403d784ff9dfb7c00
+#      "Before member-pruning fix"
+
+[[entry]]
+version = "V7"
+description = "Before freenet-stdlib 0.3.2 MessageOrigin API change"
+date = "2026-03-12"
+delegate_key = "5fc0fc05bf778a0817c651c9021fd4e08e68e7916bf61d0f2843d32aa5931622"
+code_hash = "77944fa2386b3b53733e3386b61e1a1e142fd802e3bceea78e283ca8feb6b79d"
+
+[[entry]]
+version = "V8"
+description = "Before dioxus 0.7.3 bump that changed delegate WASM via Cargo.lock"
+date = "2026-03-18"
+delegate_key = "6c714bc1b1d6c523b19b1e4f073c33f4cf9adaa583348d940ec2132ac86c755a"
+code_hash = "3a6829af9883be43022a4c0402d7b160409de4a286cfd0490ce5176673e42549"
+
+[[entry]]
+version = "V9"
+description = "Pre-v0.2.12 dependency update"
+date = "2026-03-24"
+delegate_key = "0ed1d5ba6d50bfe5d3f4b4698fc07eba6f2d5a91d06b45a84a7501b13c32f697"
+code_hash = "3a794f5eea4982441adbe7663623c55e44b58ced7be39199c5aae96eb2892648"
+
+[[entry]]
+version = "V10"
+description = "Before freenet-stdlib 0.6.0 bump (non_exhaustive hardening + MessageOrigin::Delegate)"
+date = "2026-04-14"
+delegate_key = "c2c96b97ab5e2f38bfdfb1ea697906fb947a5cdbaea25747f4670561b3edb61b"
+code_hash = "9ef1e02d5c99d9a9743972c5e618e061e0e2278658cfa178900b31a2834313c1"
+
+[[entry]]
+version = "V11"
+description = "Before private-room secret rotation moved into delegate (#228 PR 2)"
+date = "2026-05-06"
+delegate_key = "3b1d942c7271bc34df45062e525da4788af543e49bfdd49a69ad03a81cb5ed00"
+code_hash = "05bc461db19ff89ff6d30cf09572d53d26d1d5981fc45e5cbb0a30ae218c42f9"
+
+[[entry]]
+version = "V12"
+description = "Before fixes for PR 235 review findings (P1 regressions: ban-then-message, new-rooms-not-subscribed, cache-before-success)"
+date = "2026-05-08"
+delegate_key = "6c1d14f79846c1095bc4a52b56be2f60c866a97b297dc74a325562244d36080b"
+code_hash = "44d0025e2b671a2cd15d1a8a6a94e35d7cb545e9cd9dbcd02c9cb5c9eef3f9d6"
+
+[[entry]]
+version = "V13"
+description = "Before getrandom direct dep added to chat-delegate Cargo.toml (CI wasm build fix)"
+date = "2026-05-12"
+delegate_key = "8083d3bc94100c7ab73fb64539a88ca7ac7872b1d5b23068b506bd6f28d6b4c3"
+code_hash = "26fe16d3b5a4bde82d1990dac9176af7aaa756c0a0de6291c07dcb4ee82e48ee"
+
+[[entry]]
+version = "V14"
+description = "Before in-room DMs added to ChatRoomStateV1 (room contract types change)"
+date = "2026-05-12"
+delegate_key = "3a4de0aca4a094e1df9a6e0ab623724e836d4e77b53d083654741b88a44bbe19"
+code_hash = "c03369b26164432dd52761a79cb66db64610fc33c80b6c1c17532201b7ed69ac"
+
+[[entry]]
+version = "V15"
+description = "Before #240 review fixes (bans/cleanup sweep + BLAKE3 purge tokens + JSON-safe purges + domain separation) — first iteration b329fed2, never deployed; entry kept defensively"
+date = "2026-05-13"
+delegate_key = "4377eb8d7685cba2ad0318d7f118ca09a1219fed128c2c5b04cd8045f3130fdb"
+code_hash = "0ca52ed8d2978a69278a895c0adfc543dbe53d34a4c91c2f7eab49aa5e676ff1"
+
+[[entry]]
+version = "V16"
+description = "Before #241 fix: revert wasm-bindgen-contaminated chat_delegate WASM. The committed WASM had unresolved __wbindgen_placeholder__ imports introduced by PR #235 and amplified by 3ae398b7."
+date = "2026-05-13"
+delegate_key = "0f7e89d3dc05585816092e195382bedaa7aaf02cc3d759b9763470dd4b9b19eb"
+code_hash = "2f8e63598983f1d6e76aa8510744ec6ee29515010e4fa9a262ef105f23487c7e"
+
+[[entry]]
+version = "V17"
+description = "Post-#242 deploy WASM: delegate's rotation emitted only new_version secrets, so newly-joined members couldn't decrypt room name / owner nickname / pre-join messages. Fixed in PR #245 (Ivvor's report 2026-05-14)."
+date = "2026-05-14"
+delegate_key = "540b28876505abde260f479702613af1dcefacb4d9de2af78367afc58503b0a2"
+code_hash = "123f732d82e472a59927123f096580a0e4fd355ad47b1bc17f03f44deb5cdb92"
+
+[[entry]]
+version = "V18"
+description = "Before #256: outbound_dms storage key + OutboundDmStore types added to river-core"
+date = "2026-05-16"
+delegate_key = "11db7236c2211dd54ab6853826915464ce429a7a044cbf2813aa5a3d74ba5b1f"
+code_hash = "6229c2a136b30a7868c07099efdea86bee260734339d872aa1e68177733b5fdd"
+
+[[entry]]
+version = "V19"
+description = "Before #261: HiddenDmThreadsV1 added to OutboundDmStore for hide-stale-DM-threads feature"
+date = "2026-05-16"
+delegate_key = "497b522ac5c1f0a6234f832d7f593ab78c2b7f91136607400e9d1839509e6839"
+code_hash = "47e54c906561d394cf473e89180350ea9e4bc6e75091e1debcf7306e5b971c80"
+
+[[entry]]
+version = "V20"
+description = "Relax MessagesV1::apply_delta secret-version check; make RoomSecretsV1::apply_delta transactional (Bug #3 PR A)"
+date = "2026-05-17"
+delegate_key = "49b626c43a0b0bf9a8506a5266c690afdebc1dc6ce8a7d6d9397b8b1f1b21a4d"
+code_hash = "05a96a22b12f548d51a9d785c374790f6dcb22986e0d98e9f0dc023ffbaa4ca0"
+
+[[entry]]
+version = "V21"
+description = "Before Bug #3 PR B: post_apply_cleanup encrypted_secrets exemption (issue #110)"
+date = "2026-05-17"
+delegate_key = "9615964a72a194c0d400161072d3d2747ef3a2d5adc04718ab0641b758b45d0d"
+code_hash = "1a63414c706954884409f8bf2ec54fdd97740d08ec89ddd45cd9f4e4fa6ba7ef"
+
+[[entry]]
+version = "V22"
+description = "Before Bug #3 PR B follow-up: build_state_for_put returns Result/takes time arg + scope encrypted_secrets exemption to current_version (PR #272 review round 2)"
+date = "2026-05-17"
+delegate_key = "6984cf98f31dba05d98c22239b07aff5b6b025c3d05e0d1ff343007bc409f374"
+code_hash = "a4db9f71a42f6317335425bce445b8ef8fba4214827820c0214306f934c749a5"
+
+[[entry]]
+version = "V23"
+description = "Before PR #276 follow-up: EnsureRoomSubscription gains request_id field for per-call pending-request routing"
+date = "2026-05-17"
+delegate_key = "25b738b62a214355d6208c62f0bf5d3039cc263401a8e87b1795e9d27318bb80"
+code_hash = "4642294dfc04f45f7f2a0a76c80a2c9ff507556606d58c6dbc69e868fada597d"
+
+[[entry]]
+version = "V24"
+description = "Before #345: chat-delegate gains generation + compare-and-swap (CAS) KV primitive"
+date = "2026-06-03"
+delegate_key = "1ec6b3d1d16f7a2d4ecd6e305c05bb9a49321a1043b1d28ae84e6c56c4959bb9"
+code_hash = "904f76ff053f0882a8a036de3eea2ff367dced8bc5b0cbdbadcea3e40a4688f6"
+
+[[entry]]
+version = "V25"
+description = "Before freenet-stdlib 0.6.0 -> 0.8.3 bump (dogfood): last stdlib-0.6 chat-delegate generation"
+date = "2026-07-10"
+delegate_key = "3e0e07376681429abeab623c85b28fee3e0dffddc4f81601cb08e175310eda80"
+code_hash = "8bb5d06fa060b74825355a3e253f006b90f26bdfebe88ed2aa2db2e8e351cc8d"
+
+[[entry]]
+version = "V26"
+description = "Before adding MemberInfo.deputies field (deputy ban authority, #410): last pre-deputy chat-delegate generation"
+date = "2026-07-16"
+delegate_key = "b61dc292c952f5ec48f870a0f9829090968a7d03669671f619487f0b5aca8633"
+code_hash = "d91e33fcf47b4863b996fbf6bb8d782b2250a0e5037fb8dc7a030b60ac1c4de1"
+
+[[entry]]
+version = "V27"
+description = "Before deterministic Summary (BTreeMap/BTreeSet for anti-entropy staleness, #4857): last deputy-generation chat-delegate"
+date = "2026-07-18"
+delegate_key = "c01c1602ceef95278c4dbb0a980cbb63cf2e9ec36ed985f4bc657225f1558ab5"
+code_hash = "ee08e689207af26de43e02ebc1ad9ebbc1e14fa305a600c79825c0bd27d1f774"

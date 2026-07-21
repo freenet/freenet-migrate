@@ -129,6 +129,57 @@ fn river_delegate_view_matches_hand_rolled_shape() {
 }
 
 #[test]
+fn full_river_registries_import_and_validate() {
+    // The complete shipped registries (24 delegate rows, 27 contract rows) —
+    // the actual input River's adoption feeds the crate — not just a sample.
+    // Delegates: verbatim except `irregular_key = true` on V1, the single
+    // required edit (V2–V27 all satisfy the standard derivation).
+    let delegates = Registry::from_entry_toml_str(
+        include_str!("fixtures/river_legacy_delegates.toml"),
+        Component::Delegate,
+    )
+    .unwrap();
+    assert_eq!(delegates.delegate.len(), 24);
+    assert_eq!(
+        delegates
+            .delegate
+            .iter()
+            .filter(|r| r.irregular_key)
+            .map(|r| r.generation)
+            .collect::<Vec<_>>(),
+        vec![1],
+        "V1 must be the ONLY irregular row in River's registry"
+    );
+    delegates.validate().unwrap();
+    // Sparse V4–V6 gap preserved.
+    assert!(!delegates
+        .delegate
+        .iter()
+        .any(|r| (4..=6).contains(&r.generation)));
+
+    // Contracts: byte-for-byte the shipped file, zero edits required.
+    let contracts = Registry::from_entry_toml_str(
+        include_str!("fixtures/river_legacy_room_contracts.toml"),
+        Component::Contract,
+    )
+    .unwrap();
+    assert_eq!(contracts.contract.len(), 27);
+    contracts.validate().unwrap();
+
+    // Both render through the view codegen (what River's build.rs will run).
+    codegen()
+        .canonical_consts(false)
+        .delegate_pair_view("LEGACY_DELEGATES")
+        .render(&delegates)
+        .unwrap();
+    codegen()
+        .canonical_consts(false)
+        .contract_hash_view("LEGACY_ROOM_CONTRACT_CODE_HASHES")
+        .render(&contracts)
+        .unwrap();
+}
+
+#[test]
 fn river_contract_registry_imports_and_renders_hash_view() {
     let reg = Registry::from_entry_toml_str(RIVER_CONTRACTS, Component::Contract).unwrap();
     assert_eq!(

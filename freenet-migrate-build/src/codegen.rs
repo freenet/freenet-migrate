@@ -46,6 +46,8 @@ pub struct Codegen {
     canonical: bool,
     contract_hash_view: Option<String>,
     delegate_pair_view: Option<String>,
+    rerun_if_changed: bool,
+    allow_missing_registry: bool,
 }
 
 impl Default for Codegen {
@@ -60,6 +62,8 @@ impl Default for Codegen {
             canonical: true,
             contract_hash_view: None,
             delegate_pair_view: None,
+            rerun_if_changed: true,
+            allow_missing_registry: false,
         }
     }
 }
@@ -131,10 +135,38 @@ impl Codegen {
         self
     }
 
+    /// Whether [`emit`](Self::emit) prints `cargo:rerun-if-changed` for the
+    /// registry (default `true`). Set `false` in a build script that relies on
+    /// Cargo's default re-run-on-any-change heuristic (e.g. to keep a
+    /// `BUILD_TIMESTAMP` env fresh) — printing ANY `rerun-if-changed` would
+    /// disable that heuristic for the whole script.
+    pub fn rerun_if_changed(mut self, emit: bool) -> Self {
+        self.rerun_if_changed = emit;
+        self
+    }
+
+    /// Treat a **missing** registry file as an empty registry (default
+    /// `false`, i.e. hard error). For build scripts that must also work where
+    /// the registry isn't shipped — docs.rs and other non-workspace builds
+    /// reading a file outside the crate (River's `ui/build.rs` case). Emits a
+    /// `cargo:warning` when the fallback engages; any error other than
+    /// file-not-found still fails.
+    pub fn allow_missing_registry(mut self, allow: bool) -> Self {
+        self.allow_missing_registry = allow;
+        self
+    }
+
     /// Render the generated Rust source as a string (pure; no I/O beyond
     /// reading the registry file). Useful for tests.
     pub fn generate_string(&self) -> Result<String, BuildError> {
         let path = self.registry_path.as_ref().ok_or(BuildError::NoRegistry)?;
+        if self.allow_missing_registry && !path.exists() {
+            println!(
+                "cargo:warning=registry {} not found, generating empty lineage consts",
+                path.display()
+            );
+            return self.render(&Registry::default());
+        }
         let registry = match self.entry_component {
             Some(component) => Registry::from_entry_path(path, component)?,
             None => Registry::from_path(path)?,
@@ -201,9 +233,11 @@ impl Codegen {
     }
 
     /// Read the registry, render the consts, and write them into `$OUT_DIR`.
-    /// Emits `cargo:rerun-if-changed` for the registry, and skips the write
-    /// when the content is unchanged (avoiding spurious recompilation for
-    /// build scripts that re-run unconditionally). Returns the output path.
+    /// Emits `cargo:rerun-if-changed` for the registry (unless disabled via
+    /// [`rerun_if_changed`](Self::rerun_if_changed)`(false)`), and skips the
+    /// write when the content is unchanged (avoiding spurious recompilation
+    /// for build scripts that re-run unconditionally). Returns the output
+    /// path.
     pub fn emit(self) -> Result<PathBuf, BuildError> {
         let out_dir =
             std::env::var("OUT_DIR").map_err(|_| BuildError::Env("OUT_DIR not set".to_string()))?;
@@ -218,10 +252,19 @@ impl Codegen {
             std::fs::write(&dest, code)
                 .map_err(|e| BuildError::Io(format!("writing {}: {e}", dest.display())))?;
         }
-        if let Some(reg) = &self.registry_path {
-            println!("cargo:rerun-if-changed={}", reg.display());
+        for directive in self.cargo_directives() {
+            println!("{directive}");
         }
         Ok(dest)
+    }
+
+    /// The `cargo:` directives [`emit`](Self::emit) prints (factored out so
+    /// tests can pin them without capturing stdout).
+    fn cargo_directives(&self) -> Vec<String> {
+        match (&self.registry_path, self.rerun_if_changed) {
+            (Some(reg), true) => vec![format!("cargo:rerun-if-changed={}", reg.display())],
+            _ => vec![],
+        }
     }
 }
 
@@ -517,6 +560,38 @@ mod tests {
             std::fs::set_permissions(&dest, perms).unwrap();
         }
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn missing_registry_errors_by_default_but_can_fall_back_empty() {
+        let missing = std::env::temp_dir().join("freenet-migrate-definitely-not-here.toml");
+        let base = codegen()
+            .registry(&missing)
+            .canonical_consts(false)
+            .contract_hash_view("HASHES");
+        // Default: a missing file is a hard error (a typo'd path must not
+        // silently produce an empty lineage).
+        assert!(matches!(
+            base.clone().generate_string().unwrap_err(),
+            BuildError::Io(_)
+        ));
+        // Opted in (docs.rs / non-workspace builds): empty consts.
+        let out = base.allow_missing_registry(true).generate_string().unwrap();
+        assert!(out.contains("pub const HASHES: &[[u8; 32]] = &[\n];\n"));
+    }
+
+    #[test]
+    fn rerun_if_changed_directive_can_be_disabled() {
+        // A build script relying on Cargo's default re-run heuristic (e.g. for
+        // a BUILD_TIMESTAMP env) must be able to suppress the directive —
+        // printing ANY rerun-if-changed disables that heuristic script-wide.
+        let with = codegen().registry("legacy.toml");
+        assert_eq!(
+            with.cargo_directives(),
+            vec!["cargo:rerun-if-changed=legacy.toml".to_string()]
+        );
+        let without = codegen().registry("legacy.toml").rerun_if_changed(false);
+        assert!(without.cargo_directives().is_empty());
     }
 
     #[test]

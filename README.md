@@ -115,10 +115,17 @@ guard (`check_migration_guard`) asserts the rule "if the built WASM's hash
 changed, the old hash must be registered as a predecessor" — wire it into a test
 or a small xtask so an unregistered re-key fails CI instead of stranding data.
 
-**Adopting in an existing app** (keeping its registries and call sites
-unchanged): the codegen also reads River-style `[[entry]]` TOMLs and can emit
-plain byte-array *view* consts matching hand-rolled shapes, with no
-`freenet-migrate` runtime dependency:
+**Adopting in an existing app**: the codegen also reads River-style `[[entry]]`
+TOMLs and can emit plain byte-array *view* consts matching hand-rolled const
+shapes/types/values, with no `freenet-migrate` runtime dependency — call sites,
+scripts, and CI stay unchanged. The one registry edit the validation may demand:
+a delegate row whose recorded key predates the standard derivation needs
+`irregular_key = true` added (in River's registry that is V1, one line; the
+`DelegateKeyMismatch` build error says exactly which row and what to do). Build
+scripts with extra behaviors keep them via `.rerun_if_changed(false)` (preserve
+Cargo's re-run-every-build heuristic, e.g. for a `BUILD_TIMESTAMP`) and
+`.allow_missing_registry(true)` (empty consts when the registry file isn't
+shipped, e.g. docs.rs builds):
 
 ```rust,no_run
 // e.g. River's common/build.rs — same file, same consumers, crate-owned codegen

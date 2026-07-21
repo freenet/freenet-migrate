@@ -189,9 +189,16 @@ the "only while the user is online" limit rather than papering over it.
    the codegen reads River's existing `[[entry]]` TOMLs (`entry_registry`) and
    emits byte-array **view consts** under the existing names (`LEGACY_DELEGATES`
    as `&[([u8; 32], [u8; 32])]`, `LEGACY_ROOM_CONTRACT_CODE_HASHES` as
-   `&[[u8; 32]]`) so existing call sites, registries, and scripts stay
-   unchanged — a views-only adoption needs no runtime-crate dependency
-   (`canonical_consts(false)`);
+   `&[[u8; 32]]`) so existing call sites and scripts stay unchanged — a
+   views-only adoption needs no runtime-crate dependency
+   (`canonical_consts(false)`). One registry edit is required: the V1 delegate
+   row's recorded key predates the standard derivation, so it gets
+   `irregular_key = true` (V2+ all derive correctly and get full validation —
+   tighter than the old name-based V1+V2 test exemption). `ui/build.rs`
+   additionally sets `.rerun_if_changed(false)` (it relies on Cargo's
+   re-run-every-build heuristic for `BUILD_TIMESTAMP_ISO`) and
+   `.allow_missing_registry(true)` (its TOML lives outside the crate and is
+   absent on docs.rs builds);
 2. replace the `regenerate_contract_key` / `fire_legacy_migration_request` /
    `migrate_legacy_per_room` internals with crate calls (a `LegacyExportAdapter`
    plugs River's per-room export for pre-crate versions);
