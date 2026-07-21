@@ -63,8 +63,8 @@ pub use delegate::{
     HOST_ENUMERATION_CAP,
 };
 pub use driver::{
-    contract_probe, migrate_contract, FoldAllAck, Outcome, ProbeDriver, ProbeIo, ProbeStateOps,
-    SelectionPolicy, Step, DEFAULT_MAX_PROBE_HOPS, RECOMMENDED_PROBE_TIMEOUT_MS,
+    contract_probe, migrate_contract, FoldAllAck, NewestFirst, Outcome, ProbeDriver, ProbeIo,
+    ProbeStateOps, SelectionPolicy, Step, DEFAULT_MAX_PROBE_HOPS, RECOMMENDED_PROBE_TIMEOUT_MS,
 };
 pub use error::MigrateError;
 pub use lineage::{ContractLineageEntry, DelegateLineageEntry, Lineage};
