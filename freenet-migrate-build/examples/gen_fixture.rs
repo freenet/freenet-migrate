@@ -1,7 +1,7 @@
-//! One-off generator for freenet-migrate/tests/fixtures/lineage_fixture.rs.
-//! Run: cargo run -p freenet-migrate-build --example gen_fixture
-//! The fixture TOML here must stay in sync with FIXTURE_TOML in
-//! freenet-migrate/tests/generated_output_compiles.rs.
+//! One-off generator for freenet-migrate/tests/fixtures/lineage_fixture.rs,
+//! reading the registry from freenet-migrate/tests/fixtures/lineage_fixture.toml.
+//! Run: cargo run -p freenet-migrate-build --example gen_fixture \
+//!        > freenet-migrate/tests/fixtures/lineage_fixture.rs
 
 fn main() {
     let toml = include_str!("../../freenet-migrate/tests/fixtures/lineage_fixture.toml");

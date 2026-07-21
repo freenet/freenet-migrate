@@ -544,6 +544,13 @@ pub fn predecessor_delegate_keys(lineage: &[DelegateLineageEntry]) -> Vec<Delega
 /// equals the stored `delegate_key` (a data-integrity guard mirroring Delta's
 /// build-time assert; `irregular_key` rows are exempt by definition — their
 /// recorded keys deliberately do not derive).
+///
+/// The single `params` is applied to every entry, so this check only holds for
+/// lineages whose generations all share the caller's params (the empty-params
+/// River/Delta case). A registry with per-row `params_hex` values is instead
+/// cross-checked per-row at build time by `freenet-migrate-build`'s
+/// `Registry::validate`; the probe itself ([`predecessor_delegate_keys`]) is
+/// params-independent either way, since it targets stored keys.
 pub fn predecessor_delegate_keys_checked(
     params: &Parameters,
     lineage: &[DelegateLineageEntry],
