@@ -168,6 +168,46 @@ A contract that wants the node to pull predecessor state during
 `validate_state` (instead of an app-side probe) can use `resolve_predecessors`,
 which returns a `ValidateResult::RequestRelated` with `StateThenSubscribe`.
 
+### 2b. The sans-IO probe decision driver
+
+The crate owns the probe **decisions** — order, hit criteria, advance/stop,
+what to adopt — while the app pumps I/O through a thin adapter (browsers have
+no request/response correlation, so the crate cannot drive the loop itself):
+
+```rust,ignore
+use freenet_migrate::{contract_probe, Outcome, SelectionPolicy, Step};
+
+let mut driver = contract_probe(ops, local_snapshot, &params, CONTRACT_LINEAGE,
+                                SelectionPolicy::NewestFirstWins);
+loop {
+    match driver.next_action() {
+        Step::Get(id) => { /* send GET(id), arm a ~12s timer; deliver via
+                              driver.on_response(id, &bytes) / driver.on_timeout(id) */ }
+        Step::Done => break,
+    }
+}
+match driver.take_outcome().unwrap() {
+    Outcome::Recovered { merged, .. } => { /* adopt + PUT under the CURRENT key */ }
+    Outcome::SeedLocal { local }      => { /* seed the local snapshot forward */ }
+    Outcome::NoLegacy                 => { /* fresh app, normal first-run */ }
+}
+```
+
+Decisions are fixed by the driver (probing newest-first; undecodable or
+non-real responses and timeouts advance; late responses are single-shot
+ignored; exhaustion seeds the local snapshot; a `prepare_forward` hook strips
+key-relative metadata like upgrade pointers before any forward PUT). The two
+Delta incident decision-bug classes — generation-blind selection and
+scalar-recency selection — are structurally inexpressible in it.
+
+Selection policy: `NewestFirstWins` (default; one generation adopted, safe for
+delete-by-absence states) or `FoldAll` (folds every real generation; only
+sound for tombstoned states with a commutative+idempotent merge, so it takes a
+loudly-named ack and `policy_check` property helpers to verify the merge
+first). Native callers with awaitable I/O can use the pumped wrapper
+`migrate_contract(ops, io, local, &params, lineage, policy)` instead of the
+raw driver.
+
 Optionally publish an author-signed pointer from v1 → v2 so clients can discover
 the successor:
 
