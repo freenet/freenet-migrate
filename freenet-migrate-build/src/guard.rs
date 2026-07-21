@@ -5,25 +5,8 @@
 //! WASM code hash changed, the previous hash must be present in the registry* so
 //! the migration probe can still find the old key.
 
-use crate::registry::Registry;
-
-/// Which registry component a guard/lookup targets.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Component {
-    /// The `[[contract]]` list.
-    Contract,
-    /// The `[[delegate]]` list.
-    Delegate,
-}
-
-impl Component {
-    fn label(self) -> &'static str {
-        match self {
-            Component::Contract => "contract",
-            Component::Delegate => "delegate",
-        }
-    }
-}
+use crate::error::BuildError;
+use crate::registry::{decode_hash32, Component, Registry};
 
 /// Compute the base58 code hash of some WASM bytes: `blake3(wasm)`, base58
 /// (Bitcoin alphabet) — matching stdlib `CodeHash::from_code(..).encode()`.
@@ -31,6 +14,12 @@ pub fn code_hash_b58(wasm: &[u8]) -> String {
     bs58::encode(blake3::hash(wasm).as_bytes())
         .with_alphabet(bs58::Alphabet::BITCOIN)
         .into_string()
+}
+
+/// Compute the lowercase-hex code hash of some WASM bytes: `blake3(wasm)` —
+/// matching what `b3sum` prints (the encoding River's registries store).
+pub fn code_hash_hex(wasm: &[u8]) -> String {
+    blake3::hash(wasm).to_hex().to_string()
 }
 
 /// The result of the guard.
@@ -46,14 +35,14 @@ pub enum GuardOutcome {
     /// The WASM changed but the previous (base) hash is **not** registered —
     /// the migration would strand the old key. CI must fail.
     PredecessorMissing {
-        /// The unregistered base hash.
+        /// The unregistered base hash, as passed in.
         base: String,
     },
 }
 
 impl GuardOutcome {
     /// Whether the guard passes (only [`GuardOutcome::PredecessorMissing`] fails).
-    pub fn is_ok(&self) -> bool {
+    pub fn passes(&self) -> bool {
         !matches!(self, GuardOutcome::PredecessorMissing { .. })
     }
 
@@ -76,26 +65,31 @@ impl GuardOutcome {
 /// and the current built code hash (`head`), require that a change is
 /// accompanied by the base hash being registered.
 ///
-/// `base` and `head` are base58 (see [`code_hash_b58`]).
+/// `base` and `head` accept hex or base58 (see [`decode_hash32`]); comparison
+/// is on the decoded bytes, so a hex-encoded base hash matches a
+/// base58-registered predecessor and vice versa. An undecodable input is an
+/// `Err`, never a silent pass or fail.
 pub fn check_migration_guard(
     component: Component,
-    base_code_hash_b58: &str,
-    head_code_hash_b58: &str,
+    base_code_hash: &str,
+    head_code_hash: &str,
     registry: &Registry,
-) -> GuardOutcome {
-    if base_code_hash_b58 == head_code_hash_b58 {
-        return GuardOutcome::Unchanged;
+) -> Result<GuardOutcome, BuildError> {
+    let base = decode_hash32(base_code_hash)?;
+    let head = decode_hash32(head_code_hash)?;
+    if base == head {
+        return Ok(GuardOutcome::Unchanged);
     }
     let found = match component {
-        Component::Contract => registry.find_contract_code_hash(base_code_hash_b58),
-        Component::Delegate => registry.find_delegate_code_hash(base_code_hash_b58),
+        Component::Contract => registry.find_contract_code_hash_bytes(&base),
+        Component::Delegate => registry.find_delegate_code_hash_bytes(&base),
     };
-    match found {
+    Ok(match found {
         Some(generation) => GuardOutcome::PredecessorRegistered { generation },
         None => GuardOutcome::PredecessorMissing {
-            base: base_code_hash_b58.to_string(),
+            base: base_code_hash.to_string(),
         },
-    }
+    })
 }
 
 #[cfg(test)]
@@ -103,11 +97,11 @@ mod tests {
     use super::*;
     use crate::registry::{ContractRow, Registry};
 
-    fn registry_with_contract(code_hash_b58: &str, generation: u32) -> Registry {
+    fn registry_with_contract(code_hash: &str, generation: u32) -> Registry {
         Registry {
             contract: vec![ContractRow {
                 generation,
-                code_hash: code_hash_b58.to_string(),
+                code_hash: code_hash.to_string(),
                 note: String::new(),
             }],
             delegate: vec![],
@@ -120,35 +114,53 @@ mod tests {
         let b = code_hash_b58(b"some wasm");
         assert_eq!(a, b);
         // base58 of 32 bytes decodes back to 32 bytes.
-        let mut out = [0u8; 32];
-        let n = bs58::decode(&a)
-            .with_alphabet(bs58::Alphabet::BITCOIN)
-            .onto(&mut out)
-            .unwrap();
-        assert_eq!(n, 32);
+        assert!(decode_hash32(&a).is_ok());
         assert_ne!(a, code_hash_b58(b"different wasm"));
+    }
+
+    #[test]
+    fn hex_and_b58_encodings_agree() {
+        let wasm = b"some wasm";
+        assert_eq!(
+            decode_hash32(&code_hash_hex(wasm)).unwrap(),
+            decode_hash32(&code_hash_b58(wasm)).unwrap(),
+        );
     }
 
     #[test]
     fn unchanged_wasm_passes() {
         let h = code_hash_b58(b"v1");
         let reg = Registry::default();
-        let outcome = check_migration_guard(Component::Contract, &h, &h, &reg);
+        let outcome = check_migration_guard(Component::Contract, &h, &h, &reg).unwrap();
         assert_eq!(outcome, GuardOutcome::Unchanged);
-        assert!(outcome.is_ok());
+        assert!(outcome.passes());
+    }
+
+    #[test]
+    fn unchanged_wasm_across_encodings_passes() {
+        // base in hex, head in base58, same bytes — still Unchanged.
+        let outcome = check_migration_guard(
+            Component::Contract,
+            &code_hash_hex(b"v1"),
+            &code_hash_b58(b"v1"),
+            &Registry::default(),
+        )
+        .unwrap();
+        assert_eq!(outcome, GuardOutcome::Unchanged);
     }
 
     #[test]
     fn changed_wasm_with_registered_predecessor_passes() {
         let base = code_hash_b58(b"v1");
         let head = code_hash_b58(b"v2");
-        let reg = registry_with_contract(&base, 0);
-        let outcome = check_migration_guard(Component::Contract, &base, &head, &reg);
+        // Registered in hex; probed in base58 — bytes-compare must match.
+        let reg = registry_with_contract(&code_hash_hex(b"v1"), 0);
+        let outcome = check_migration_guard(Component::Contract, &base, &head, &reg).unwrap();
         assert_eq!(
             outcome,
             GuardOutcome::PredecessorRegistered { generation: 0 }
         );
-        assert!(outcome.is_ok());
+        assert!(outcome.passes());
         assert!(outcome.advice(Component::Contract).is_none());
     }
 
@@ -157,12 +169,12 @@ mod tests {
         let base = code_hash_b58(b"v1");
         let head = code_hash_b58(b"v2");
         let reg = Registry::default(); // base not registered
-        let outcome = check_migration_guard(Component::Contract, &base, &head, &reg);
+        let outcome = check_migration_guard(Component::Contract, &base, &head, &reg).unwrap();
         assert_eq!(
             outcome,
             GuardOutcome::PredecessorMissing { base: base.clone() }
         );
-        assert!(!outcome.is_ok());
+        assert!(!outcome.passes());
         assert!(outcome.advice(Component::Contract).unwrap().contains(&base));
     }
 
@@ -172,7 +184,15 @@ mod tests {
         let base = code_hash_b58(b"shared");
         let head = code_hash_b58(b"changed");
         let reg = registry_with_contract(&base, 0);
-        let outcome = check_migration_guard(Component::Delegate, &base, &head, &reg);
+        let outcome = check_migration_guard(Component::Delegate, &base, &head, &reg).unwrap();
         assert!(matches!(outcome, GuardOutcome::PredecessorMissing { .. }));
+    }
+
+    #[test]
+    fn undecodable_input_is_an_error_not_a_verdict() {
+        let head = code_hash_b58(b"v2");
+        let err = check_migration_guard(Component::Contract, "0OIl", &head, &Registry::default())
+            .unwrap_err();
+        assert!(matches!(err, BuildError::InvalidCodeHash { .. }));
     }
 }

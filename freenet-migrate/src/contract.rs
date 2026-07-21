@@ -134,33 +134,44 @@ impl PermissiveValidatorAck {
     }
 }
 
-/// Reconstruct a predecessor `ContractInstanceId` from a base58 code hash and
+/// Reconstruct a predecessor `ContractInstanceId` from a 32-byte code hash and
 /// the (stable) parameters, **without** the old WASM bytes.
 ///
 /// Mirrors stdlib key derivation exactly:
 /// * `code_hash = blake3(wasm)`            (stdlib `CodeHash::from_code`)
 /// * `id        = blake3(code_hash ‖ params)` (stdlib `generate_id`, code hash first)
-pub fn contract_id_from_code_hash(
+///
+/// Infallible: the lineage's hashes were decoded and validated at build time.
+pub fn contract_id_from_code_hash(code_hash: &[u8; 32], params: &Parameters) -> ContractInstanceId {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(code_hash);
+    hasher.update(params.as_ref());
+    let id = *hasher.finalize().as_bytes();
+    ContractInstanceId::new(id)
+}
+
+/// [`contract_id_from_code_hash`] for a base58 string, for callers holding
+/// stdlib's string form rather than a lineage entry.
+pub fn contract_id_from_code_hash_b58(
     code_hash_b58: &str,
     params: &Parameters,
 ) -> Result<ContractInstanceId, MigrateError> {
     let code_hash = decode_b58_32(code_hash_b58)?;
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(&code_hash);
-    hasher.update(params.as_ref());
-    let id = *hasher.finalize().as_bytes();
-    Ok(ContractInstanceId::new(id))
+    Ok(contract_id_from_code_hash(&code_hash, params))
 }
 
 /// Reconstruct every predecessor contract id for a backward probe. Ordered as
 /// the registry is (oldest-first); probe newest-first by iterating in reverse.
+///
+/// Infallible: a generated lineage's hashes cannot be malformed (they were
+/// decoded and validated at build time).
 pub fn predecessor_ids(
     params: &Parameters,
     lineage: &[ContractLineageEntry],
-) -> Result<Vec<ContractInstanceId>, MigrateError> {
+) -> Vec<ContractInstanceId> {
     lineage
         .iter()
-        .map(|e| contract_id_from_code_hash(e.code_hash, params))
+        .map(|e| contract_id_from_code_hash(&e.code_hash, params))
         .collect()
 }
 
@@ -206,16 +217,16 @@ pub fn resolve_predecessors(
     params: &Parameters,
     lineage: &[ContractLineageEntry],
     related: &RelatedContracts<'static>,
-) -> Result<Resolution, MigrateError> {
+) -> Resolution {
     let already: HashSet<ContractInstanceId> = related.states().map(|(id, _)| *id).collect();
-    let ids = predecessor_ids(params, lineage)?
+    let ids = predecessor_ids(params, lineage)
         .into_iter()
         .filter(|id| !already.contains(id))
         .collect();
-    Ok(Resolution {
+    Resolution {
         ids,
         mode: RelatedMode::StateThenSubscribe,
-    })
+    }
 }
 
 /// Decode a base58 (Bitcoin alphabet) string into exactly 32 bytes.
@@ -248,33 +259,36 @@ mod tests {
         let code = ContractCode::from(wasm.to_vec());
 
         let expected = ContractInstanceId::from_params_and_code(&params, &code);
-        let code_hash_b58 = code.hash().encode();
+        let code_hash: [u8; 32] = **code.hash();
 
-        let reconstructed = contract_id_from_code_hash(&code_hash_b58, &params).unwrap();
+        let reconstructed = contract_id_from_code_hash(&code_hash, &params);
         assert_eq!(
             reconstructed, expected,
             "blake3(code_hash ‖ params) reconstruction diverged from stdlib generate_id"
         );
 
+        // The base58-string path agrees.
+        let via_b58 = contract_id_from_code_hash_b58(&code.hash().encode(), &params).unwrap();
+        assert_eq!(via_b58, expected);
+
         // And via the lineage entry path.
-        let ch: &'static str = Box::leak(code_hash_b58.into_boxed_str());
         let lineage = [ContractLineageEntry {
             generation: 0,
-            code_hash: ch,
+            code_hash,
             note: "v1",
         }];
-        let ids = predecessor_ids(&params, &lineage).unwrap();
+        let ids = predecessor_ids(&params, &lineage);
         assert_eq!(ids, vec![expected]);
     }
 
     #[test]
-    fn bad_code_hash_is_rejected() {
+    fn bad_code_hash_string_is_rejected() {
         let params = Parameters::from(Vec::new());
         // "0OIl" contains base58-illegal chars.
-        let err = contract_id_from_code_hash("0OIl", &params).unwrap_err();
+        let err = contract_id_from_code_hash_b58("0OIl", &params).unwrap_err();
         assert!(matches!(err, MigrateError::BadCodeHash(_)));
         // Valid base58 but too short.
-        let err = contract_id_from_code_hash("abc", &params).unwrap_err();
+        let err = contract_id_from_code_hash_b58("abc", &params).unwrap_err();
         assert!(matches!(err, MigrateError::BadCodeHash(_)));
     }
 

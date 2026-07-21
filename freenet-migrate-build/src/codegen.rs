@@ -1,9 +1,24 @@
-//! Codegen: emit `CONTRACT_LINEAGE` / `DELEGATE_LINEAGE` consts into `$OUT_DIR`.
+//! Codegen: emit lineage consts into `$OUT_DIR`.
+//!
+//! Two kinds of output, from the same validated registry:
+//!
+//! * **Canonical consts** (`CONTRACT_LINEAGE` / `DELEGATE_LINEAGE`): slices of
+//!   the runtime crate's `ContractLineageEntry` / `DelegateLineageEntry`, with
+//!   `[u8; 32]` hashes decoded and validated at build time.
+//! * **View consts**: plain byte-array shapes matching what existing apps'
+//!   hand-rolled build scripts emit, so their call sites compile unchanged —
+//!   [`Codegen::contract_hash_view`] (`&[[u8; 32]]`, River's
+//!   `LEGACY_ROOM_CONTRACT_CODE_HASHES`) and [`Codegen::delegate_pair_view`]
+//!   (`&[([u8; 32], [u8; 32])]` in `(delegate_key, code_hash)` order, River's
+//!   `LEGACY_DELEGATES`). Views need no dependency on the `freenet-migrate`
+//!   runtime crate; disable the canonical consts with
+//!   [`Codegen::canonical_consts`]`(false)` for a views-only (build-dep-only)
+//!   adoption.
 
 use std::path::{Path, PathBuf};
 
 use crate::error::BuildError;
-use crate::registry::Registry;
+use crate::registry::{Component, Registry};
 
 /// Start a codegen builder.
 ///
@@ -20,19 +35,48 @@ pub fn codegen() -> Codegen {
 }
 
 /// Builder for the generated lineage consts.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Codegen {
     registry_path: Option<PathBuf>,
+    entry_component: Option<Component>,
     out_file: Option<String>,
     contract_const: Option<String>,
     delegate_const: Option<String>,
     crate_path: Option<String>,
+    canonical: bool,
+    contract_hash_view: Option<String>,
+    delegate_pair_view: Option<String>,
+}
+
+impl Default for Codegen {
+    fn default() -> Self {
+        Self {
+            registry_path: None,
+            entry_component: None,
+            out_file: None,
+            contract_const: None,
+            delegate_const: None,
+            crate_path: None,
+            canonical: true,
+            contract_hash_view: None,
+            delegate_pair_view: None,
+        }
+    }
 }
 
 impl Codegen {
-    /// Path to the `legacy.toml` registry.
+    /// Path to a unified-schema (`[[contract]]` / `[[delegate]]`) registry.
     pub fn registry(mut self, path: impl Into<PathBuf>) -> Self {
         self.registry_path = Some(path.into());
+        self.entry_component = None;
+        self
+    }
+
+    /// Path to a River-style `[[entry]]` registry, imported as `component`.
+    /// See [`Registry::from_entry_toml_str`] for the import rules.
+    pub fn entry_registry(mut self, path: impl Into<PathBuf>, component: Component) -> Self {
+        self.registry_path = Some(path.into());
+        self.entry_component = Some(component);
         self
     }
 
@@ -42,16 +86,41 @@ impl Codegen {
         self
     }
 
-    /// Name of the emitted contract const (default `CONTRACT_LINEAGE`). Set this
-    /// to alias to an existing name (e.g. River's `LEGACY_ROOM_CONTRACT_...`).
+    /// Whether to emit the canonical `ContractLineageEntry` /
+    /// `DelegateLineageEntry` consts (default `true`). Set `false` for a
+    /// views-only output that needs no `freenet-migrate` runtime dependency.
+    pub fn canonical_consts(mut self, emit: bool) -> Self {
+        self.canonical = emit;
+        self
+    }
+
+    /// Name of the emitted canonical contract const (default
+    /// `CONTRACT_LINEAGE`).
     pub fn contract_const_name(mut self, name: impl Into<String>) -> Self {
         self.contract_const = Some(name.into());
         self
     }
 
-    /// Name of the emitted delegate const (default `DELEGATE_LINEAGE`).
+    /// Name of the emitted canonical delegate const (default
+    /// `DELEGATE_LINEAGE`).
     pub fn delegate_const_name(mut self, name: impl Into<String>) -> Self {
         self.delegate_const = Some(name.into());
+        self
+    }
+
+    /// Also emit `pub const {name}: &[[u8; 32]]` — the contract code hashes in
+    /// registry order. Matches River's hand-rolled
+    /// `LEGACY_ROOM_CONTRACT_CODE_HASHES` shape.
+    pub fn contract_hash_view(mut self, name: impl Into<String>) -> Self {
+        self.contract_hash_view = Some(name.into());
+        self
+    }
+
+    /// Also emit `pub const {name}: &[([u8; 32], [u8; 32])]` — the delegate
+    /// rows in registry order, each tuple **`(delegate_key, code_hash)`** (that
+    /// order — matching River's hand-rolled `LEGACY_DELEGATES` shape).
+    pub fn delegate_pair_view(mut self, name: impl Into<String>) -> Self {
+        self.delegate_pair_view = Some(name.into());
         self
     }
 
@@ -62,23 +131,44 @@ impl Codegen {
         self
     }
 
-    /// Render the generated Rust source as a string (pure; no I/O beyond reading
-    /// the registry file). Useful for tests.
+    /// Render the generated Rust source as a string (pure; no I/O beyond
+    /// reading the registry file). Useful for tests.
     pub fn generate_string(&self) -> Result<String, BuildError> {
         let path = self.registry_path.as_ref().ok_or(BuildError::NoRegistry)?;
-        let registry = Registry::from_path(path)?;
+        let registry = match self.entry_component {
+            Some(component) => Registry::from_entry_path(path, component)?,
+            None => Registry::from_path(path)?,
+        };
         self.render(&registry)
     }
 
     /// Render from an already-parsed registry (no file I/O). Validates first.
     pub fn render(&self, registry: &Registry) -> Result<String, BuildError> {
         registry.validate()?;
-        let crate_path = self.crate_path.as_deref().unwrap_or("::freenet_migrate");
-        let contract_const = self.contract_const.as_deref().unwrap_or("CONTRACT_LINEAGE");
-        let delegate_const = self.delegate_const.as_deref().unwrap_or("DELEGATE_LINEAGE");
+        if !self.canonical && self.contract_hash_view.is_none() && self.delegate_pair_view.is_none()
+        {
+            return Err(BuildError::NothingToEmit);
+        }
 
         let mut out = String::new();
         out.push_str("// @generated by freenet-migrate-build — do not edit.\n\n");
+
+        if self.canonical {
+            self.render_canonical(registry, &mut out)?;
+        }
+        if let Some(name) = &self.contract_hash_view {
+            render_contract_hash_view(registry, name, &mut out)?;
+        }
+        if let Some(name) = &self.delegate_pair_view {
+            render_delegate_pair_view(registry, name, &mut out)?;
+        }
+        Ok(out)
+    }
+
+    fn render_canonical(&self, registry: &Registry, out: &mut String) -> Result<(), BuildError> {
+        let crate_path = self.crate_path.as_deref().unwrap_or("::freenet_migrate");
+        let contract_const = self.contract_const.as_deref().unwrap_or("CONTRACT_LINEAGE");
+        let delegate_const = self.delegate_const.as_deref().unwrap_or("DELEGATE_LINEAGE");
 
         out.push_str(&format!(
             "pub const {contract_const}: &[{crate_path}::ContractLineageEntry] = &[\n"
@@ -87,7 +177,7 @@ impl Codegen {
             out.push_str(&format!(
                 "    {crate_path}::ContractLineageEntry {{ generation: {}u32, code_hash: {}, note: {} }},\n",
                 row.generation,
-                rust_str(&row.code_hash),
+                fmt_bytes32(&row.code_hash_bytes()?),
                 rust_str(&row.note),
             ));
         }
@@ -98,20 +188,22 @@ impl Codegen {
         ));
         for row in &registry.delegate {
             out.push_str(&format!(
-                "    {crate_path}::DelegateLineageEntry {{ generation: {}u32, code_hash: {}, delegate_key: {}, note: {} }},\n",
+                "    {crate_path}::DelegateLineageEntry {{ generation: {}u32, code_hash: {}, delegate_key: {}, irregular_key: {}, note: {} }},\n",
                 row.generation,
-                rust_str(&row.code_hash),
-                rust_str(&row.delegate_key),
+                fmt_bytes32(&row.code_hash_bytes()?),
+                fmt_bytes32(&row.delegate_key_bytes()?),
+                row.irregular_key,
                 rust_str(&row.note),
             ));
         }
-        out.push_str("];\n");
-
-        Ok(out)
+        out.push_str("];\n\n");
+        Ok(())
     }
 
     /// Read the registry, render the consts, and write them into `$OUT_DIR`.
-    /// Emits `cargo:rerun-if-changed` for the registry. Returns the output path.
+    /// Emits `cargo:rerun-if-changed` for the registry, and skips the write
+    /// when the content is unchanged (avoiding spurious recompilation for
+    /// build scripts that re-run unconditionally). Returns the output path.
     pub fn emit(self) -> Result<PathBuf, BuildError> {
         let out_dir =
             std::env::var("OUT_DIR").map_err(|_| BuildError::Env("OUT_DIR not set".to_string()))?;
@@ -121,13 +213,59 @@ impl Codegen {
             .unwrap_or_else(|| "lineage.rs".to_string());
         let dest = Path::new(&out_dir).join(&file);
         let code = self.generate_string()?;
-        std::fs::write(&dest, code)
-            .map_err(|e| BuildError::Io(format!("writing {}: {e}", dest.display())))?;
+        let existing = std::fs::read_to_string(&dest).unwrap_or_default();
+        if existing != code {
+            std::fs::write(&dest, code)
+                .map_err(|e| BuildError::Io(format!("writing {}: {e}", dest.display())))?;
+        }
         if let Some(reg) = &self.registry_path {
             println!("cargo:rerun-if-changed={}", reg.display());
         }
         Ok(dest)
     }
+}
+
+fn render_contract_hash_view(
+    registry: &Registry,
+    name: &str,
+    out: &mut String,
+) -> Result<(), BuildError> {
+    out.push_str(&format!("pub const {name}: &[[u8; 32]] = &[\n"));
+    for row in &registry.contract {
+        if !row.note.is_empty() {
+            out.push_str(&format!("    // {}\n", row.note));
+        }
+        out.push_str(&format!("    {},\n", fmt_bytes32(&row.code_hash_bytes()?)));
+    }
+    out.push_str("];\n\n");
+    Ok(())
+}
+
+fn render_delegate_pair_view(
+    registry: &Registry,
+    name: &str,
+    out: &mut String,
+) -> Result<(), BuildError> {
+    out.push_str(&format!("pub const {name}: &[([u8; 32], [u8; 32])] = &[\n"));
+    for row in &registry.delegate {
+        if !row.note.is_empty() {
+            out.push_str(&format!("    // {}\n", row.note));
+        }
+        // Tuple order is (delegate_key, code_hash) — River's LEGACY_DELEGATES.
+        out.push_str(&format!(
+            "    ({}, {}),\n",
+            fmt_bytes32(&row.delegate_key_bytes()?),
+            fmt_bytes32(&row.code_hash_bytes()?),
+        ));
+    }
+    out.push_str("];\n\n");
+    Ok(())
+}
+
+/// Format a 32-byte array as a Rust literal.
+fn fmt_bytes32(bytes: &[u8; 32]) -> String {
+    let inner: Vec<String> = bytes.iter().map(|b| b.to_string()).collect();
+    format!("[{}]", inner.join(", "))
 }
 
 /// Format `s` as a Rust string literal (quotes + escaped body).
@@ -138,12 +276,24 @@ fn rust_str(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::registry::{ContractRow, DelegateRow};
+    use crate::registry::{derive_delegate_key, ContractRow, DelegateRow};
 
     fn b58(b: [u8; 32]) -> String {
         bs58::encode(b)
             .with_alphabet(bs58::Alphabet::BITCOIN)
             .into_string()
+    }
+
+    fn regular_delegate_row(code: [u8; 32], generation: u32, note: &str) -> DelegateRow {
+        let dk = derive_delegate_key(&code, &[]);
+        DelegateRow {
+            generation,
+            code_hash: b58(code),
+            delegate_key: b58(dk),
+            params_hex: String::new(),
+            irregular_key: false,
+            note: note.to_string(),
+        }
     }
 
     fn sample_registry() -> Registry {
@@ -160,17 +310,12 @@ mod tests {
                     note: String::new(),
                 },
             ],
-            delegate: vec![DelegateRow {
-                generation: 0,
-                code_hash: b58([4; 32]),
-                delegate_key: b58([3; 32]),
-                note: "delegate v1".to_string(),
-            }],
+            delegate: vec![regular_delegate_row([4; 32], 0, "delegate v1")],
         }
     }
 
     #[test]
-    fn renders_default_const_names_and_entries() {
+    fn renders_default_const_names_and_byte_entries() {
         let reg = sample_registry();
         let out = codegen().render(&reg).unwrap();
         assert!(out.contains(
@@ -179,31 +324,106 @@ mod tests {
         assert!(out.contains(
             "pub const DELEGATE_LINEAGE: &[::freenet_migrate::DelegateLineageEntry] = &["
         ));
+        // Hashes are emitted as byte arrays, decoded at build time.
         assert!(out.contains(&format!(
-            "::freenet_migrate::ContractLineageEntry {{ generation: 0u32, code_hash: \"{}\", note: \"v1\" }},",
-            b58([1; 32])
+            "::freenet_migrate::ContractLineageEntry {{ generation: 0u32, code_hash: {}, note: \"v1\" }},",
+            fmt_bytes32(&[1; 32])
         )));
+        let dk = derive_delegate_key(&[4; 32], &[]);
         assert!(out.contains(&format!(
-            "::freenet_migrate::DelegateLineageEntry {{ generation: 0u32, code_hash: \"{}\", delegate_key: \"{}\", note: \"delegate v1\" }},",
-            b58([4; 32]),
-            b58([3; 32])
+            "::freenet_migrate::DelegateLineageEntry {{ generation: 0u32, code_hash: {}, delegate_key: {}, irregular_key: false, note: \"delegate v1\" }},",
+            fmt_bytes32(&[4; 32]),
+            fmt_bytes32(&dk),
         )));
+        // No base58 strings survive into the generated code.
+        assert!(!out.contains(&b58([1; 32])));
     }
 
     #[test]
     fn honors_alias_names_and_crate_path() {
         let reg = sample_registry();
         let out = codegen()
-            .contract_const_name("LEGACY_ROOM_CONTRACT_CODE_HASHES")
-            .delegate_const_name("LEGACY_DELEGATES")
+            .contract_const_name("MY_CONTRACTS")
+            .delegate_const_name("MY_DELEGATES")
             .crate_path("crate::migrate")
             .render(&reg)
             .unwrap();
-        assert!(out.contains(
-            "pub const LEGACY_ROOM_CONTRACT_CODE_HASHES: &[crate::migrate::ContractLineageEntry] = &["
-        ));
-        assert!(out.contains("pub const LEGACY_DELEGATES: &[crate::migrate::DelegateLineageEntry]"));
+        assert!(
+            out.contains("pub const MY_CONTRACTS: &[crate::migrate::ContractLineageEntry] = &[")
+        );
+        assert!(out.contains("pub const MY_DELEGATES: &[crate::migrate::DelegateLineageEntry]"));
         assert!(!out.contains("::freenet_migrate::"));
+    }
+
+    #[test]
+    fn contract_hash_view_matches_river_shape() {
+        let reg = sample_registry();
+        let out = codegen()
+            .canonical_consts(false)
+            .contract_hash_view("LEGACY_ROOM_CONTRACT_CODE_HASHES")
+            .render(&reg)
+            .unwrap();
+        assert!(out.contains("pub const LEGACY_ROOM_CONTRACT_CODE_HASHES: &[[u8; 32]] = &["));
+        assert!(out.contains("    // v1\n"));
+        assert!(out.contains(&format!("    {},\n", fmt_bytes32(&[1; 32]))));
+        assert!(out.contains(&format!("    {},\n", fmt_bytes32(&[2; 32]))));
+        // Views-only output must not reference the runtime crate.
+        assert!(!out.contains("::freenet_migrate::"));
+    }
+
+    #[test]
+    fn delegate_pair_view_is_delegate_key_then_code_hash() {
+        let code = [4u8; 32];
+        let dk = derive_delegate_key(&code, &[]);
+        let reg = Registry {
+            contract: vec![],
+            delegate: vec![regular_delegate_row(code, 0, "delegate v1")],
+        };
+        let out = codegen()
+            .canonical_consts(false)
+            .delegate_pair_view("LEGACY_DELEGATES")
+            .render(&reg)
+            .unwrap();
+        assert!(out.contains("pub const LEGACY_DELEGATES: &[([u8; 32], [u8; 32])] = &["));
+        // Order pinned: (delegate_key, code_hash) — NOT (code_hash, delegate_key).
+        assert!(out.contains(&format!(
+            "    ({}, {}),\n",
+            fmt_bytes32(&dk),
+            fmt_bytes32(&code)
+        )));
+        assert!(out.contains("    // delegate v1\n"));
+    }
+
+    #[test]
+    fn views_and_canonical_can_coexist() {
+        let reg = sample_registry();
+        let out = codegen()
+            .contract_hash_view("HASHES")
+            .delegate_pair_view("PAIRS")
+            .render(&reg)
+            .unwrap();
+        assert!(out.contains("pub const CONTRACT_LINEAGE"));
+        assert!(out.contains("pub const HASHES"));
+        assert!(out.contains("pub const PAIRS"));
+    }
+
+    #[test]
+    fn empty_registry_emits_empty_views() {
+        let out = codegen()
+            .canonical_consts(false)
+            .contract_hash_view("HASHES")
+            .render(&Registry::default())
+            .unwrap();
+        assert!(out.contains("pub const HASHES: &[[u8; 32]] = &[\n];\n"));
+    }
+
+    #[test]
+    fn nothing_to_emit_is_an_error() {
+        let err = codegen()
+            .canonical_consts(false)
+            .render(&Registry::default())
+            .unwrap_err();
+        assert_eq!(err, BuildError::NothingToEmit);
     }
 
     #[test]

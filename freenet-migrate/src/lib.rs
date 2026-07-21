@@ -52,8 +52,8 @@ pub mod lineage;
 pub mod successor;
 
 pub use contract::{
-    contract_id_from_code_hash, predecessor_ids, resolve_predecessors, CarryForward,
-    PermissiveValidatorAck, Resolution,
+    contract_id_from_code_hash, contract_id_from_code_hash_b58, predecessor_ids,
+    resolve_predecessors, CarryForward, PermissiveValidatorAck, Resolution,
 };
 pub use delegate::{
     handle_export_request, import_secrets_once, predecessor_delegate_keys,
