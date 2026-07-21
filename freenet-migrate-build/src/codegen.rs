@@ -505,8 +505,17 @@ mod tests {
         let err = build().emit().unwrap_err();
         assert!(matches!(err, BuildError::Io(_)));
 
-        perms.set_readonly(false);
-        std::fs::set_permissions(&dest, perms).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        #[cfg(not(unix))]
+        {
+            #[allow(clippy::permissions_set_readonly_false)]
+            perms.set_readonly(false);
+            std::fs::set_permissions(&dest, perms).unwrap();
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 
