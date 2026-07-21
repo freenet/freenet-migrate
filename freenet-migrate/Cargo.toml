@@ -1,7 +1,9 @@
 [package]
 name = "freenet-migrate"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
+# u64::is_multiple_of (and CI clippy expects it) — needs 1.87+.
+rust-version = "1.87"
 license = "LGPL-3.0-only"
 description = "Reusable contract/delegate upgrade-migration machinery for Freenet dApps"
 repository = "https://github.com/freenet/freenet-migrate"

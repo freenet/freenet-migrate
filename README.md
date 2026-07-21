@@ -76,10 +76,11 @@ this crate will not paper over that.
 When you cut v2, record v1's code hash in a `legacy.toml` at your crate root:
 
 ```toml
-# legacy.toml — the predecessor registry (base58 code hashes, stdlib's string form)
+# legacy.toml — the predecessor registry. Hashes may be base58 (stdlib's string
+# form) or 64-char hex (what b3sum prints); both decode at BUILD time.
 [[contract]]
 generation = 1
-code_hash  = "9xF...v1codehash..."     # blake3(v1 wasm), base58
+code_hash  = "9xF...v1codehash..."     # blake3(v1 wasm)
 note       = "v1: initial release"
 
 [[delegate]]
@@ -88,6 +89,14 @@ code_hash    = "7kQ...v1codehash..."
 delegate_key = "7kQ...v1delegatekey..." # blake3(code_hash ‖ params)
 note         = "v1: initial delegate"
 ```
+
+Validation happens at build time: hashes decode to a canonical `[u8; 32]` (a
+typo is a build failure, not a runtime probe miss), and each delegate row's
+`delegate_key` is re-derived from `code_hash` and cross-checked — the
+wrong-derivation incident class (River, Feb 2026) cannot enter a registry.
+Grandfathered rows whose recorded key predates the standard derivation mark
+themselves `irregular_key = true` (the recorded key is what the probe targets);
+delegates with non-empty params record them as `params_hex`.
 
 In `build.rs`, codegen the lineage consts and (optionally) run the CI hash-guard:
 
@@ -106,6 +115,32 @@ guard (`check_migration_guard`) asserts the rule "if the built WASM's hash
 changed, the old hash must be registered as a predecessor" — wire it into a test
 or a small xtask so an unregistered re-key fails CI instead of stranding data.
 
+**Adopting in an existing app**: the codegen also reads River-style `[[entry]]`
+TOMLs and can emit plain byte-array *view* consts matching hand-rolled const
+shapes/types/values, with no `freenet-migrate` runtime dependency — call sites,
+scripts, and CI stay unchanged. The one registry edit the validation may demand:
+a delegate row whose recorded key predates the standard derivation needs
+`irregular_key = true` added (in River's registry that is V1, one line; the
+`DelegateKeyMismatch` build error says exactly which row and what to do). Build
+scripts with extra behaviors keep them via `.rerun_if_changed(false)` (preserve
+Cargo's re-run-every-build heuristic, e.g. for a `BUILD_TIMESTAMP`) and
+`.allow_missing_registry(true)` (empty consts when the registry file isn't
+shipped, e.g. docs.rs builds):
+
+```rust,no_run
+// e.g. River's common/build.rs — same file, same consumers, crate-owned codegen
+use freenet_migrate_build::Component;
+freenet_migrate_build::codegen()
+    .entry_registry("legacy_room_contracts.toml", Component::Contract)
+    .canonical_consts(false)                              // views only
+    .contract_hash_view("LEGACY_ROOM_CONTRACT_CODE_HASHES") // &[[u8; 32]]
+    .out_file("legacy_room_contracts.rs")
+    .emit()
+    .expect("codegen legacy room-contract hashes");
+// ui/build.rs: .delegate_pair_view("LEGACY_DELEGATES")
+//   → &[([u8; 32], [u8; 32])] in (delegate_key, code_hash) order
+```
+
 ### 2. Contract state carry-forward (runtime)
 
 `predecessor_ids` reconstructs each old `ContractInstanceId` from
@@ -117,7 +152,7 @@ current key:
 use freenet_migrate::{predecessor_ids, CarryForward};
 
 // Reconstruct predecessor keys from the codegen'd lineage + your stable params.
-let old_ids = predecessor_ids(&params, CONTRACT_LINEAGE)?;
+let old_ids = predecessor_ids(&params, CONTRACT_LINEAGE); // infallible: hashes were validated at build time
 
 // GET each old id (app-side); fold the recovered state forward.
 let mut current = MyState::default();
@@ -230,9 +265,14 @@ Key derivation is cross-checked **byte-for-byte** against stdlib's real
 
 ## Status
 
-Draft: the reusable core machinery + tests. Integrating River/Delta (pointing
-their `build.rs` at the codegen, swapping their migration internals for crate
-calls) is a later step. Targets current stdlib **0.8.x**.
+The reusable core machinery + tests. 0.2.0 makes the codegen shape canonical
+`[u8; 32]` (build-time-validated), accepts hex and base58 registries plus
+River-style `[[entry]]` files, adds the byte-array view consts for existing
+apps, and restores the `delegate_key` derivation cross-check. Integrating
+River/Delta (pointing their `build.rs` at the codegen, then swapping their
+migration internals for crate calls) is the current adoption step
+([freenet/river#398](https://github.com/freenet/river/issues/398)). Targets
+current stdlib **0.8.x**.
 
 ## License
 

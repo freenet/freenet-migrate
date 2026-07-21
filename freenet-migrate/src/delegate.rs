@@ -28,8 +28,8 @@
 //! (see its docs for the fragility and the Horizon-B `NodeCopyForward` seam).
 
 use freenet_stdlib::prelude::{
-    ApplicationMessage, ContractInstanceId, DelegateKey, MessageOrigin, OutboundDelegateMsg,
-    Parameters,
+    ApplicationMessage, CodeHash, ContractInstanceId, DelegateKey, MessageOrigin,
+    OutboundDelegateMsg, Parameters,
 };
 use serde::{Deserialize, Serialize};
 
@@ -518,45 +518,60 @@ impl SecretTransport for ReRunOldWasm {
     }
 }
 
-/// Reconstruct every predecessor `DelegateKey` from the lineage, for addressing
-/// old delegates during a probe.
+/// The predecessor `DelegateKey`s to address old delegates during a probe.
 ///
-/// Uses stdlib `DelegateKey::from_params` = `blake3(code_hash ‖ params)`. For
-/// the empty delegate params River and Delta use, this equals the stored
-/// `delegate_key`; the reconstruction and the stored value can be cross-checked
-/// with [`predecessor_delegate_keys_checked`].
-pub fn predecessor_delegate_keys(
-    params: &Parameters,
-    lineage: &[DelegateLineageEntry],
-) -> Result<Vec<DelegateKey>, MigrateError> {
+/// Built from each entry's **stored** `delegate_key` — the key the old delegate
+/// actually had on the network — never by re-deriving from `code_hash`. The
+/// distinction is load-bearing for `irregular_key` rows (e.g. River's V1/V2,
+/// whose recorded keys predate the standard derivation): re-derivation would
+/// target a key that never existed, so the probe would silently find nothing
+/// and strand that generation's data. Regular rows' stored keys are
+/// cross-checked against the derivation at build time (and again in
+/// [`predecessor_delegate_keys_checked`]), so using the stored key never
+/// weakens the regular case.
+///
+/// Infallible: a generated lineage's keys cannot be malformed (decoded and
+/// validated at build time).
+pub fn predecessor_delegate_keys(lineage: &[DelegateLineageEntry]) -> Vec<DelegateKey> {
     lineage
         .iter()
-        .map(|e| {
-            DelegateKey::from_params(e.code_hash, params)
-                .map_err(|err| MigrateError::BadCodeHash(format!("{:?}: {err}", e.code_hash)))
-        })
+        .map(|e| DelegateKey::new(e.delegate_key, CodeHash::new(e.code_hash)))
         .collect()
 }
 
-/// Like [`predecessor_delegate_keys`], but also asserts each reconstructed key's
-/// base58 equals the registry's stored `delegate_key` (a build/data-integrity
-/// guard, mirroring Delta's build-time assert).
+/// Like [`predecessor_delegate_keys`], but re-derives
+/// `blake3(code_hash ‖ params)` for every **regular** entry and asserts it
+/// equals the stored `delegate_key` (a data-integrity guard mirroring Delta's
+/// build-time assert; `irregular_key` rows are exempt by definition — their
+/// recorded keys deliberately do not derive).
+///
+/// The single `params` is applied to every entry, so this check only holds for
+/// lineages whose generations all share the caller's params (the empty-params
+/// River/Delta case). A registry with per-row `params_hex` values is instead
+/// cross-checked per-row at build time by `freenet-migrate-build`'s
+/// `Registry::validate`; the probe itself ([`predecessor_delegate_keys`]) is
+/// params-independent either way, since it targets stored keys.
 pub fn predecessor_delegate_keys_checked(
     params: &Parameters,
     lineage: &[DelegateLineageEntry],
 ) -> Result<Vec<DelegateKey>, MigrateError> {
-    let keys = predecessor_delegate_keys(params, lineage)?;
-    for (entry, key) in lineage.iter().zip(keys.iter()) {
-        if key.encode() != entry.delegate_key {
+    for entry in lineage.iter().filter(|e| !e.irregular_key) {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&entry.code_hash);
+        hasher.update(params.as_ref());
+        let derived = *hasher.finalize().as_bytes();
+        if derived != entry.delegate_key {
             return Err(MigrateError::BadCodeHash(format!(
-                "delegate gen {}: reconstructed key {} != registered {}",
+                "delegate gen {}: derived key {} != registered {}",
                 entry.generation,
-                key.encode(),
-                entry.delegate_key
+                bs58::encode(derived)
+                    .with_alphabet(bs58::Alphabet::BITCOIN)
+                    .into_string(),
+                entry.delegate_key_b58(),
             )));
         }
     }
-    Ok(keys)
+    Ok(predecessor_delegate_keys(lineage))
 }
 
 // The wasm-only bridge over the real delegate context. Double-gated on
@@ -1134,51 +1149,78 @@ mod tests {
     }
 
     #[test]
-    fn predecessor_delegate_keys_reconstructs_blake3_of_code_hash() {
+    fn predecessor_delegate_keys_uses_stored_key_and_checked_agrees() {
         // River/Delta delegates use empty params, so key = blake3(code_hash).
         let params = Parameters::from(Vec::new());
         let wasm = b"delegate wasm v1";
         let code_hash = CodeHash::from_code(wasm);
-        let ch_b58 = code_hash.encode();
 
         // Independent expected derivation: blake3(code_hash ‖ params).
         let mut h = blake3::Hasher::new();
         h.update(&*code_hash);
         h.update(params.as_ref());
         let expected_key = *h.finalize().as_bytes();
-        let expected_key_b58 = bs58::encode(expected_key)
-            .with_alphabet(bs58::Alphabet::BITCOIN)
-            .into_string();
 
-        let ch_static: &'static str = Box::leak(ch_b58.into_boxed_str());
-        let dk_static: &'static str = Box::leak(expected_key_b58.clone().into_boxed_str());
         let lineage = [DelegateLineageEntry {
             generation: 0,
-            code_hash: ch_static,
-            delegate_key: dk_static,
+            code_hash: *code_hash,
+            delegate_key: expected_key,
+            irregular_key: false,
             note: "v1",
         }];
 
-        let keys = predecessor_delegate_keys(&params, &lineage).unwrap();
+        let keys = predecessor_delegate_keys(&lineage);
         assert_eq!(keys[0].bytes(), expected_key);
-        // The checked variant agrees because the stored key matches.
-        predecessor_delegate_keys_checked(&params, &lineage).unwrap();
+        assert_eq!(keys[0].code_hash(), &code_hash);
+        // Cross-check against stdlib's own derivation from the b58 string.
+        let stdlib_key = DelegateKey::from_params(code_hash.encode(), &params).unwrap();
+        assert_eq!(keys[0], stdlib_key);
+        // The checked variant agrees because the stored key derives correctly.
+        assert_eq!(
+            predecessor_delegate_keys_checked(&params, &lineage).unwrap(),
+            keys
+        );
     }
 
     #[test]
     fn predecessor_delegate_keys_checked_flags_mismatch() {
         let params = Parameters::from(Vec::new());
-        let wasm = b"delegate wasm v2";
-        let ch_b58 = CodeHash::from_code(wasm).encode();
-        let ch_static: &'static str = Box::leak(ch_b58.into_boxed_str());
         let lineage = [DelegateLineageEntry {
             generation: 0,
-            code_hash: ch_static,
-            // Deliberately wrong stored key.
-            delegate_key: "11111111111111111111111111111111",
+            code_hash: *CodeHash::from_code(b"delegate wasm v2"),
+            // Deliberately wrong stored key on a row NOT marked irregular.
+            delegate_key: [7u8; 32],
+            irregular_key: false,
             note: "",
         }];
         let err = predecessor_delegate_keys_checked(&params, &lineage).unwrap_err();
         assert!(matches!(err, MigrateError::BadCodeHash(_)));
+    }
+
+    #[test]
+    fn irregular_rows_probe_recorded_key_and_pass_checked() {
+        // River V1/V2 class: the recorded key does NOT derive from code_hash.
+        // The probe must target the recorded key (re-derivation would target a
+        // key that never existed on the network), and `_checked` must exempt
+        // the row rather than fail the whole lineage.
+        let params = Parameters::from(Vec::new());
+        let recorded_key = [9u8; 32]; // not blake3(code_hash ‖ params)
+        let lineage = [DelegateLineageEntry {
+            generation: 1,
+            code_hash: *CodeHash::from_code(b"ancient delegate wasm"),
+            delegate_key: recorded_key,
+            irregular_key: true,
+            note: "V1: pre-standard derivation",
+        }];
+        let keys = predecessor_delegate_keys(&lineage);
+        assert_eq!(keys[0].bytes(), recorded_key);
+        // The full DelegateKey addresses by (key, code_hash) — the code_hash
+        // field must carry the entry's real code hash, not a derived one.
+        assert_eq!(
+            keys[0].code_hash(),
+            &CodeHash::from_code(b"ancient delegate wasm")
+        );
+        let checked = predecessor_delegate_keys_checked(&params, &lineage).unwrap();
+        assert_eq!(checked[0].bytes(), recorded_key);
     }
 }
