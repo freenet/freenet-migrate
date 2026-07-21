@@ -1207,6 +1207,12 @@ mod tests {
         }];
         let keys = predecessor_delegate_keys(&lineage);
         assert_eq!(keys[0].bytes(), recorded_key);
+        // The full DelegateKey addresses by (key, code_hash) — the code_hash
+        // field must carry the entry's real code hash, not a derived one.
+        assert_eq!(
+            keys[0].code_hash(),
+            &CodeHash::from_code(b"ancient delegate wasm")
+        );
         let checked = predecessor_delegate_keys_checked(&params, &lineage).unwrap();
         assert_eq!(checked[0].bytes(), recorded_key);
     }

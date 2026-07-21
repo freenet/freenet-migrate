@@ -179,6 +179,23 @@ mod tests {
     }
 
     #[test]
+    fn changed_wasm_registered_b58_probed_hex_passes() {
+        // The reverse encoding direction: registered in base58, probed in hex.
+        let reg = registry_with_contract(&code_hash_b58(b"v1"), 4);
+        let outcome = check_migration_guard(
+            Component::Contract,
+            &code_hash_hex(b"v1"),
+            &code_hash_hex(b"v2"),
+            &reg,
+        )
+        .unwrap();
+        assert_eq!(
+            outcome,
+            GuardOutcome::PredecessorRegistered { generation: 4 }
+        );
+    }
+
+    #[test]
     fn guard_is_component_scoped() {
         // A hash registered only under contract must not satisfy a delegate guard.
         let base = code_hash_b58(b"shared");

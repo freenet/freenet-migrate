@@ -199,7 +199,7 @@ impl Registry {
     ///   (see the module docs on the delegate-key cross-check).
     pub fn from_entry_toml_str(s: &str, component: Component) -> Result<Self, BuildError> {
         let file: EntryFile = toml::from_str(s).map_err(|e| BuildError::Toml(e.to_string()))?;
-        let generations = entry_generations(&file.entry);
+        let generations = entry_generations(&file.entry)?;
 
         let mut registry = Registry::default();
         for (row, generation) in file.entry.iter().zip(generations) {
@@ -331,11 +331,28 @@ impl Registry {
     }
 }
 
-/// Derive generations for an `[[entry]]` import: `V<n>` numbers if uniform,
-/// else sequential file order.
-fn entry_generations(rows: &[EntryRow]) -> Vec<u32> {
-    let parsed: Option<Vec<u32>> = rows.iter().map(|r| parse_v_number(&r.version)).collect();
-    parsed.unwrap_or_else(|| (0..rows.len() as u32).collect())
+/// Derive generations for an `[[entry]]` import: `V<n>` numbers when **every**
+/// version parses; sequential file order when **none** does. A mix is an
+/// error — silently renumbering the parseable rows would change lineage
+/// identity (and anti-rollback ordering) for sparse histories.
+fn entry_generations(rows: &[EntryRow]) -> Result<Vec<u32>, BuildError> {
+    let parsed: Vec<Option<u32>> = rows.iter().map(|r| parse_v_number(&r.version)).collect();
+    if parsed.iter().all(|p| p.is_some()) {
+        return Ok(parsed.into_iter().flatten().collect());
+    }
+    if parsed.iter().all(|p| p.is_none()) {
+        return Ok((0..rows.len() as u32).collect());
+    }
+    let offender = rows
+        .iter()
+        .find(|r| parse_v_number(&r.version).is_none())
+        .map(|r| r.version.clone())
+        .unwrap_or_default();
+    Err(BuildError::EntrySchema(format!(
+        "mixed version formats: some entries parse as V<n> but {offender:?} does not; \
+         either every version must be V<n> (numbers used as generations) or none \
+         (sequential generations assigned)"
+    )))
 }
 
 fn parse_v_number(version: &str) -> Option<u32> {
@@ -358,7 +375,12 @@ fn entry_note(row: &EntryRow) -> String {
 }
 
 /// The standard delegate-key derivation: `blake3(code_hash ‖ params)`.
-pub(crate) fn derive_delegate_key(code_hash: &[u8; 32], params: &[u8]) -> [u8; 32] {
+///
+/// Public so consumers (and the cross-crate consistency tests) can pin this
+/// against stdlib's real `DelegateKey::from_params` — the build-time
+/// cross-check in [`Registry::validate`] is only as good as this function's
+/// agreement with what the node actually derives.
+pub fn derive_delegate_key(code_hash: &[u8; 32], params: &[u8]) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(code_hash);
     hasher.update(params);
@@ -399,6 +421,11 @@ pub fn decode_hash32(value: &str) -> Result<[u8; 32], BuildError> {
 }
 
 fn decode_hex(value: &str) -> Result<Vec<u8>, String> {
+    // Reject non-ASCII up front: byte-index slicing below would otherwise
+    // panic mid-codepoint on multibyte input instead of returning an error.
+    if !value.is_ascii() {
+        return Err("contains non-ASCII characters".to_string());
+    }
     if !value.len().is_multiple_of(2) {
         return Err(format!("odd length {}", value.len()));
     }
@@ -753,6 +780,124 @@ code_hash = "{}"
         );
         let err = Registry::from_entry_toml_str(&toml, Component::Delegate).unwrap_err();
         assert!(matches!(err, BuildError::EntrySchema(_)));
+    }
+
+    #[test]
+    fn decode_hash32_rejects_wrong_length_base58() {
+        // Valid base58 decoding to 31 and 33 bytes — the length branch, not
+        // the alphabet branch.
+        let short = bs58::encode([1u8; 31])
+            .with_alphabet(bs58::Alphabet::BITCOIN)
+            .into_string();
+        let long = bs58::encode([1u8; 33])
+            .with_alphabet(bs58::Alphabet::BITCOIN)
+            .into_string();
+        assert!(matches!(
+            decode_hash32(&short),
+            Err(BuildError::InvalidCodeHash { .. })
+        ));
+        assert!(matches!(
+            decode_hash32(&long),
+            Err(BuildError::InvalidCodeHash { .. })
+        ));
+    }
+
+    #[test]
+    fn decode_hash32_rejects_64char_nonhex_base58() {
+        // 64 chars, valid base58 alphabet, but not hex (contains 'z'): takes
+        // the base58 branch and must be rejected (decodes to ~47 bytes) — the
+        // exact disambiguation boundary the module docs claim collision-free.
+        let value = "z".repeat(64); // 'z' is base58-legal but not a hex digit
+        assert!(matches!(
+            decode_hash32(&value),
+            Err(BuildError::InvalidCodeHash { .. })
+        ));
+    }
+
+    #[test]
+    fn decode_hash32_rejects_empty() {
+        assert!(matches!(
+            decode_hash32(""),
+            Err(BuildError::InvalidCodeHash { .. })
+        ));
+    }
+
+    #[test]
+    fn cross_check_rejects_wrong_key_with_params() {
+        // Regular row, NON-empty params, wrong key: the mismatch branch must
+        // include params in its derivation (a "forgot params" bug would let
+        // blake3(code_hash) alone pass here).
+        let code = [5u8; 32];
+        let params = b"delegate params";
+        let params_hex: String = params.iter().map(|b| format!("{b:02x}")).collect();
+        let wrong_key = derive_delegate_key(&code, &[]); // derived WITHOUT params
+        let toml = format!(
+            "[[delegate]]\ngeneration = 0\ncode_hash = \"{}\"\ndelegate_key = \"{}\"\n\
+             params_hex = \"{params_hex}\"\n",
+            b58s(code),
+            b58s(wrong_key),
+        );
+        let err = Registry::from_toml_str(&toml)
+            .unwrap()
+            .validate()
+            .unwrap_err();
+        assert!(matches!(err, BuildError::DelegateKeyMismatch { .. }));
+    }
+
+    #[test]
+    fn invalid_params_hex_is_clean_error() {
+        let (ch, dk) = regular_delegate_pair([1; 32]);
+        for bad in ["abc", "zz", "🦀🦀"] {
+            let toml = format!(
+                "[[delegate]]\ngeneration = 0\ncode_hash = \"{}\"\ndelegate_key = \"{}\"\n\
+                 params_hex = \"{bad}\"\n",
+                b58s(ch),
+                b58s(dk),
+            );
+            let err = Registry::from_toml_str(&toml)
+                .unwrap()
+                .validate()
+                .unwrap_err();
+            assert!(
+                matches!(err, BuildError::InvalidParams { .. }),
+                "params_hex {bad:?}: got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn entry_import_mixed_version_formats_is_error() {
+        // One row parses as V<n>, another doesn't: silently renumbering the
+        // parseable rows would change lineage identity, so this must error.
+        let toml = format!(
+            "[[entry]]\nversion = \"V3\"\ncode_hash = \"{}\"\n\
+             [[entry]]\nversion = \"pre-release\"\ncode_hash = \"{}\"\n",
+            hex([3; 32]),
+            hex([4; 32]),
+        );
+        let err = Registry::from_entry_toml_str(&toml, Component::Contract).unwrap_err();
+        assert!(matches!(err, BuildError::EntrySchema(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn entry_import_duplicate_v_numbers_caught_by_validate() {
+        // Two "V3" entries import (the importer is parse-only) but validate()
+        // — which codegen render() always runs — rejects the duplicate.
+        let toml = format!(
+            "[[entry]]\nversion = \"V3\"\ncode_hash = \"{}\"\n\
+             [[entry]]\nversion = \"V3\"\ncode_hash = \"{}\"\n",
+            hex([3; 32]),
+            hex([4; 32]),
+        );
+        let reg = Registry::from_entry_toml_str(&toml, Component::Contract).unwrap();
+        let err = reg.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            BuildError::DuplicateGeneration {
+                component: "contract",
+                generation: 3
+            }
+        ));
     }
 
     #[test]

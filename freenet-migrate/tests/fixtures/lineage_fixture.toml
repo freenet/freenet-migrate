@@ -1,0 +1,31 @@
+# Fixture registry for the generated-output compile-smoke test.
+[[contract]]
+generation = 0
+code_hash = "415d03916cccddca057d343ce0f5c8dc89606221d0b260f3dfc7344f64dd5b38"
+note = "V1: quote \" and backslash \\ (2025-08-11)"
+
+[[contract]]
+generation = 1
+code_hash = "8qbHbw2BbbTHBW1sbeqakYXVKRQM8Ne7pLK7m6CVfeR"
+note = """multi
+line note"""
+
+[[delegate]]
+generation = 1
+code_hash = "0909090909090909090909090909090909090909090909090909090909090909"
+delegate_key = "0808080808080808080808080808080808080808080808080808080808080808"
+irregular_key = true
+note = "V1: pre-standard recorded key"
+
+[[delegate]]
+generation = 2
+code_hash = "0404040404040404040404040404040404040404040404040404040404040404"
+delegate_key = "b1cd635b0dcadf09c456342a3f2504bf84ee4ea67ac0ae4885354e01fbadc04d"
+note = "V2: regular empty-params row"
+
+[[delegate]]
+generation = 3
+code_hash = "0505050505050505050505050505050505050505050505050505050505050505"
+delegate_key = "1a7fcaec055c0a61c4f4f94f5ddb84563b3d86a4376cf944a4abaa28cd72684b"
+params_hex = "6669787475726520706172616d73"
+note = "V3: non-empty params row"

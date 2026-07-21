@@ -4,8 +4,10 @@
 //! wrong key and silently strands state — so this is worth a cross-crate test.
 
 use freenet_migrate::{contract_id_from_code_hash, contract_id_from_code_hash_b58};
-use freenet_migrate_build::{code_hash_b58, code_hash_hex, decode_hash32};
-use freenet_stdlib::prelude::{CodeHash, ContractCode, ContractInstanceId, Parameters};
+use freenet_migrate_build::{code_hash_b58, code_hash_hex, decode_hash32, derive_delegate_key};
+use freenet_stdlib::prelude::{
+    CodeHash, ContractCode, ContractInstanceId, DelegateKey, Parameters,
+};
 
 const WASM: &[u8] = b"room_contract v7 pretend wasm bytes";
 
@@ -37,4 +39,23 @@ fn codegen_hash_reconstructs_stdlib_instance_id() {
         contract_id_from_code_hash_b58(&code_hash_b58(WASM), &params).unwrap(),
         stdlib_id
     );
+}
+
+#[test]
+fn build_delegate_derivation_matches_stdlib() {
+    // The build crate's delegate-key cross-check (Registry::validate) is only
+    // as good as derive_delegate_key's agreement with what the node actually
+    // derives — pin it against stdlib's real DelegateKey::from_params, for
+    // empty params (the River/Delta case) and non-empty params.
+    let code_hash = CodeHash::from_code(WASM);
+    for params_bytes in [b"".to_vec(), b"delegate parameters".to_vec()] {
+        let params = Parameters::from(params_bytes.clone());
+        let stdlib_key = DelegateKey::from_params(code_hash.encode(), &params).unwrap();
+        assert_eq!(
+            derive_delegate_key(&code_hash, &params_bytes),
+            stdlib_key.bytes(),
+            "build-crate delegate derivation diverged from stdlib (params len {})",
+            params_bytes.len()
+        );
+    }
 }

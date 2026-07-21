@@ -60,4 +60,6 @@ mod registry;
 pub use codegen::{codegen, Codegen};
 pub use error::BuildError;
 pub use guard::{check_migration_guard, code_hash_b58, code_hash_hex, GuardOutcome};
-pub use registry::{decode_hash32, Component, ContractRow, DelegateRow, Registry};
+pub use registry::{
+    decode_hash32, derive_delegate_key, Component, ContractRow, DelegateRow, Registry,
+};

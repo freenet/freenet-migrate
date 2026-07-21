@@ -233,7 +233,7 @@ fn render_contract_hash_view(
     out.push_str(&format!("pub const {name}: &[[u8; 32]] = &[\n"));
     for row in &registry.contract {
         if !row.note.is_empty() {
-            out.push_str(&format!("    // {}\n", row.note));
+            out.push_str(&format!("    // {}\n", comment_safe(&row.note)));
         }
         out.push_str(&format!("    {},\n", fmt_bytes32(&row.code_hash_bytes()?)));
     }
@@ -249,7 +249,7 @@ fn render_delegate_pair_view(
     out.push_str(&format!("pub const {name}: &[([u8; 32], [u8; 32])] = &[\n"));
     for row in &registry.delegate {
         if !row.note.is_empty() {
-            out.push_str(&format!("    // {}\n", row.note));
+            out.push_str(&format!("    // {}\n", comment_safe(&row.note)));
         }
         // Tuple order is (delegate_key, code_hash) — River's LEGACY_DELEGATES.
         out.push_str(&format!(
@@ -260,6 +260,13 @@ fn render_delegate_pair_view(
     }
     out.push_str("];\n\n");
     Ok(())
+}
+
+/// Make a note safe for a single-line `//` comment: line breaks would leave
+/// the remainder of the note as bare (uncompilable) tokens in the generated
+/// file.
+fn comment_safe(note: &str) -> String {
+    note.replace(['\n', '\r'], " ")
 }
 
 /// Format a 32-byte array as a Rust literal.
@@ -424,6 +431,83 @@ mod tests {
             .render(&Registry::default())
             .unwrap_err();
         assert_eq!(err, BuildError::NothingToEmit);
+    }
+
+    #[test]
+    fn view_note_with_newline_stays_single_comment_line() {
+        // A multi-line note must not leak bare tokens past the `//` comment
+        // (which would make the generated file uncompilable).
+        let reg = Registry {
+            contract: vec![ContractRow {
+                generation: 0,
+                code_hash: b58([1; 32]),
+                note: "line one\nline two\r\nline three".to_string(),
+            }],
+            delegate: vec![],
+        };
+        let out = codegen()
+            .canonical_consts(false)
+            .contract_hash_view("HASHES")
+            .render(&reg)
+            .unwrap();
+        assert!(out.contains("    // line one line two  line three\n"));
+        // Every non-empty line in the output is a comment, a const header, an
+        // entry, or a closing bracket — nothing dangling.
+        for line in out.lines().filter(|l| !l.trim().is_empty()) {
+            let t = line.trim_start();
+            assert!(
+                t.starts_with("//")
+                    || t.starts_with("pub const")
+                    || t.starts_with('[')
+                    || t == "];",
+                "dangling line in generated output: {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn emit_writes_then_skips_unchanged() {
+        // emit() must write on first call and skip the write when the content
+        // is unchanged (pinned by making the file read-only: a skipped write
+        // succeeds, an attempted rewrite errors).
+        let dir =
+            std::env::temp_dir().join(format!("freenet-migrate-emit-test-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok(); // clear any read-only leftover
+        std::fs::create_dir_all(&dir).unwrap();
+        let registry_path = dir.join("legacy.toml");
+        std::fs::write(&registry_path, "").unwrap();
+        std::env::set_var("OUT_DIR", &dir);
+
+        let build = || {
+            codegen()
+                .registry(&registry_path)
+                .out_file("lineage_emit_test.rs")
+        };
+        let dest = build().emit().unwrap();
+        let first = std::fs::read_to_string(&dest).unwrap();
+        assert!(first.contains("pub const CONTRACT_LINEAGE"));
+
+        let mut perms = std::fs::metadata(&dest).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&dest, perms.clone()).unwrap();
+        // Unchanged content: the write is skipped, so read-only is no obstacle.
+        build().emit().unwrap();
+        // Changed registry → changed content → a real write is attempted and
+        // fails against the read-only file, proving the skip wasn't a no-op.
+        std::fs::write(
+            &registry_path,
+            format!(
+                "[[contract]]\ngeneration = 0\ncode_hash = \"{}\"\n",
+                b58([3; 32])
+            ),
+        )
+        .unwrap();
+        let err = build().emit().unwrap_err();
+        assert!(matches!(err, BuildError::Io(_)));
+
+        perms.set_readonly(false);
+        std::fs::set_permissions(&dest, perms).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
