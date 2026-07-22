@@ -226,6 +226,46 @@ pointer.verify_and_check_supersedes(&signer.public_key(), app_id, current_genera
 
 ### 3. Delegate secret carry-forward (runtime)
 
+**The app-facing entry point is `migrate_delegate_secrets`** — carry each
+predecessor delegate's secrets forward into the successor, with consent required
+from day one. The transport underneath (app-side round-trips today, a node-side
+copy tomorrow) is an internal detail apps do not program against — that altitude
+is the whole point, so a future node copy-forward is a drop-in with no app
+re-adoption.
+
+```rust,ignore
+use freenet_migrate::{
+    migrate_delegate_secrets, MigrationAuthorization, PredecessorSecretsIo,
+};
+
+// `io` implements PredecessorSecretsIo: `probe_executable` sends a cheap no-op to
+// an old delegate key (G1.8 preflight); `fetch_secrets` enumerates its secrets —
+// both in the app's own delegate protocol (DelegateRequest::ApplicationMessages),
+// with the app's own response correlation (a browser has no request/response
+// correlation, so the app supplies it — e.g. a per-request oneshot side-table).
+let report = migrate_delegate_secrets(
+    &mut ctx,                                     // successor SecretStore
+    &mut io,                                      // reaches the predecessors
+    DELEGATE_LINEAGE,                             // predecessor LIST (codegen'd)
+    MigrationAuthorization::app_author_ack(),     // consent — required, no default
+).await?;
+
+// The #204 UX fix: if a predecessor could not be reached, DO NOT fresh-install —
+// surface "your data may exist but can't auto-migrate".
+if report.any_unresponsive() {
+    // show the can't-migrate notice; never silently start empty
+}
+```
+
+Predecessors are processed newest-generation-first (never-clobber, so the newest
+value wins), each import keyed by the **predecessor delegate key** so a future
+node copy-forward writes the same anti-resurrection marker; a re-run is a no-op.
+Predecessor data is never deleted (`no-delete` invariant) — the marker, not
+deletion, is the anti-resurrection mechanism, and the intact predecessor is the
+rollback story. `register_delegate_with_migration` bundles registering the
+successor delegate with the same migration.
+
+Underneath, the delegate-side **export/import primitives** do the mechanical work.
 The export enumerates secrets *generically* via `SecretStore::list_secrets`
 instead of a hand-maintained per-type fan-out, removing the per-**type** omission
 that cost Delta its data. It is **not** an unconditional "copy every secret": the
@@ -256,8 +296,10 @@ let out = handle_export_request(
     &export_request,
 )?;
 
-// v2 delegate (new WASM): import once. `successor_generation` is this delegate's
-// own generation; the export's source_generation must be strictly older.
+// v2 delegate (new WASM): import once. The high-level entry point drives the
+// delegate-key-keyed `import_predecessor_secrets_once` (seam-safe — a node copy
+// writes the same marker). `import_secrets_once` below is the lower-level
+// generation-keyed primitive, for a single-generation app-side round-trip.
 match import_secrets_once(&mut ctx, &exported, successor_generation)? {
     ImportOutcome::Imported { imported, skipped, .. } => { /* wrote `imported` */ }
     ImportOutcome::AlreadyMigrated { .. }             => { /* no-op */ }
@@ -265,11 +307,16 @@ match import_secrets_once(&mut ctx, &exported, successor_generation)? {
 }
 ```
 
-> The transport that reaches into a predecessor delegate (`SecretTransport` /
-> `ReRunOldWasm`) is a **documented stub** in this release — it returns
-> `TransportUnavailable`. Today apps carry the export app-side via
-> `DelegateRequest::ApplicationMessages` round-trips (as River/Delta do); the
-> stub is the seam a future node-mediated transport drops into with no API break.
+> **The transport is an internal, redesigned seam, not part of the app-facing
+> API.** Apps call `migrate_delegate_secrets`; today it drives the interim
+> app-side `DelegateRequest::ApplicationMessages` round-trips (as River/Delta do).
+> When the node-side copy-forward lands (freenet-core#2776), it slots under the
+> *unchanged* entry point — it copies secrets between namespaces internally
+> without executing old code, killing the `ReRunOldWasm` / #204 landmine, and
+> needs no app re-adoption. This is the plan-v2 correction over v1's
+> `SecretTransport::export_from(predecessor) -> ExportedSecrets`, which could host
+> neither transport (the interim path is async and uncorrelated; the node path
+> returns nothing app-side).
 
 ### Known limitations
 
@@ -288,6 +335,14 @@ match import_secrets_once(&mut ctx, &exported, successor_generation)? {
   and then retried re-imports the still-missing keys and cannot distinguish "never
   imported" from "imported then user-deleted", so a key deleted during that narrow
   window can be resurrected by the completing retry.
+- **Old-delegate-WASM retention (G1.8 preflight dependency).** The preflight can
+  only tell "predecessor can't execute" from "predecessor has no data" while the
+  node still has the old delegate WASM registered. If the old WASM has been
+  dropped, an unregistered predecessor is indistinguishable from a broken one —
+  both surface as `Unresponsive`, which the app must show rather than silently
+  fresh-installing. Old-WASM retention is a hard platform prerequisite of the
+  interim path; the node-side copy-forward removes the dependency by reading
+  storage directly.
 
 ## Building & testing
 
@@ -308,10 +363,17 @@ Key derivation is cross-checked **byte-for-byte** against stdlib's real
 The reusable core machinery + tests. 0.2.0 makes the codegen shape canonical
 `[u8; 32]` (build-time-validated), accepts hex and base58 registries plus
 River-style `[[entry]]` files, adds the byte-array view consts for existing
-apps, and restores the `delegate_key` derivation cross-check. Integrating
-River/Delta (pointing their `build.rs` at the codegen, then swapping their
-migration internals for crate calls) is the current adoption step
-([freenet/river#398](https://github.com/freenet/river/issues/398)). Targets
+apps, and restores the `delegate_key` derivation cross-check. 0.3.0 adds the
+sans-IO contract backward-probe decision driver + pumped `migrate_contract`
+entry point. 0.4.0 adds the delegate-side app-facing entry points
+(`migrate_delegate_secrets` / `register_delegate_with_migration`) with consent
+(`MigrationAuthorization`) required from day one, the G1.8 executability
+preflight (so a broken old delegate surfaces rather than silently
+fresh-installing — freenet/river#204), and the redesigned sans-IO transport seam
+a future node-side copy-forward (freenet-core#2776) swaps under with no app
+re-adoption. Integrating River/Delta (pointing their `build.rs` at the codegen,
+then swapping their migration internals for crate calls) is the current adoption
+step ([freenet/river#398](https://github.com/freenet/river/issues/398)). Targets
 current stdlib **0.8.x**.
 
 ## License

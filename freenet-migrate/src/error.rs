@@ -79,7 +79,9 @@ pub enum MigrateError {
     /// replayed across apps that share a release key.
     EmptyAppId,
     /// The secret transport could not produce the predecessor's secrets.
-    /// [`crate::delegate::ReRunOldWasm`] returns this today (see its docs).
+    /// Reserved for a future node-mediated transport's capability-detection /
+    /// unavailable path (the interim app-side transport surfaces I/O failures
+    /// through the app's own `PredecessorSecretsIo::Error` instead).
     TransportUnavailable(String),
     /// Hosted per-user (user-scope) secrets cannot be migrated at rest, because
     /// the node cannot decrypt them without the user's live token (design §2.3
