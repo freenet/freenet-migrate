@@ -63,9 +63,11 @@ pub use contract::{
 };
 pub use delegate::{
     handle_export_request, import_predecessor_secrets_once, import_secrets_once,
-    predecessor_delegate_keys, predecessor_delegate_keys_checked, ExportRequest, ExportScope,
-    ExportedSecrets, ImportOutcome, OriginPolicy, PredecessorImportOutcome, SecretPair,
-    SecretStore, SingleAppDelegateAck, HOST_ENUMERATION_CAP,
+    predecessor_delegate_keys, predecessor_delegate_keys_checked, predecessor_done_marker,
+    ExportRequest, ExportScope, ExportedSecrets, ImportOutcome, OriginPolicy,
+    PredecessorImportOutcome, SecretPair, SecretStore, SingleAppDelegateAck, HOST_ENUMERATION_CAP,
+    PRED_DONE_MARKER_KEY_PREFIX, PRED_DONE_MARKER_VALUE_DATA, PRED_DONE_MARKER_VALUE_EMPTY,
+    PRED_DONE_MARKER_VERSION,
 };
 pub use delegate_migrate::{
     migrate_delegate_secrets, register_delegate_with_migration, DelegateMigrationReport,

@@ -71,8 +71,8 @@ use core::future::Future;
 use freenet_stdlib::prelude::{CodeHash, DelegateKey};
 
 use crate::delegate::{
-    import_predecessor_secrets_once, legacy_generation_migrated, predecessor_migration_had_data,
-    PredecessorImportOutcome, SecretPair, SecretStore,
+    import_predecessor_secrets_once, legacy_generation_migrated, legacy_generation_migrated_exact,
+    predecessor_migration_had_data, PredecessorImportOutcome, SecretPair, SecretStore,
 };
 use crate::lineage::DelegateLineageEntry;
 
@@ -137,6 +137,11 @@ pub enum SecretSelectionPolicy {
     /// Documented cost: a key that only ever existed in a generation *older* than
     /// the authoritative one stays unrecovered. Use [`UnionAllGenerations`](Self::UnionAllGenerations)
     /// when recovering such stranded data matters more than delete-by-absence.
+    ///
+    /// **Scope:** these semantics are **app-side** (the interim round-trip path).
+    /// A Gap-3 copy-forward node copies union-with-newest-precedence and does not
+    /// honor this stop-at-first-data-bearing / delete-by-absence guarantee, because
+    /// the v1 wire carries no generations/policy — see `SecretTransport`.
     NewestSnapshotWins,
     /// **Opt-in recovery.** Import *every* predecessor newest-first with
     /// never-clobber (so the newest generation's value still wins any key
@@ -260,6 +265,13 @@ pub trait RegisterAndMigrateIo: PredecessorSecretsIo {
     /// [`migrate_delegate_secrets`] finds the delegate-key markers already
     /// written and reports every predecessor as already-migrated, a no-op. The
     /// wrapper's signature does not change.
+    ///
+    /// **`predecessors` is supplied newest-generation-first** (guaranteed by
+    /// [`register_delegate_with_migration`]). Send the keys to the node in that
+    /// order: the v1 wire carries only the key list and the node copies with
+    /// first-writer-wins, so newest-first yields newest-precedence. The v1 node
+    /// copy is union-with-newest-precedence and does NOT honor `policy` (which is
+    /// forwarded only for a future wire evolution) — see `SecretTransport`.
     fn register_successor(
         &mut self,
         predecessors: &[DelegateLineageEntry],
@@ -499,6 +511,13 @@ where
 /// the predecessor list to the node (which does the copy-forward), and the
 /// migration step becomes a no-op — the signature is unchanged.
 ///
+/// The predecessors handed to `register_successor` are sorted **newest-first**
+/// here, because a copy-forward node copies in supplied order with
+/// first-writer-wins (newest-first ⇒ newest-precedence). See
+/// [`RegisterAndMigrateIo::register_successor`] and the `SecretTransport` docs
+/// for what the v1 node copy does and does NOT guarantee (it is
+/// union-with-newest-precedence, not `NewestSnapshotWins`).
+///
 /// # Errors
 ///
 /// Returns `IO::Error` only if the pre-migration `register_successor` fails (no
@@ -516,7 +535,12 @@ where
     IO: RegisterAndMigrateIo,
     IO::Error: core::fmt::Debug,
 {
-    io.register_successor(predecessors, &authorization, &policy)
+    // The lineage is oldest-first by convention; the node needs newest-first
+    // (first-writer-wins ⇒ newest-precedence), so sort here and guarantee the
+    // contract rather than trusting the caller's slice order.
+    let mut newest_first = predecessors.to_vec();
+    newest_first.sort_by_key(|e| core::cmp::Reverse(e.generation));
+    io.register_successor(&newest_first, &authorization, &policy)
         .await?;
     Ok(migrate_delegate_secrets(store, io, predecessors, authorization, policy).await)
 }
@@ -537,14 +561,30 @@ where
 /// mechanism is non-viable. The real seam is **register-time copy + shared
 /// markers**:
 ///
-/// 1. [`register_delegate_with_migration`] passes the predecessor list +
-///    authorization + policy to [`RegisterAndMigrateIo::register_successor`].
+/// 1. [`register_delegate_with_migration`] passes the predecessor list
+///    (**newest-first**) + authorization to [`RegisterAndMigrateIo::register_successor`].
 /// 2. On a node with the copy-forward primitive, registration copies each
 ///    predecessor's secrets into the successor **internally, without executing
-///    old code**, and writes the **same** delegate-key `pred-done` markers this
-///    interim path writes (via `import_predecessor_secrets_once`).
-/// 3. The subsequent [`migrate_delegate_secrets`] then finds every predecessor
-///    already marked and short-circuits each to `AlreadyMigrated` — a no-op.
+///    old code**, and writes the **same** public `pred-done` marker
+///    ([`crate::predecessor_done_marker`]) for each predecessor it *fully* copies.
+/// 3. The subsequent [`migrate_delegate_secrets`] then finds every completed
+///    predecessor already marked and short-circuits each to `AlreadyMigrated` — a
+///    no-op. A predecessor the node only partially copied has **no** marker, so
+///    the interim app-side round-trip retries it.
+///
+/// ## What the v1 node copy does — and does NOT — guarantee
+///
+/// The v1 wire carries only `Vec<DelegateKey>` (no generations, no policy). The
+/// node copies in the supplied order, **first-writer-wins**, so with a
+/// newest-first list it is **union-with-newest-precedence**: every predecessor is
+/// copied, the newest value wins a key conflict. It therefore does **not**
+/// implement [`SecretSelectionPolicy::NewestSnapshotWins`]'s
+/// stop-at-first-data-bearing / delete-by-absence preservation — that is an
+/// **app-side-only** semantic in v1. So on a copy-forward node the effective
+/// cross-generation behavior is Union regardless of the `policy` argument;
+/// `policy`'s finer semantics apply only to the app-side fallback path. (A future
+/// wire evolution could carry generations/policy and close the gap.) This does
+/// not promise policy preservation node-side.
 ///
 /// So the app-facing entry points are unchanged, the shared `pred-done` markers
 /// are the interoperability contract, and this interim app-side round-trip is the
@@ -565,7 +605,7 @@ pub(crate) trait SecretTransport<S: SecretStore + ?Sized> {
     ) -> impl Future<Output = DelegateMigrationReport>;
 }
 
-/// The interim [`SecretTransport`]: app-side request/response round-trips through
+/// The interim `SecretTransport`: app-side request/response round-trips through
 /// the [`PredecessorSecretsIo`] adapter, importing with the delegate-key-keyed
 /// primitive. This supersedes v1's `ReRunOldWasm` stub — there is no node re-run
 /// of old WASM here; the app ferries the export round-trip.
@@ -625,10 +665,22 @@ where
             }
 
             // Already migrated? The delegate-key marker (with its data/empty flag),
-            // OR — defensively — a legacy generation-keyed marker that covers this
-            // generation (P1#3 bridge). Skip the round-trips entirely.
-            let already = predecessor_migration_had_data(store, &key)
-                .or_else(|| legacy_generation_migrated(store, generation).then_some(true));
+            // OR — defensively — a legacy generation-keyed marker (P1#3 bridge),
+            // which is policy-aware: under NewestSnapshotWins a newer legacy
+            // snapshot is authoritative so `>=` seals older generations; under
+            // Union only the EXACT generation is done (generations *below* the
+            // legacy done marker were barred by monotonicity, never copied, so
+            // Union must still recover them). Skip the round-trips entirely.
+            let legacy = match policy {
+                SecretSelectionPolicy::NewestSnapshotWins => {
+                    legacy_generation_migrated(store, generation)
+                }
+                SecretSelectionPolicy::UnionAllGenerations(_) => {
+                    legacy_generation_migrated_exact(store, generation)
+                }
+            };
+            let already =
+                predecessor_migration_had_data(store, &key).or_else(|| legacy.then_some(true));
             if let Some(had_data) = already {
                 if policy.already_migrated_is_authoritative(had_data) {
                     terminated = true;
@@ -679,7 +731,39 @@ where
             // NoData is imported through here too (empty slice), so its marker is
             // written and a re-run is a true no-op (P1#2).
             let outcome = import_predecessor_secrets_once(store, &key, &secrets);
-            let migration = classify_import(key, generation, outcome);
+            let migration = match outcome {
+                PredecessorImportOutcome::Imported { imported, skipped } => {
+                    // Classify by the PERSISTED marker flag (the source of truth a
+                    // retry preserves), not the raw counts: a data-then-empty retry
+                    // writes 0 secrets but keeps its data-bearing marker, so it is
+                    // still Imported (authoritative), not NoData (P1 retry-flip).
+                    if predecessor_migration_had_data(store, &key) == Some(true) {
+                        PredecessorMigration::Imported {
+                            key,
+                            generation,
+                            imported,
+                            skipped,
+                        }
+                    } else {
+                        PredecessorMigration::NoData { key, generation }
+                    }
+                }
+                // Concurrent marker appearance; the driver already gated on it.
+                PredecessorImportOutcome::AlreadyMigrated => {
+                    PredecessorMigration::AlreadyMigrated { key, generation }
+                }
+                PredecessorImportOutcome::Incomplete {
+                    imported,
+                    skipped,
+                    failed,
+                } => PredecessorMigration::Incomplete {
+                    key,
+                    generation,
+                    imported,
+                    skipped,
+                    failed,
+                },
+            };
             match &migration {
                 // Data-bearing snapshot: authoritative under NewestSnapshotWins.
                 PredecessorMigration::Imported { .. } => {
@@ -709,49 +793,10 @@ where
     }
 }
 
-/// Map a per-predecessor import outcome to its report entry. An
-/// `Imported { imported: 0, skipped: 0 }` (no real secret processed) is a
-/// [`PredecessorMigration::NoData`]; any write or skip means the predecessor was
-/// data-bearing.
-fn classify_import(
-    key: DelegateKey,
-    generation: u32,
-    outcome: PredecessorImportOutcome,
-) -> PredecessorMigration {
-    match outcome {
-        PredecessorImportOutcome::Imported {
-            imported: 0,
-            skipped: 0,
-        } => PredecessorMigration::NoData { key, generation },
-        PredecessorImportOutcome::Imported { imported, skipped } => {
-            PredecessorMigration::Imported {
-                key,
-                generation,
-                imported,
-                skipped,
-            }
-        }
-        PredecessorImportOutcome::AlreadyMigrated => {
-            PredecessorMigration::AlreadyMigrated { key, generation }
-        }
-        PredecessorImportOutcome::Incomplete {
-            imported,
-            skipped,
-            failed,
-        } => PredecessorMigration::Incomplete {
-            key,
-            generation,
-            imported,
-            skipped,
-            failed,
-        },
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::delegate::{done_marker, pred_done_marker};
+    use crate::delegate::{done_marker, pred_done_marker, predecessor_done_marker};
     use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
     // ---- test successor store -------------------------------------------------
@@ -1585,28 +1630,21 @@ mod tests {
     // ---- Gap 3 seam: register-time node copy + shared markers ----------------
 
     #[test]
-    fn node_register_time_copy_shares_markers_and_short_circuits_migrate() {
-        // The real Gap-3 realization (fidelity F1): a node copies a predecessor's
-        // secrets at REGISTER time — internally, no io, no old-WASM execution —
-        // writing the SAME delegate-key pred-done marker this crate's interim path
-        // writes. The unchanged app-facing migrate then finds the marker and
-        // short-circuits to AlreadyMigrated (no round-trip, no re-import). This is
-        // the interoperability contract, NOT a second SecretTransport impl routed
-        // inside migrate.
+    fn node_register_time_copy_via_public_marker_short_circuits_migrate() {
+        // The real Gap-3 realization (fidelity F1 + Codex P1): a node copies a
+        // predecessor's secrets at REGISTER time — internally, no io, no old-WASM
+        // execution — and seals it by writing the completion marker through the
+        // PUBLIC, versioned format (`predecessor_done_marker`), the exact contract
+        // surface core uses. The unchanged app-facing migrate then finds the marker
+        // and short-circuits to AlreadyMigrated. NOT a second SecretTransport impl.
         let e = entry(1, 1);
         let mut store = MemStore::default();
 
-        // The node's internal register-time copy, via the shared seam-safe primitive.
-        let outcome = import_predecessor_secrets_once(
-            &mut store,
-            &key_of(&e),
-            &[(b"nk".to_vec(), b"nv".to_vec())],
-        );
-        assert!(matches!(
-            outcome,
-            PredecessorImportOutcome::Imported { imported: 1, .. }
-        ));
-        assert_eq!(store.get_secret(b"nk").unwrap(), b"nv");
+        // The node's register-time copy: copy the secret + seal via the public
+        // marker format (had_data = true, ≥1 secret copied).
+        store.set_secret(b"nk", b"nv");
+        let (marker_key, marker_value) = predecessor_done_marker(&key_of(&e), true);
+        store.set_secret(&marker_key, &marker_value);
 
         // The unchanged app-facing entry point sees the node-written marker and is
         // a no-op — no predecessor round-trip, no resurrection.
@@ -1623,7 +1661,7 @@ mod tests {
                 report.predecessors[0],
                 PredecessorMigration::AlreadyMigrated { .. }
             ),
-            "the interim path must recognize the node-written delegate-key marker"
+            "the interim path must recognize the node-written public marker"
         );
         assert!(
             !io.probed.contains(key_of(&e).bytes()),
@@ -1633,6 +1671,45 @@ mod tests {
             store.get_secret(b"nk").unwrap(),
             b"nv",
             "not resurrected/clobbered"
+        );
+    }
+
+    #[test]
+    fn legacy_bridge_under_union_only_seals_the_exact_generation() {
+        // P2 (legacy bridge vs Union): with a legacy done:5 marker, Union treats
+        // ONLY gen 5 as already-migrated; gen 3 (below) was BARRED by the legacy
+        // path's monotonicity (never copied), so Union must still recover it.
+        let g5 = entry(5, 5);
+        let g3 = entry(3, 3);
+        let mut store = MemStore::default();
+        store.set_secret(&done_marker(5), b"1");
+        let mut io = MockIo::default()
+            .executable_with(&key_of(&g5), &[(b"a", b"5")])
+            .executable_with(&key_of(&g3), &[(b"b", b"3")]);
+        let report = block_on(migrate_delegate_secrets(
+            &mut store,
+            &mut io,
+            &[g3, g5],
+            ack(),
+            union(),
+        ));
+        // Newest-first: g5 (exact legacy → AlreadyMigrated), g3 (below → imported).
+        assert!(matches!(
+            report.predecessors[0],
+            PredecessorMigration::AlreadyMigrated { .. }
+        ));
+        assert!(matches!(
+            report.predecessors[1],
+            PredecessorMigration::Imported { .. }
+        ));
+        assert_eq!(
+            store.get_secret(b"b").unwrap(),
+            b"3",
+            "a generation below the legacy done marker IS recovered under Union"
+        );
+        assert!(
+            store.get_secret(b"a").is_none(),
+            "the exact legacy generation is not re-imported"
         );
     }
 }

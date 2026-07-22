@@ -127,19 +127,32 @@ generation, sig }`, `verify(release_pk, app_id)`, `supersedes(current_generation
 Generation bounds *backward* replay only; forward key-compromise stays
 unmitigated and must be documented, not hidden.
 
-**Delegate export/import behind a swappable transport:**
+**Delegate secret carry-forward — high-level entry points over a sans-IO adapter:**
 
 ```rust
-pub fn handle_export_request(ctx, origin, policy: OriginPolicy, req) -> Result<Vec<OutboundDelegateMsg>, _>; // v1 side; enumerates ctx.list_secrets(b"") generically
-pub fn import_secrets_once(ctx, exported) -> Result<ImportOutcome, _>;  // v2 side; writes "migrated:<gen>" marker so a stray old-WASM re-run can't resurrect deleted data
-pub trait SecretTransport { fn export_from(&self, predecessor: &DelegateKey) -> Result<ExportedSecrets, _>; }
-pub struct ReRunOldWasm; impl SecretTransport for ReRunOldWasm { /* today: node runs old WASM */ }
+// The stable, app-facing entry points (consent + policy required, day one):
+pub async fn migrate_delegate_secrets(store, io, predecessors, authorization, policy) -> DelegateMigrationReport;
+pub async fn register_delegate_with_migration(store, io, predecessors, authorization, policy) -> Result<DelegateMigrationReport, IO::Error>;
+// io = PredecessorSecretsIo: probe_executable (G1.8 preflight) + fetch_secrets, one round-trip per call.
+
+// Delegate-side primitives the entry points drive:
+pub fn handle_export_request(ctx, origin, policy: OriginPolicy, scope, req) -> Result<Vec<OutboundDelegateMsg>, _>; // enumerates ctx.list_secrets(b"") generically
+pub fn import_predecessor_secrets_once(store, predecessor: &DelegateKey, secrets) -> PredecessorImportOutcome;      // delegate-key-keyed marker
+pub fn predecessor_done_marker(predecessor: &DelegateKey, had_data: bool) -> (Vec<u8>, Vec<u8>);                   // PUBLIC, versioned marker contract with core
 ```
 
 The generic `list_secrets` export copies **every** secret by construction — this
 structurally eliminates the per-type-export omission that cost Delta site data in
 April 2026. (Pre-crate predecessors still need a `LegacyExportAdapter` wrapping
 the app's existing per-type export.)
+
+**Altitude correction (plan v2):** the app-facing contract is the high-level entry
+points plus the delegate-key `pred-done` marker, **not** a swappable
+`SecretTransport { export_from -> ExportedSecrets }` trait. That synchronous,
+bytes-returning trait could host neither real transport — the interim path is
+app-side async round-trips through an uncorrelated handler, and a node copy
+returns nothing app-side — so it was removed. `SecretTransport` survives only as
+the crate-private factoring of the interim app-side round-trip.
 
 ## 3. Preconditions as first-class
 
@@ -161,25 +174,38 @@ safe carry-forward** from this design — with permissionless re-PUT, a maliciou
 node can inject crafted state under the new key — and the crate refuses to
 pretend otherwise.
 
-## 4. Fragility & the Horizon-B hand-off (the `SecretTransport` seam)
+## 4. Fragility & the Gap-3 hand-off (entry points + register-time copy + marker contract)
 
-Delegate secret copy still bottoms out on **re-running old WASM**
-(`ReRunOldWasm` — the node loads and runs the old delegate to answer the export;
-the exact path a stdlib/ABI bump breaks, River V4–V6 / #204 data loss). The crate
-does not eliminate that fragility; it **contains** it:
+Delegate secret copy interim-bottoms-out on the **app-side round-trip** to the old
+delegate (the app enumerates the predecessor's secrets in its own protocol; the
+node executing a predecessor still runs its WASM, the path a stdlib/ABI bump
+breaks — River V4–V6 / #204). The crate does not eliminate that fragility; it
+**contains** it and provides the seam for a node-side primitive to remove it:
 
-- the two-phase anti-resurrection marker bounds the damage of a stray old-WASM
-  re-run, and
-- `SecretTransport` is the **seam**. When the platform-level primitive (the
-  "Horizon-B" node-mediated `SecretsStore::migrate_secrets`, deferred on #2776)
-  lands, adding `struct NodeCopyForward; impl SecretTransport` is a **drop-in with
-  no API break** — callers are written against the trait, not the concrete
-  transport.
+- the two-phase, delegate-key-keyed anti-resurrection marker bounds the damage of
+  a stray re-import, and
+- the **seam is the app-facing entry points plus a public, versioned marker
+  contract**, NOT a swappable transport trait. When the platform primitive (the
+  node-mediated secret copy-forward, freenet-core#2776) lands, it copies each
+  predecessor's secrets **at registration time** (the `register_successor` path
+  carries the predecessor list newest-first) and seals each fully-copied
+  predecessor by writing the exact `predecessor_done_marker(key, had_data)` secret.
+  The unchanged `migrate_delegate_secrets` then finds those markers and
+  short-circuits every predecessor to `AlreadyMigrated` — **no API break, no app
+  re-adoption**, with the app-side round-trip as the pre-primitive fallback.
+
+**What the v1 node copy does NOT guarantee:** the v1 wire carries only
+`Vec<DelegateKey>` (no generations/policy), so the node copy is
+union-with-newest-precedence and does not implement `NewestSnapshotWins`'s
+delete-by-absence preservation — that stays app-side-only in v1 (a future wire
+evolution could carry generations/policy). The earlier "`NodeCopyForward: impl
+SecretTransport` drop-in routed inside migrate" framing was non-viable (the io
+reaches predecessors, not the node) and is retired.
 
 Hosted per-user secrets stay un-migratable at rest even under a node-mediated
-transport (their DEK keying material is the user's secret, deliberately not the
-node KEK), so the crate returns `MigrateError::UserScopeNotAtRest` and documents
-the "only while the user is online" limit rather than papering over it.
+copy (their DEK keying material is the user's secret, deliberately not the node
+KEK), so the crate returns `MigrateError::UserScopeNotAtRest` and documents the
+"only while the user is online" limit rather than papering over it.
 
 ## 5. Incremental adoption (no flag-day)
 
