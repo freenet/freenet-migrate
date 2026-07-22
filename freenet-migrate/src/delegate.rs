@@ -589,12 +589,31 @@ pub enum PredecessorImportOutcome {
 /// precisely so its marker is written and a later re-run is a true no-op even if
 /// the old delegate later gains data.
 ///
-/// ## Residual limit
+/// ## Residual limits
 ///
-/// The same interrupted-then-retried window as [`import_secrets_once`]: a key the
-/// user deletes *during* an interrupted migration can be resurrected by the
-/// completing retry. It exists only between a partial import and its retry; once
-/// the completion marker is written it is closed for good.
+/// **Interrupted-then-retried (per-predecessor).** The same window as
+/// [`import_secrets_once`]: a key the user deletes *during* an interrupted
+/// migration can be resurrected by the completing retry. It exists only between a
+/// partial import and its retry, and closing it is scoped **to this predecessor's
+/// marker** — once *this predecessor's* completion marker is written the window is
+/// closed for that predecessor (it says nothing about other predecessors).
+///
+/// **Lineage growth.** Because the marker is per-predecessor, appending a *new,
+/// older* predecessor to the lineage after a completed migration presents an
+/// unmarked predecessor whose keys have never been imported — re-opening the
+/// resurrection window for keys unique to it (a key the user deleted that lives
+/// only in that late-added generation could come back when it is imported). How
+/// the driver handles it depends on the [`crate::SecretSelectionPolicy`]:
+///
+/// * `NewestSnapshotWins` (default) **closes this window** whenever a newer
+///   predecessor already yielded data: on the re-run the newer predecessor's
+///   data-bearing `pred-done` marker re-establishes authority, so the late-added
+///   older predecessor is `Superseded` and never imported. It is imported only if
+///   no newer predecessor has yet yielded data (the ordinary "recover from the
+///   older generation" case).
+/// * `UnionAllGenerations` imports the late-added older predecessor (never-clobber,
+///   so only keys the successor lacks), which is exactly the ack'd
+///   delete-by-absence resurrection that policy opts into.
 pub fn import_predecessor_secrets_once<S: SecretStore + ?Sized>(
     store: &mut S,
     predecessor: &DelegateKey,

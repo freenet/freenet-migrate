@@ -298,7 +298,12 @@ silently beyond it, so the export **detects** cap saturation and refuses with
 in by the completion marker). You choose an `ExportScope`: a key prefix (safe on a
 delegate shared by multiple web-apps), or the whole scope via a loudly-named
 single-app acknowledgement. The v2 side imports once, guarded by a two-phase
-anti-resurrection marker (idempotent, never clobbers existing keys):
+anti-resurrection marker (idempotent, never clobbers existing keys). There are two
+import primitives: `import_predecessor_secrets_once` (delegate-key-keyed, the
+seam-safe one the entry point drives) and the lower-level `import_secrets_once`
+(generation-keyed). **Do not mix the two on one delegate's store** — the entry
+point defensively honors a legacy generation marker, but the generation-keyed
+markers are not what a future node copy-forward writes, so pick one API per store:
 
 ```rust,ignore
 use freenet_migrate::{

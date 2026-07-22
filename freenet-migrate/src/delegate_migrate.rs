@@ -5,10 +5,11 @@
 //!
 //! The **stable app-facing contract is the high-level entry points**
 //! ([`migrate_delegate_secrets`], [`register_delegate_with_migration`]), with
-//! consent ([`MigrationAuthorization`]) baked in from day one. The transport that
-//! actually moves the secrets — app-side round-trips today, a node-side copy
-//! tomorrow — is an **internal, redesigned detail** (the crate-private
-//! `SecretTransport` seam), not something apps program against.
+//! consent ([`MigrationAuthorization`]) baked in from day one, plus the
+//! delegate-key `pred-done` markers as the cross-transport interoperability
+//! contract. The transport that actually moves the secrets — the interim app-side
+//! round-trips today, a node-internal copy at *registration* tomorrow (writing
+//! those same markers) — is a detail apps do not program against.
 //!
 //! This is the load-bearing correction over v1. The old
 //! `SecretTransport::export_from(predecessor) -> ExportedSecrets` (synchronous,
@@ -35,6 +36,12 @@
 //! owns the **I/O** through a thin [`PredecessorSecretsIo`] adapter (modeled on
 //! the contract side's [`crate::ProbeIo`]): one round-trip per call, correlation
 //! and transport left to the app.
+//!
+//! Unlike the contract side there is deliberately **no hand-pumped raw driver**
+//! here — the adopter's delegate path is already awaitable (River drives each
+//! delegate round-trip to completion through a per-request `oneshot` side-table,
+//! unlike its fire-and-forget contract probe), so a single async entry point over
+//! this adapter is all that is needed.
 //!
 //! ```text
 //! for predecessor in newest_first(predecessors) {   // stop early per policy
@@ -514,20 +521,36 @@ where
     Ok(migrate_delegate_secrets(store, io, predecessors, authorization, policy).await)
 }
 
-/// The redesigned, sans-IO secret transport — **the internal seam Gap 3 swaps
-/// under** (plan G1.7 / G3.6).
+/// The redesigned, sans-IO secret transport — the internal factoring of the
+/// **interim** app-side migration (plan G1.7 / G3.6).
 ///
 /// Replaces v1's `export_from(predecessor) -> ExportedSecrets`: `migrate_from`
 /// takes the predecessor **list** and returns a metadata-only
-/// [`DelegateMigrationReport`] (never bytes, never a bare error), so it can host
-/// *both* the interim app-side round-trip ([`AppSideRoundTrip`]) and a future
-/// `NodeCopyForward` that copies secrets internally and returns nothing app-side.
+/// [`DelegateMigrationReport`] (never bytes, never a bare error). The one impl is
+/// the interim app-side round-trip ([`AppSideRoundTrip`]).
 ///
-/// Intentionally `pub(crate)`: it is NOT the app-facing contract (the entry
-/// points are). When the node primitive lands, add `struct NodeCopyForward; impl
-/// SecretTransport for NodeCopyForward { .. }` and route to it (with capability
-/// detection + the interim as fallback) inside the *unchanged*
-/// [`migrate_delegate_secrets`].
+/// # How Gap 3 (the node copy-forward) actually lands
+///
+/// **Not** by adding a second `SecretTransport` impl routed inside
+/// [`migrate_delegate_secrets`] — the `io` here reaches *predecessors*, and
+/// nothing on the migrate path can trigger a node-internal copy, so that
+/// mechanism is non-viable. The real seam is **register-time copy + shared
+/// markers**:
+///
+/// 1. [`register_delegate_with_migration`] passes the predecessor list +
+///    authorization + policy to [`RegisterAndMigrateIo::register_successor`].
+/// 2. On a node with the copy-forward primitive, registration copies each
+///    predecessor's secrets into the successor **internally, without executing
+///    old code**, and writes the **same** delegate-key `pred-done` markers this
+///    interim path writes (via `import_predecessor_secrets_once`).
+/// 3. The subsequent [`migrate_delegate_secrets`] then finds every predecessor
+///    already marked and short-circuits each to `AlreadyMigrated` — a no-op.
+///
+/// So the app-facing entry points are unchanged, the shared `pred-done` markers
+/// are the interoperability contract, and this interim app-side round-trip is the
+/// **fallback** for nodes that predate the copy-forward primitive. Intentionally
+/// `pub(crate)`: the transport is not the app-facing contract (the entry points
+/// and the markers are).
 pub(crate) trait SecretTransport<S: SecretStore + ?Sized> {
     /// Migrate the secrets of every predecessor in `predecessors` into `store`,
     /// once each, under `policy`. Returns a per-predecessor report; never returns
@@ -1559,56 +1582,36 @@ mod tests {
         ));
     }
 
-    // ---- the seam: a non-io transport (NodeCopyForward shape) fits ------------
+    // ---- Gap 3 seam: register-time node copy + shared markers ----------------
 
     #[test]
-    fn secret_transport_seam_hosts_a_non_io_transport() {
-        // Proves the redesigned seam can host a transport that does NOT use `io`
-        // and returns no bytes app-side — the NodeCopyForward shape. It writes the
-        // SAME delegate-key markers via the shared primitive, so a later
-        // migrate_delegate_secrets over the same predecessor is AlreadyMigrated.
-        struct NodeCopyForwardMock {
-            /// canned "storage" the node would copy directly, per predecessor key.
-            store: HashMap<Vec<u8>, Vec<SecretPair>>,
-        }
-        impl<S: SecretStore + ?Sized> SecretTransport<S> for NodeCopyForwardMock {
-            async fn migrate_from(
-                &mut self,
-                store: &mut S,
-                predecessors: &[DelegateLineageEntry],
-                _authorization: &MigrationAuthorization,
-                _policy: &SecretSelectionPolicy,
-            ) -> DelegateMigrationReport {
-                let mut out = Vec::new();
-                for e in predecessors {
-                    let key = DelegateKey::new(e.delegate_key, CodeHash::new(e.code_hash));
-                    let secrets = self.store.get(key.bytes()).cloned().unwrap_or_default();
-                    // Same seam-safe primitive the app-side path uses.
-                    let outcome = import_predecessor_secrets_once(store, &key, &secrets);
-                    out.push(classify_import(key, e.generation, outcome));
-                }
-                DelegateMigrationReport { predecessors: out }
-            }
-        }
-
+    fn node_register_time_copy_shares_markers_and_short_circuits_migrate() {
+        // The real Gap-3 realization (fidelity F1): a node copies a predecessor's
+        // secrets at REGISTER time — internally, no io, no old-WASM execution —
+        // writing the SAME delegate-key pred-done marker this crate's interim path
+        // writes. The unchanged app-facing migrate then finds the marker and
+        // short-circuits to AlreadyMigrated (no round-trip, no re-import). This is
+        // the interoperability contract, NOT a second SecretTransport impl routed
+        // inside migrate.
         let e = entry(1, 1);
         let mut store = MemStore::default();
-        let mut node = NodeCopyForwardMock {
-            store: HashMap::from([(
-                key_of(&e).bytes().to_vec(),
-                vec![(b"nk".to_vec(), b"nv".to_vec())],
-            )]),
-        };
-        let report = block_on(node.migrate_from(&mut store, &[e], &ack(), &newest()));
+
+        // The node's internal register-time copy, via the shared seam-safe primitive.
+        let outcome = import_predecessor_secrets_once(
+            &mut store,
+            &key_of(&e),
+            &[(b"nk".to_vec(), b"nv".to_vec())],
+        );
         assert!(matches!(
-            report.predecessors[0],
-            PredecessorMigration::Imported { imported: 1, .. }
+            outcome,
+            PredecessorImportOutcome::Imported { imported: 1, .. }
         ));
         assert_eq!(store.get_secret(b"nk").unwrap(), b"nv");
 
-        // The app-side path now sees the node's markers and re-imports nothing.
+        // The unchanged app-facing entry point sees the node-written marker and is
+        // a no-op — no predecessor round-trip, no resurrection.
         let mut io = MockIo::default().executable_with(&key_of(&e), &[(b"nk", b"RESURRECT")]);
-        let after = block_on(migrate_delegate_secrets(
+        let report = block_on(migrate_delegate_secrets(
             &mut store,
             &mut io,
             &[e],
@@ -1617,10 +1620,14 @@ mod tests {
         ));
         assert!(
             matches!(
-                after.predecessors[0],
+                report.predecessors[0],
                 PredecessorMigration::AlreadyMigrated { .. }
             ),
             "the interim path must recognize the node-written delegate-key marker"
+        );
+        assert!(
+            !io.probed.contains(key_of(&e).bytes()),
+            "a register-time node copy means migrate does no predecessor round-trip"
         );
         assert_eq!(
             store.get_secret(b"nk").unwrap(),
