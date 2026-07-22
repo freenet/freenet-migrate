@@ -759,6 +759,19 @@ pub(crate) fn pred_done_marker(predecessor: &DelegateKey) -> Vec<u8> {
 ///
 /// `had_data` is whether at least one real secret was copied from the predecessor
 /// ([`PRED_DONE_MARKER_VALUE_DATA`] vs [`PRED_DONE_MARKER_VALUE_EMPTY`]).
+///
+/// # Contract: markers are per-successor and MUST NOT be swept forward
+///
+/// A marker is written under the successor's Local scope, but a copy-forward
+/// **must not carry the reserved `\0freenet-migrate/` namespace onward** when it
+/// later copies this successor to a *further* successor — skip every registered
+/// key with that prefix during the copy walk. The app-side path already does:
+/// [`import_predecessor_secrets_once`] skips every reserved-namespace key on
+/// import, so it structurally cannot sweep a marker forward. Excluding them
+/// node-side keeps both transports producing byte-identical marker state (a
+/// marker means "this exact migration completed," never "an ancestor's data is
+/// transitively present"), so a later chained migration behaves the same however
+/// each generation was migrated.
 pub fn predecessor_done_marker(predecessor: &DelegateKey, had_data: bool) -> (Vec<u8>, Vec<u8>) {
     let value = if had_data {
         PRED_DONE_MARKER_VALUE_DATA
