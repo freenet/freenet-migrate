@@ -812,6 +812,9 @@ mod tests {
         fn fail_writes_to(&mut self, key: &[u8]) {
             self.fail_keys.insert(key.to_vec());
         }
+        fn stop_failing(&mut self) {
+            self.fail_keys.clear();
+        }
     }
     impl SecretStore for MemStore {
         fn list_secrets(&self, prefix: &[u8]) -> Vec<Vec<u8>> {
@@ -1427,6 +1430,67 @@ mod tests {
                 "older predecessor must not be imported after the halt"
             );
         }
+    }
+
+    #[test]
+    fn empty_incomplete_then_data_retry_seals_data_and_supersedes_older() {
+        // P1 sticky-data, end-to-end (exact order): the newer predecessor B is
+        // EMPTY on attempt 1 and its DONE-marker write fails (Incomplete); on the
+        // retry B brings DATA. The marker must seal DATA-bearing, so B is
+        // authoritative under NewestSnapshotWins and the older A is Superseded —
+        // never imported (no resurrection).
+        let a = entry(1, 1);
+        let b = entry(2, 2);
+        let mut store = MemStore::default();
+        let (b_done_key, _) = predecessor_done_marker(&key_of(&b), true);
+        store.fail_writes_to(&b_done_key);
+
+        // Run 1: B empty → its DONE write fails → Incomplete → halt; A Superseded.
+        let mut io1 = MockIo::default()
+            .executable_with(&key_of(&b), &[])
+            .executable_with(&key_of(&a), &[(b"a_only", b"va")]);
+        let r1 = block_on(migrate_delegate_secrets(
+            &mut store,
+            &mut io1,
+            &[a, b],
+            ack(),
+            newest(),
+        ));
+        assert!(matches!(
+            r1.predecessors[0],
+            PredecessorMigration::Incomplete { .. }
+        ));
+        assert!(matches!(
+            r1.predecessors[1],
+            PredecessorMigration::Superseded { .. }
+        ));
+
+        // Run 2: DONE writes succeed; B now has data → seals DATA → authoritative →
+        // A Superseded, A's data never imported.
+        store.stop_failing();
+        let mut io2 = MockIo::default()
+            .executable_with(&key_of(&b), &[(b"b_only", b"vb")])
+            .executable_with(&key_of(&a), &[(b"a_only", b"va")]);
+        let r2 = block_on(migrate_delegate_secrets(
+            &mut store,
+            &mut io2,
+            &[a, b],
+            ack(),
+            newest(),
+        ));
+        assert!(
+            matches!(r2.predecessors[0], PredecessorMigration::Imported { .. }),
+            "B seals data-bearing on the retry"
+        );
+        assert!(
+            matches!(r2.predecessors[1], PredecessorMigration::Superseded { .. }),
+            "the older A must be Superseded once B is data-bearing"
+        );
+        assert_eq!(store.get_secret(b"b_only").unwrap(), b"vb");
+        assert!(
+            store.get_secret(b"a_only").is_none(),
+            "A must NOT be imported (no resurrection) — the empty→data retry sealed B as data"
+        );
     }
 
     // ---- NoData writes a marker (P1#2) ---------------------------------------

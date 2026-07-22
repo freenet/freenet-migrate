@@ -73,8 +73,8 @@ const DONE_PREFIX: &[u8] = b"\0freenet-migrate/done:";
 /// Predecessor-delegate-key-keyed **in-progress** marker sub-prefix (private;
 /// internal to the two-phase import): `MARKER_NS ++ b"v1/pred-wip:" ++ <32 raw
 /// delegate-key bytes>`. The WIP marker's value carries the data/empty decision
-/// made at first fetch, so a retry preserves it (see
-/// [`import_predecessor_secrets_once`]).
+/// so a retry is **sticky-data** — it keeps a data flag and upgrades an empty one
+/// if the retry brings data (see [`import_predecessor_secrets_once`]).
 const PRED_WIP_PREFIX: &[u8] = b"\0freenet-migrate/v1/pred-wip:";
 
 /// Version of the **public** predecessor completion-marker format (below). The
@@ -474,9 +474,9 @@ struct TwoPhaseWrite {
 ///    then. (Short-circuits: a prior failure never writes the done marker.)
 ///
 /// Both markers are written with `marker_value`. For the delegate-key path this
-/// is the data/empty flag, written on the WIP marker at phase 1 so that a *retry*
-/// (which passes the flag it read back from the surviving WIP marker) preserves
-/// the first attempt's data/empty decision; the generation path passes `b"1"`.
+/// is the data/empty flag, written on the WIP marker at phase 1 so a *retry* can
+/// read it back and apply the sticky-data rule (keep data, upgrade empty→data);
+/// the generation path passes `b"1"`.
 fn write_secrets_two_phase<S: SecretStore + ?Sized>(
     store: &mut S,
     wip_marker: &[u8],
@@ -635,17 +635,19 @@ pub fn import_predecessor_secrets_once<S: SecretStore + ?Sized>(
         return PredecessorImportOutcome::AlreadyMigrated;
     }
 
-    // The data/empty decision is fixed at the FIRST fetch and PRESERVED across a
-    // retry: if a WIP marker survives from an earlier (Incomplete) attempt, reuse
-    // the flag it recorded rather than recomputing from *this* call's secrets.
-    // Otherwise a G2-data-then-Incomplete predecessor whose re-export is empty on
-    // retry would flip its marker to "empty" and lose its NewestSnapshotWins
-    // authority. First attempt: derive the flag from whether any real (non-marker)
-    // secret is present.
+    // The data/empty decision is **sticky-data** across a retry: a predecessor is
+    // sealed data-bearing if ANY attempt saw real data. A surviving WIP marker
+    // from an earlier (Incomplete) attempt carries that attempt's flag; this
+    // attempt ORs its own observation onto it. So BOTH retry directions are safe —
+    // data-then-empty keeps its data flag, and empty-then-data upgrades to data —
+    // and neither can seal the marker "empty" while data was imported, which would
+    // make NewestSnapshotWins misclassify NoData and fall through to older
+    // generations (resurrection). First attempt: just this call's observation.
     let wip_marker = pred_wip_marker(predecessor);
+    let current_had_data = secrets.iter().any(|(k, _)| !is_marker(k));
     let had_data = match store.get_secret(&wip_marker) {
-        Some(flag) => flag != PRED_DONE_MARKER_VALUE_EMPTY,
-        None => secrets.iter().any(|(k, _)| !is_marker(k)),
+        Some(flag) => (flag != PRED_DONE_MARKER_VALUE_EMPTY) || current_had_data,
+        None => current_had_data,
     };
     let marker_value = if had_data {
         PRED_DONE_MARKER_VALUE_DATA
@@ -768,10 +770,12 @@ pub(crate) fn pred_done_marker(predecessor: &DelegateKey) -> Vec<u8> {
 /// key with that prefix during the copy walk. The app-side path already does:
 /// [`import_predecessor_secrets_once`] skips every reserved-namespace key on
 /// import, so it structurally cannot sweep a marker forward. Excluding them
-/// node-side keeps both transports producing byte-identical marker state (a
-/// marker means "this exact migration completed," never "an ancestor's data is
-/// transitively present"), so a later chained migration behaves the same however
-/// each generation was migrated.
+/// node-side gives both transports **identical completion-marker semantics** (a
+/// `pred-done` marker means "this exact migration completed," never "an ancestor's
+/// data is transitively present"), so a later chained migration behaves the same
+/// however each generation was migrated. (The app path additionally leaves a
+/// crate-internal `pred-wip` marker behind; that is not part of the shared
+/// completion contract and is never read once the `pred-done` marker exists.)
 pub fn predecessor_done_marker(predecessor: &DelegateKey, had_data: bool) -> (Vec<u8>, Vec<u8>) {
     let value = if had_data {
         PRED_DONE_MARKER_VALUE_DATA
@@ -1684,6 +1688,46 @@ mod tests {
             predecessor_migration_had_data(&store, &key),
             Some(true),
             "the data flag must be preserved across a data-then-empty retry"
+        );
+    }
+
+    #[test]
+    fn import_predecessor_retry_upgrades_empty_flag_to_data() {
+        // P1 sticky-data (the mirror-image order): attempt 1 is EMPTY and the
+        // DONE-marker write FAILS → Incomplete, recording an empty WIP flag. The
+        // retry brings DATA → the flag must UPGRADE to data-bearing, or
+        // NewestSnapshotWins would misclassify NoData and fall through to older
+        // generations (resurrection).
+        let key = dk(2);
+        let mut store = MemStore::default();
+        // Fail the DONE-marker write so an EMPTY first attempt goes Incomplete
+        // (with the empty WIP flag persisted) rather than completing as NoData.
+        store.fail_writes_to(&pred_done_marker(&key));
+
+        let attempt1 = import_predecessor_secrets_once(&mut store, &key, &[]);
+        assert!(matches!(
+            attempt1,
+            PredecessorImportOutcome::Incomplete { .. }
+        ));
+        assert_eq!(
+            store.get_secret(&pred_wip_marker(&key)),
+            Some(b"0".to_vec()),
+            "attempt 1 recorded an EMPTY WIP flag"
+        );
+
+        // Retry brings data; the DONE-marker write now succeeds.
+        store.stop_failing();
+        let retry =
+            import_predecessor_secrets_once(&mut store, &key, &[(b"x".to_vec(), b"vx".to_vec())]);
+        assert!(matches!(
+            retry,
+            PredecessorImportOutcome::Imported { imported: 1, .. }
+        ));
+        assert_eq!(store.get_secret(b"x").unwrap(), b"vx");
+        assert_eq!(
+            predecessor_migration_had_data(&store, &key),
+            Some(true),
+            "the empty flag must UPGRADE to data-bearing when the retry brings data"
         );
     }
 
