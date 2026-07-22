@@ -37,31 +37,35 @@
 //! and transport left to the app.
 //!
 //! ```text
-//! for predecessor in newest_first(predecessors) {
-//!     if already_migrated(predecessor) { record AlreadyMigrated; continue }
-//!     match io.probe_executable(predecessor).await? {          // G1.8 preflight
-//!         false => { record Unresponsive; continue }           // data may exist,
-//!         true  => {                                           //   can't migrate
-//!             let secrets = io.fetch_secrets(predecessor).await?;
+//! for predecessor in newest_first(predecessors) {   // stop early per policy
+//!     if already_migrated(predecessor) { record AlreadyMigrated; maybe stop }
+//!     match io.probe_executable(predecessor).await {           // G1.8 preflight
+//!         Ok(false) | Err(_) => { record Unresponsive; maybe stop }  // data may
+//!         Ok(true) => {                                              // exist,
+//!             let secrets = io.fetch_secrets(predecessor).await?;    // can't migrate
 //!             import_predecessor_secrets_once(store, predecessor, &secrets)  // §0 marker
 //!         }
 //!     }
 //! }
 //! ```
 //!
+//! Cross-generation selection is an explicit [`SecretSelectionPolicy`]
+//! (`NewestSnapshotWins` default, or `UnionAllGenerations`), the delegate-side
+//! analogue of the contract driver's `NewestFirstWins` / `FoldAll`.
+//!
 //! Honest limits — what stays app code the crate cannot verify: the I/O adapter
-//! itself (send / correlate / time out); what a "cheap no-op probe" is in the
-//! app's own delegate protocol; and (until Gap 3) the dependence on the node
-//! still having the **old delegate WASM registered** so the preflight can reach
-//! it at all (see [`PredecessorSecretsIo::probe_executable`]).
+//! itself (send / correlate / time out); and what a "cheap no-op probe" is in the
+//! app's own delegate protocol. The preflight distinguishes "can't execute" from
+//! "no data" only while the node the request reaches actually has the predecessor
+//! delegate registered/available (see [`PredecessorSecretsIo::probe_executable`]).
 
 use core::future::Future;
 
 use freenet_stdlib::prelude::{CodeHash, DelegateKey};
 
 use crate::delegate::{
-    import_predecessor_secrets_once, predecessor_already_migrated, PredecessorImportOutcome,
-    SecretPair, SecretStore,
+    import_predecessor_secrets_once, legacy_generation_migrated, predecessor_migration_had_data,
+    PredecessorImportOutcome, SecretPair, SecretStore,
 };
 use crate::lineage::DelegateLineageEntry;
 
@@ -83,10 +87,19 @@ use crate::lineage::DelegateLineageEntry;
 pub enum MigrationAuthorization {
     /// Interim no-op: the app author authorizes this migration. There is no
     /// per-transition user consent and no node-recorded same-origin binding yet
-    /// (those arrive with Gap 3's `NodeCopyForward`). Construct it via the loud
-    /// [`MigrationAuthorization::app_author_ack`].
-    AppAuthorAck,
+    /// (those arrive with Gap 3's `NodeCopyForward`).
+    ///
+    /// The variant carries a private token, so [`MigrationAuthorization::app_author_ack`]
+    /// is the *only* way to construct it — a caller cannot bypass the loud
+    /// constructor by naming the variant directly.
+    AppAuthorAck(AppAuthorAckToken),
 }
+
+/// Private witness that gates [`MigrationAuthorization::AppAuthorAck`] behind the
+/// loud [`MigrationAuthorization::app_author_ack`] constructor. It has no public
+/// constructor, so the variant cannot be built outside this crate any other way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppAuthorAckToken(());
 
 impl MigrationAuthorization {
     /// The interim authorization: the app author vouches for this migration.
@@ -95,7 +108,75 @@ impl MigrationAuthorization {
     /// acknowledgement, not user consent. Under Gap 3 a caller chooses a stronger
     /// variant here; the entry-point signature does not change.
     pub fn app_author_ack() -> Self {
-        MigrationAuthorization::AppAuthorAck
+        MigrationAuthorization::AppAuthorAck(AppAuthorAckToken(()))
+    }
+}
+
+/// How secrets are selected across predecessor **generations** (the delegate-side
+/// analogue of the contract driver's [`crate::SelectionPolicy`]). Passed
+/// explicitly to the entry points — no implicit default — so the cross-generation
+/// behavior is visible at every call site.
+///
+/// The two modes trade delete-by-absence safety against stranded-data recovery,
+/// the same tension the contract side resolves with `NewestFirstWins` vs
+/// `FoldAll`.
+#[derive(Debug)]
+pub enum SecretSelectionPolicy {
+    /// **Default / safe.** Walk predecessors newest-first; the newest predecessor
+    /// that yields data is the authoritative snapshot, and OLDER predecessors are
+    /// NOT imported after it. Preserves delete-by-absence: a key the authoritative
+    /// (newer) generation dropped can never be resurrected from an older one.
+    ///
+    /// Documented cost: a key that only ever existed in a generation *older* than
+    /// the authoritative one stays unrecovered. Use [`UnionAllGenerations`](Self::UnionAllGenerations)
+    /// when recovering such stranded data matters more than delete-by-absence.
+    NewestSnapshotWins,
+    /// **Opt-in recovery.** Import *every* predecessor newest-first with
+    /// never-clobber (so the newest generation's value still wins any key
+    /// conflict). This is the freenet/river#204 stranded-older-generation recovery
+    /// mode.
+    ///
+    /// It **resurrects delete-by-absence data**: a key deleted in a newer
+    /// generation but still present in an older one is re-imported. Hence the loud
+    /// [`UnionAck`].
+    UnionAllGenerations(UnionAck),
+}
+
+/// Opt-in token for [`SecretSelectionPolicy::UnionAllGenerations`]. Deliberately
+/// not `Default`: holding one acknowledges that union import can resurrect
+/// secrets a newer generation deleted by absence.
+#[must_use = "a UnionAck acknowledges that union import resurrects secrets a newer \
+              generation deleted by absence; construct it only if that is intended"]
+#[derive(Debug)]
+pub struct UnionAck(());
+
+impl UnionAck {
+    /// Construct the opt-in. Only sound when re-importing secrets that a newer
+    /// generation deleted (by their absence) is acceptable — e.g. recovering
+    /// genuinely stranded data from a skipped older generation (river#204).
+    pub fn i_understand_union_resurrects_deleted_by_absence_secrets() -> Self {
+        Self(())
+    }
+}
+
+impl SecretSelectionPolicy {
+    /// Whether an already-migrated *data-bearing* (or unknown-state) predecessor
+    /// terminates a `NewestSnapshotWins` walk. Union never terminates on it.
+    fn already_migrated_is_authoritative(&self, had_data: bool) -> bool {
+        matches!(self, SecretSelectionPolicy::NewestSnapshotWins) && had_data
+    }
+
+    /// Whether a freshly-imported data-bearing predecessor terminates the walk.
+    fn imported_is_authoritative(&self) -> bool {
+        matches!(self, SecretSelectionPolicy::NewestSnapshotWins)
+    }
+
+    /// Whether an `Unresponsive` predecessor terminates the walk. Under
+    /// `NewestSnapshotWins` it does — falling through to import an older snapshot
+    /// past an unknown newer state would risk resurrecting keys the newer
+    /// generation deleted. Union keeps going (it wants every generation).
+    fn unresponsive_terminates(&self) -> bool {
+        matches!(self, SecretSelectionPolicy::NewestSnapshotWins)
     }
 }
 
@@ -128,12 +209,14 @@ pub trait PredecessorSecretsIo {
     /// * `Err` — abort the whole migration (the caller sees the error).
     ///
     /// **Dependency (document honestly):** this can only distinguish "can't
-    /// execute" from "has no data" while the node still has the old delegate WASM
-    /// registered. If the old WASM has been dropped, an unregistered predecessor
-    /// is indistinguishable from a broken one — both surface as `Ok(false)` /
-    /// `Unresponsive`. Old-delegate-WASM retention is the hard platform
-    /// prerequisite (the queued A4 item); the node-side copy-forward removes the
-    /// dependency entirely by reading storage directly.
+    /// execute" from "has no data" while the node the request reaches actually has
+    /// the predecessor delegate **registered and available**. (freenet-core retains
+    /// delegate WASM indefinitely — only an explicit `UnregisterDelegate` removes
+    /// it — so this is NOT time-decay/WASM-GC; it is per-node registration and
+    /// availability.) A predecessor the reached node never registered is
+    /// indistinguishable from a broken one — both surface as `Ok(false)` /
+    /// `Unresponsive`. The node-side copy-forward removes the dependency by reading
+    /// storage directly.
     fn probe_executable(
         &mut self,
         predecessor: &DelegateKey,
@@ -164,8 +247,8 @@ pub trait PredecessorSecretsIo {
 pub trait RegisterAndMigrateIo: PredecessorSecretsIo {
     /// Register the successor delegate with the node.
     ///
-    /// `predecessors` and `authorization` are passed through so that Gap 3's
-    /// `RegisterDelegate { predecessor: [..] }` wire change can have the node do
+    /// `predecessors`, `authorization`, and `policy` are passed through so that
+    /// Gap 3's `RegisterDelegateWithPredecessors` wire change can have the node do
     /// the copy-forward *at registration time* — at which point
     /// [`migrate_delegate_secrets`] finds the delegate-key markers already
     /// written and reports every predecessor as already-migrated, a no-op. The
@@ -174,6 +257,7 @@ pub trait RegisterAndMigrateIo: PredecessorSecretsIo {
         &mut self,
         predecessors: &[DelegateLineageEntry],
         authorization: &MigrationAuthorization,
+        policy: &SecretSelectionPolicy,
     ) -> impl Future<Output = Result<(), Self::Error>>;
 }
 
@@ -208,16 +292,20 @@ pub enum PredecessorMigration {
         /// The predecessor's lineage generation.
         generation: u32,
     },
-    /// **G1.8**: the predecessor could not be confirmed executable (the preflight
-    /// got no reply). Its data may exist but cannot be auto-migrated. The app
-    /// MUST surface this and MUST NOT treat the migration as a fresh install
-    /// (freenet/river#204). See [`PredecessorSecretsIo::probe_executable`] for
-    /// the old-WASM-retention dependency this rests on.
+    /// **G1.8**: the predecessor could not be confirmed executable — the preflight
+    /// got no reply, or a probe/fetch round-trip errored (the error is stringified
+    /// into `error`). Its data may exist but cannot be auto-migrated. The app MUST
+    /// surface this and MUST NOT treat the migration as a fresh install
+    /// (freenet/river#204). See [`PredecessorSecretsIo::probe_executable`] for the
+    /// registration/availability dependency this rests on.
     Unresponsive {
         /// The predecessor delegate key.
         key: DelegateKey,
         /// The predecessor's lineage generation.
         generation: u32,
+        /// The stringified transport error, if the round-trip errored (vs. a
+        /// clean "no reply", which is `None`).
+        error: Option<String>,
     },
     /// A two-phase partial write: at least one secret failed to store, so the
     /// completion marker was withheld and a retry will re-run this predecessor.
@@ -234,6 +322,19 @@ pub enum PredecessorMigration {
         /// Secrets whose write failed.
         failed: usize,
     },
+    /// The predecessor was **not imported** because a higher-priority predecessor
+    /// decided the outcome: under [`SecretSelectionPolicy::NewestSnapshotWins`] a
+    /// newer predecessor supplied the authoritative snapshot, OR an earlier
+    /// predecessor halted the walk (`Incomplete`, or `Unresponsive` under
+    /// `NewestSnapshotWins`). Whether this is a *clean* skip or a *retry-me* skip
+    /// is told by [`DelegateMigrationReport::is_complete`] (an earlier
+    /// `Incomplete`/`Unresponsive` makes the whole report incomplete).
+    Superseded {
+        /// The predecessor delegate key.
+        key: DelegateKey,
+        /// The predecessor's lineage generation.
+        generation: u32,
+    },
 }
 
 impl PredecessorMigration {
@@ -244,7 +345,8 @@ impl PredecessorMigration {
             | PredecessorMigration::NoData { key, .. }
             | PredecessorMigration::AlreadyMigrated { key, .. }
             | PredecessorMigration::Unresponsive { key, .. }
-            | PredecessorMigration::Incomplete { key, .. } => key,
+            | PredecessorMigration::Incomplete { key, .. }
+            | PredecessorMigration::Superseded { key, .. } => key,
         }
     }
 }
@@ -328,6 +430,8 @@ impl DelegateMigrationReport {
 ///   this is always a list; keys come from each entry's stored `delegate_key`,
 ///   never re-derived.
 /// * `authorization` — required consent (see [`MigrationAuthorization`]).
+/// * `policy` — cross-generation selection (see [`SecretSelectionPolicy`]);
+///   explicit at the call site, no implicit default.
 ///
 /// **`no-delete` invariant (plan §0):** predecessor data is never deleted — this
 /// only *reads* predecessors (via `io`) and *writes* markers + imported secrets on
@@ -336,22 +440,26 @@ impl DelegateMigrationReport {
 /// path here (or in `io`, which has no delete method) that removes predecessor
 /// data.
 ///
-/// Predecessors are processed **newest-generation-first**, so with never-clobber
-/// import the newest generation's value wins on any key present in more than one
-/// generation.
+/// Predecessors are processed **newest-generation-first**; `policy` decides
+/// whether an older predecessor is imported after a newer one already yielded
+/// data (see [`SecretSelectionPolicy`]).
 ///
-/// # Errors
+/// # The report is the source of truth (no bare error)
 ///
-/// Returns `IO::Error` only when `io` aborts (a `probe_executable` / `fetch_secrets`
-/// `Err`). A per-predecessor storage write failure is not an abort — it is
-/// reported as [`PredecessorMigration::Incomplete`] so one predecessor's failure
-/// does not lose the others.
+/// This returns a [`DelegateMigrationReport`], not a `Result`: once the walk
+/// begins it never fails outright. A `probe_executable`/`fetch_secrets` transport
+/// error is captured as [`PredecessorMigration::Unresponsive`] with the error
+/// stringified into its `error` field (a fetch timeout is a clean `Ok(false)` →
+/// `Unresponsive { error: None }`); a storage write failure is
+/// [`PredecessorMigration::Incomplete`]. So an error mid-run never discards the
+/// predecessors already migrated — the app inspects the report and retries.
 ///
 /// # The authorization parameter is required
 ///
-/// [`MigrationAuthorization`] has no `Default`, so a caller cannot migrate secrets
-/// without explicitly constructing one — the consent gate is enforced at compile
-/// time. This does not compile:
+/// [`MigrationAuthorization`] has no `Default` and its only variant carries a
+/// private token, so a caller cannot migrate secrets without explicitly calling
+/// [`MigrationAuthorization::app_author_ack`] — the consent gate is enforced at
+/// compile time. This does not compile:
 ///
 /// ```compile_fail
 /// // `MigrationAuthorization` has no `Default` impl — there is no way to obtain
@@ -363,14 +471,16 @@ pub async fn migrate_delegate_secrets<S, IO>(
     io: &mut IO,
     predecessors: &[DelegateLineageEntry],
     authorization: MigrationAuthorization,
-) -> Result<DelegateMigrationReport, IO::Error>
+    policy: SecretSelectionPolicy,
+) -> DelegateMigrationReport
 where
     S: SecretStore + ?Sized,
     IO: PredecessorSecretsIo,
+    IO::Error: core::fmt::Debug,
 {
     let mut transport = AppSideRoundTrip { io };
     transport
-        .migrate_from(store, predecessors, &authorization)
+        .migrate_from(store, predecessors, &authorization, &policy)
         .await
 }
 
@@ -381,18 +491,27 @@ where
 /// then [`migrate_delegate_secrets`]. Under Gap 3 the registration itself carries
 /// the predecessor list to the node (which does the copy-forward), and the
 /// migration step becomes a no-op — the signature is unchanged.
+///
+/// # Errors
+///
+/// Returns `IO::Error` only if the pre-migration `register_successor` fails (no
+/// secrets have moved at that point). Once registration succeeds the migration
+/// runs and its result is always an `Ok(report)` — see [`migrate_delegate_secrets`].
 pub async fn register_delegate_with_migration<S, IO>(
     store: &mut S,
     io: &mut IO,
     predecessors: &[DelegateLineageEntry],
     authorization: MigrationAuthorization,
+    policy: SecretSelectionPolicy,
 ) -> Result<DelegateMigrationReport, IO::Error>
 where
     S: SecretStore + ?Sized,
     IO: RegisterAndMigrateIo,
+    IO::Error: core::fmt::Debug,
 {
-    io.register_successor(predecessors, &authorization).await?;
-    migrate_delegate_secrets(store, io, predecessors, authorization).await
+    io.register_successor(predecessors, &authorization, &policy)
+        .await?;
+    Ok(migrate_delegate_secrets(store, io, predecessors, authorization, policy).await)
 }
 
 /// The redesigned, sans-IO secret transport — **the internal seam Gap 3 swaps
@@ -400,9 +519,9 @@ where
 ///
 /// Replaces v1's `export_from(predecessor) -> ExportedSecrets`: `migrate_from`
 /// takes the predecessor **list** and returns a metadata-only
-/// [`DelegateMigrationReport`] (never bytes), so it can host *both* the interim
-/// app-side round-trip ([`AppSideRoundTrip`]) and a future `NodeCopyForward` that
-/// copies secrets internally and returns nothing app-side.
+/// [`DelegateMigrationReport`] (never bytes, never a bare error), so it can host
+/// *both* the interim app-side round-trip ([`AppSideRoundTrip`]) and a future
+/// `NodeCopyForward` that copies secrets internally and returns nothing app-side.
 ///
 /// Intentionally `pub(crate)`: it is NOT the app-facing contract (the entry
 /// points are). When the node primitive lands, add `struct NodeCopyForward; impl
@@ -410,17 +529,17 @@ where
 /// detection + the interim as fallback) inside the *unchanged*
 /// [`migrate_delegate_secrets`].
 pub(crate) trait SecretTransport<S: SecretStore + ?Sized> {
-    /// The transport's error type (the app's `io` error, or a node error).
-    type Error;
-
     /// Migrate the secrets of every predecessor in `predecessors` into `store`,
-    /// once each. Returns a per-predecessor report; never returns exported bytes.
+    /// once each, under `policy`. Returns a per-predecessor report; never returns
+    /// exported bytes and never a bare error (transport failures are captured as
+    /// report rows).
     fn migrate_from(
         &mut self,
         store: &mut S,
         predecessors: &[DelegateLineageEntry],
         authorization: &MigrationAuthorization,
-    ) -> impl Future<Output = Result<DelegateMigrationReport, Self::Error>>;
+        policy: &SecretSelectionPolicy,
+    ) -> impl Future<Output = DelegateMigrationReport>;
 }
 
 /// The interim [`SecretTransport`]: app-side request/response round-trips through
@@ -435,28 +554,29 @@ impl<S, IO> SecretTransport<S> for AppSideRoundTrip<'_, IO>
 where
     S: SecretStore + ?Sized,
     IO: PredecessorSecretsIo,
+    IO::Error: core::fmt::Debug,
 {
-    type Error = IO::Error;
-
     async fn migrate_from(
         &mut self,
         store: &mut S,
         predecessors: &[DelegateLineageEntry],
         authorization: &MigrationAuthorization,
-    ) -> Result<DelegateMigrationReport, Self::Error> {
+        policy: &SecretSelectionPolicy,
+    ) -> DelegateMigrationReport {
         // Interim: the app-author ack is a no-op gate — its PRESENCE authorizes
         // the migration. Gap 3's stronger variant (per-transition user consent +
         // node-recorded same-origin binding) is checked here without changing any
         // signature. Matching exhaustively (no wildcard) means a new variant
         // forces this site to decide how to handle it.
         match authorization {
-            MigrationAuthorization::AppAuthorAck => {}
+            MigrationAuthorization::AppAuthorAck(_) => {}
         }
 
-        // Newest-generation-first, so never-clobber gives the newest generation's
-        // value precedence on any key present in more than one generation. Built
-        // from each entry's STORED delegate_key (never re-derived — irregular
-        // rows' recorded keys don't derive).
+        // Newest-generation-first: under NewestSnapshotWins the first data-bearing
+        // predecessor is authoritative; under Union never-clobber gives the newest
+        // generation's value precedence on any shared key. Built from each entry's
+        // STORED delegate_key (never re-derived — irregular rows' recorded keys
+        // don't derive).
         let mut ordered: Vec<(DelegateKey, u32)> = predecessors
             .iter()
             .map(|e| {
@@ -469,44 +589,117 @@ where
         ordered.sort_by_key(|(_, generation)| core::cmp::Reverse(*generation));
 
         let mut results = Vec::with_capacity(ordered.len());
+        // Once set, every remaining (older) predecessor is Superseded: either a
+        // newer authoritative snapshot was found (NewestSnapshotWins) or the walk
+        // halted (P1#1: never import an older predecessor after a newer one
+        // imported partially or was unreachable).
+        let mut terminated = false;
+
         for (key, generation) in ordered {
-            // Already migrated from this predecessor? Skip the round-trips
-            // entirely (cheap, marker-gated re-run). This is the §0 marker check.
-            if predecessor_already_migrated(store, &key) {
+            if terminated {
+                results.push(PredecessorMigration::Superseded { key, generation });
+                continue;
+            }
+
+            // Already migrated? The delegate-key marker (with its data/empty flag),
+            // OR — defensively — a legacy generation-keyed marker that covers this
+            // generation (P1#3 bridge). Skip the round-trips entirely.
+            let already = predecessor_migration_had_data(store, &key)
+                .or_else(|| legacy_generation_migrated(store, generation).then_some(true));
+            if let Some(had_data) = already {
+                if policy.already_migrated_is_authoritative(had_data) {
+                    terminated = true;
+                }
                 results.push(PredecessorMigration::AlreadyMigrated { key, generation });
                 continue;
             }
 
-            // G1.8: confirm executability BEFORE concluding "no data".
-            if !self.io.probe_executable(&key).await? {
-                results.push(PredecessorMigration::Unresponsive { key, generation });
-                continue;
+            // G1.8: confirm executability BEFORE concluding "no data". A transport
+            // error or a clean no-reply are both Unresponsive (error attached only
+            // for the former); under NewestSnapshotWins an unknown newer state must
+            // not be fallen through (would risk resurrecting deleted keys).
+            match self.io.probe_executable(&key).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    results.push(PredecessorMigration::Unresponsive {
+                        key,
+                        generation,
+                        error: None,
+                    });
+                    terminated = policy.unresponsive_terminates();
+                    continue;
+                }
+                Err(e) => {
+                    results.push(PredecessorMigration::Unresponsive {
+                        key,
+                        generation,
+                        error: Some(format!("{e:?}")),
+                    });
+                    terminated = policy.unresponsive_terminates();
+                    continue;
+                }
             }
 
-            let secrets = self.io.fetch_secrets(&key).await?;
-            if secrets.is_empty() {
-                // The preflight confirmed it executes, so empty is genuine.
-                results.push(PredecessorMigration::NoData { key, generation });
-                continue;
-            }
+            let secrets = match self.io.fetch_secrets(&key).await {
+                Ok(secrets) => secrets,
+                Err(e) => {
+                    results.push(PredecessorMigration::Unresponsive {
+                        key,
+                        generation,
+                        error: Some(format!("{e:?}")),
+                    });
+                    terminated = policy.unresponsive_terminates();
+                    continue;
+                }
+            };
 
+            // NoData is imported through here too (empty slice), so its marker is
+            // written and a re-run is a true no-op (P1#2).
             let outcome = import_predecessor_secrets_once(store, &key, &secrets);
-            results.push(classify_import(key, generation, outcome));
+            let migration = classify_import(key, generation, outcome);
+            match &migration {
+                // Data-bearing snapshot: authoritative under NewestSnapshotWins.
+                PredecessorMigration::Imported { .. } => {
+                    if policy.imported_is_authoritative() {
+                        terminated = true;
+                    }
+                }
+                // Concurrent marker appearance; classify by its recorded flag.
+                PredecessorMigration::AlreadyMigrated { .. } => {
+                    let had_data =
+                        predecessor_migration_had_data(store, migration.key()).unwrap_or(true);
+                    if policy.already_migrated_is_authoritative(had_data) {
+                        terminated = true;
+                    }
+                }
+                // Partial write: never process an older predecessor after it (P1#1).
+                PredecessorMigration::Incomplete { .. } => terminated = true,
+                // NoData falls through to older predecessors under both policies.
+                _ => {}
+            }
+            results.push(migration);
         }
 
-        Ok(DelegateMigrationReport {
+        DelegateMigrationReport {
             predecessors: results,
-        })
+        }
     }
 }
 
-/// Map a per-predecessor import outcome to its report entry.
+/// Map a per-predecessor import outcome to its report entry. An
+/// `Imported { imported: 0, skipped: 0 }` (no real secret processed) is a
+/// [`PredecessorMigration::NoData`]; any write or skip means the predecessor was
+/// data-bearing.
 fn classify_import(
     key: DelegateKey,
     generation: u32,
     outcome: PredecessorImportOutcome,
 ) -> PredecessorMigration {
     match outcome {
+        PredecessorImportOutcome::Imported {
+            imported: 0,
+            skipped: 0,
+        } => PredecessorMigration::NoData { key, generation },
         PredecessorImportOutcome::Imported { imported, skipped } => {
             PredecessorMigration::Imported {
                 key,
@@ -515,8 +708,6 @@ fn classify_import(
                 skipped,
             }
         }
-        // The driver already gated on the marker, so this is only reachable if the
-        // marker appeared concurrently; treat it as the no-op it is.
         PredecessorImportOutcome::AlreadyMigrated => {
             PredecessorMigration::AlreadyMigrated { key, generation }
         }
@@ -537,14 +728,22 @@ fn classify_import(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::delegate::pred_done_marker;
-    use std::collections::{BTreeMap, HashMap, HashSet};
+    use crate::delegate::{done_marker, pred_done_marker};
+    use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
     // ---- test successor store -------------------------------------------------
 
     #[derive(Default)]
     struct MemStore {
         data: BTreeMap<Vec<u8>, Vec<u8>>,
+        /// `set_secret` fails (stores nothing) for keys in this set, modelling a
+        /// storage write error for the two-phase / Incomplete tests.
+        fail_keys: BTreeSet<Vec<u8>>,
+    }
+    impl MemStore {
+        fn fail_writes_to(&mut self, key: &[u8]) {
+            self.fail_keys.insert(key.to_vec());
+        }
     }
     impl SecretStore for MemStore {
         fn list_secrets(&self, prefix: &[u8]) -> Vec<Vec<u8>> {
@@ -561,6 +760,9 @@ mod tests {
             self.data.contains_key(key)
         }
         fn set_secret(&mut self, key: &[u8], value: &[u8]) -> bool {
+            if self.fail_keys.contains(key) {
+                return false;
+            }
             self.data.insert(key.to_vec(), value.to_vec());
             true
         }
@@ -581,8 +783,8 @@ mod tests {
         fetched: HashSet<Vec<u8>>,
         /// registration calls, for the wrapper test.
         registered: usize,
-        /// force an abort from probe_executable for these keys.
-        abort_on_probe: HashSet<Vec<u8>>,
+        /// force a transport error from probe_executable for these keys.
+        error_on_probe: HashSet<Vec<u8>>,
     }
 
     #[derive(Debug, PartialEq, Eq)]
@@ -604,8 +806,8 @@ mod tests {
             self.executable.insert(key.bytes().to_vec(), false);
             self
         }
-        fn abort_probe(mut self, key: &DelegateKey) -> Self {
-            self.abort_on_probe.insert(key.bytes().to_vec());
+        fn error_probe(mut self, key: &DelegateKey) -> Self {
+            self.error_on_probe.insert(key.bytes().to_vec());
             self
         }
     }
@@ -614,7 +816,7 @@ mod tests {
         type Error = IoAbort;
         async fn probe_executable(&mut self, predecessor: &DelegateKey) -> Result<bool, IoAbort> {
             let k = predecessor.bytes().to_vec();
-            if self.abort_on_probe.contains(&k) {
+            if self.error_on_probe.contains(&k) {
                 return Err(IoAbort);
             }
             self.probed.insert(k.clone());
@@ -635,6 +837,7 @@ mod tests {
             &mut self,
             _predecessors: &[DelegateLineageEntry],
             _authorization: &MigrationAuthorization,
+            _policy: &SecretSelectionPolicy,
         ) -> Result<(), IoAbort> {
             self.registered += 1;
             Ok(())
@@ -661,6 +864,16 @@ mod tests {
         MigrationAuthorization::app_author_ack()
     }
 
+    fn newest() -> SecretSelectionPolicy {
+        SecretSelectionPolicy::NewestSnapshotWins
+    }
+
+    fn union() -> SecretSelectionPolicy {
+        SecretSelectionPolicy::UnionAllGenerations(
+            UnionAck::i_understand_union_resurrects_deleted_by_absence_secrets(),
+        )
+    }
+
     /// Minimal single-future block_on (no async runtime): all mock futures are
     /// immediately ready. Mirrors the driver-side test executor.
     fn block_on<F: Future>(fut: F) -> F::Output {
@@ -676,7 +889,7 @@ mod tests {
         panic!("future never became ready; the mock io must stay awaitless");
     }
 
-    // ---- outcome classification matrix ---------------------------------------
+    // ---- single-predecessor outcome classification ---------------------------
 
     #[test]
     fn imports_secrets_from_an_executable_predecessor_with_data() {
@@ -686,7 +899,13 @@ mod tests {
             &key_of(&e),
             &[(b"rooms", b"blob"), (b"signing_key:a", b"kb")],
         );
-        let report = block_on(migrate_delegate_secrets(&mut store, &mut io, &[e], ack())).unwrap();
+        let report = block_on(migrate_delegate_secrets(
+            &mut store,
+            &mut io,
+            &[e],
+            ack(),
+            newest(),
+        ));
         assert_eq!(report.predecessors.len(), 1);
         assert!(matches!(
             report.predecessors[0],
@@ -709,7 +928,13 @@ mod tests {
         let e = entry(1, 1);
         let mut store = MemStore::default();
         let mut io = MockIo::default().executable_with(&key_of(&e), &[]);
-        let report = block_on(migrate_delegate_secrets(&mut store, &mut io, &[e], ack())).unwrap();
+        let report = block_on(migrate_delegate_secrets(
+            &mut store,
+            &mut io,
+            &[e],
+            ack(),
+            newest(),
+        ));
         assert!(matches!(
             report.predecessors[0],
             PredecessorMigration::NoData { .. }
@@ -720,15 +945,21 @@ mod tests {
 
     #[test]
     fn unexecutable_predecessor_is_unresponsive_never_silent_fresh_install() {
-        // freenet/river#204: a broken/absent old WASM must surface, not read as
-        // "no data → fresh install".
+        // freenet/river#204: a broken/absent old delegate must surface, not read
+        // as "no data → fresh install".
         let e = entry(4, 4);
         let mut store = MemStore::default();
         let mut io = MockIo::default().dead(&key_of(&e));
-        let report = block_on(migrate_delegate_secrets(&mut store, &mut io, &[e], ack())).unwrap();
+        let report = block_on(migrate_delegate_secrets(
+            &mut store,
+            &mut io,
+            &[e],
+            ack(),
+            newest(),
+        ));
         assert!(matches!(
             report.predecessors[0],
-            PredecessorMigration::Unresponsive { .. }
+            PredecessorMigration::Unresponsive { error: None, .. }
         ));
         assert!(report.any_unresponsive(), "the #204 gate must trip");
         assert!(!report.is_complete());
@@ -745,7 +976,13 @@ mod tests {
         let mut store = MemStore::default();
         store.set_secret(&pred_done_marker(&key_of(&e)), b"1");
         let mut io = MockIo::default().executable_with(&key_of(&e), &[(b"x", b"y")]);
-        let report = block_on(migrate_delegate_secrets(&mut store, &mut io, &[e], ack())).unwrap();
+        let report = block_on(migrate_delegate_secrets(
+            &mut store,
+            &mut io,
+            &[e],
+            ack(),
+            newest(),
+        ));
         assert!(matches!(
             report.predecessors[0],
             PredecessorMigration::AlreadyMigrated { .. }
@@ -765,7 +1002,13 @@ mod tests {
 
         let first = {
             let mut io = MockIo::default().executable_with(&key_of(&e), &[(b"k", b"v")]);
-            block_on(migrate_delegate_secrets(&mut store, &mut io, &[e], ack())).unwrap()
+            block_on(migrate_delegate_secrets(
+                &mut store,
+                &mut io,
+                &[e],
+                ack(),
+                newest(),
+            ))
         };
         assert!(matches!(
             first.predecessors[0],
@@ -777,7 +1020,13 @@ mod tests {
         // Re-run (fresh io that would re-import if asked): must be a no-op.
         let second = {
             let mut io = MockIo::default().executable_with(&key_of(&e), &[(b"k", b"RESURRECT")]);
-            block_on(migrate_delegate_secrets(&mut store, &mut io, &[e], ack())).unwrap()
+            block_on(migrate_delegate_secrets(
+                &mut store,
+                &mut io,
+                &[e],
+                ack(),
+                newest(),
+            ))
         };
         assert!(matches!(
             second.predecessors[0],
@@ -788,37 +1037,250 @@ mod tests {
     }
 
     #[test]
-    fn newest_generation_wins_on_key_conflict() {
-        // Predecessors listed oldest-first; processed newest-first so never-clobber
-        // gives the newest generation's value precedence.
+    fn empty_predecessor_list_is_a_clean_empty_report() {
+        let mut store = MemStore::default();
+        let mut io = MockIo::default();
+        let report = block_on(migrate_delegate_secrets(
+            &mut store,
+            &mut io,
+            &[],
+            ack(),
+            newest(),
+        ));
+        assert!(report.predecessors.is_empty());
+        assert!(report.is_complete());
+        assert!(
+            !report.any_unresponsive(),
+            "no predecessors = safe fresh install"
+        );
+    }
+
+    // ---- SecretSelectionPolicy matrix ----------------------------------------
+
+    #[test]
+    fn newest_snapshot_wins_supersedes_older_after_a_data_bearing_newer() {
+        // Newest data-bearing predecessor is authoritative; the older one is
+        // Superseded (never imported), so a key that lives ONLY in the older
+        // generation stays unrecovered — the documented cost of the safe default.
         let old = entry(1, 1);
         let new = entry(2, 2);
         let mut store = MemStore::default();
         let mut io = MockIo::default()
             .executable_with(&key_of(&old), &[(b"shared", b"OLD"), (b"only_old", b"o")])
             .executable_with(&key_of(&new), &[(b"shared", b"NEW"), (b"only_new", b"n")]);
-        // Registry order is oldest-first; the driver must still take the newest.
         let report = block_on(migrate_delegate_secrets(
             &mut store,
             &mut io,
             &[old, new],
             ack(),
-        ))
-        .unwrap();
-        assert_eq!(report.predecessors.len(), 2);
-        // Newest processed first.
-        assert_eq!(
-            report.predecessors[0].key().bytes(),
-            key_of(&entry(2, 2)).bytes()
+            newest(),
+        ));
+        // Newest first (gen 2 Imported), then gen 1 Superseded.
+        assert!(matches!(
+            report.predecessors[0],
+            PredecessorMigration::Imported { .. }
+        ));
+        assert!(matches!(
+            report.predecessors[1],
+            PredecessorMigration::Superseded { .. }
+        ));
+        assert!(report.is_complete(), "a clean supersede is still complete");
+        assert_eq!(store.get_secret(b"shared").unwrap(), b"NEW");
+        assert_eq!(store.get_secret(b"only_new").unwrap(), b"n");
+        assert!(
+            store.get_secret(b"only_old").is_none(),
+            "older-only key is NOT recovered under NewestSnapshotWins (documented cost)"
         );
+        // The older predecessor was never even probed.
+        assert!(!io.probed.contains(key_of(&old).bytes()));
+    }
+
+    #[test]
+    fn newest_snapshot_wins_does_not_resurrect_a_deleted_key() {
+        // THE delete-by-absence case. Newer generation (gen 2) deleted key `k`
+        // (it has only `a`); older generation (gen 1) still has `k`. Under
+        // NewestSnapshotWins the newer snapshot is authoritative, so `k` must NOT
+        // come back.
+        let old = entry(1, 1);
+        let new = entry(2, 2);
+        let mut store = MemStore::default();
+        let mut io = MockIo::default()
+            .executable_with(&key_of(&old), &[(b"a", b"1"), (b"k", b"deleted-value")])
+            .executable_with(&key_of(&new), &[(b"a", b"1")]);
+        block_on(migrate_delegate_secrets(
+            &mut store,
+            &mut io,
+            &[old, new],
+            ack(),
+            newest(),
+        ));
+        assert_eq!(store.get_secret(b"a").unwrap(), b"1");
+        assert!(
+            store.get_secret(b"k").is_none(),
+            "NewestSnapshotWins must NOT resurrect a key the newer generation deleted"
+        );
+    }
+
+    #[test]
+    fn union_resurrects_a_deleted_key_documented() {
+        // Same setup as above, but UnionAllGenerations DOES import the older
+        // generation, so the deleted-by-absence `k` comes back. This is the
+        // documented, ack-gated resurrection (river#204 stranded-data recovery).
+        let old = entry(1, 1);
+        let new = entry(2, 2);
+        let mut store = MemStore::default();
+        let mut io = MockIo::default()
+            .executable_with(&key_of(&old), &[(b"a", b"1"), (b"k", b"deleted-value")])
+            .executable_with(&key_of(&new), &[(b"a", b"1")]);
+        let report = block_on(migrate_delegate_secrets(
+            &mut store,
+            &mut io,
+            &[old, new],
+            ack(),
+            union(),
+        ));
+        // Both generations imported (newest-first).
+        assert!(matches!(
+            report.predecessors[0],
+            PredecessorMigration::Imported { .. }
+        ));
+        assert!(matches!(
+            report.predecessors[1],
+            PredecessorMigration::Imported { .. }
+        ));
+        assert_eq!(
+            store.get_secret(b"k").unwrap(),
+            b"deleted-value",
+            "Union DOES resurrect the older generation's key (documented)"
+        );
+    }
+
+    #[test]
+    fn union_newest_generation_still_wins_a_key_conflict() {
+        // Union imports all, but never-clobber + newest-first means the newest
+        // generation's value wins any shared key.
+        let old = entry(1, 1);
+        let new = entry(2, 2);
+        let mut store = MemStore::default();
+        let mut io = MockIo::default()
+            .executable_with(&key_of(&old), &[(b"shared", b"OLD"), (b"only_old", b"o")])
+            .executable_with(&key_of(&new), &[(b"shared", b"NEW"), (b"only_new", b"n")]);
+        block_on(migrate_delegate_secrets(
+            &mut store,
+            &mut io,
+            &[old, new],
+            ack(),
+            union(),
+        ));
         assert_eq!(store.get_secret(b"shared").unwrap(), b"NEW", "newest wins");
-        assert_eq!(store.get_secret(b"only_old").unwrap(), b"o");
+        assert_eq!(
+            store.get_secret(b"only_old").unwrap(),
+            b"o",
+            "older-only recovered"
+        );
         assert_eq!(store.get_secret(b"only_new").unwrap(), b"n");
     }
 
     #[test]
-    fn mixed_list_classifies_each_predecessor_independently() {
-        // A realistic V4-V6 skip: one has data, one is empty, one is dead.
+    fn newest_snapshot_wins_falls_through_an_empty_newer_to_an_older_with_data() {
+        // The common migration shape: the NEW generation's delegate is empty
+        // (freshly registered), so NewestSnapshotWins falls through to the older
+        // generation that actually holds the data.
+        let old = entry(1, 1);
+        let new = entry(2, 2);
+        let mut store = MemStore::default();
+        let mut io = MockIo::default()
+            .executable_with(&key_of(&new), &[]) // newest: empty
+            .executable_with(&key_of(&old), &[(b"data", b"v")]); // older: has data
+        let report = block_on(migrate_delegate_secrets(
+            &mut store,
+            &mut io,
+            &[old, new],
+            ack(),
+            newest(),
+        ));
+        assert!(matches!(
+            report.predecessors[0],
+            PredecessorMigration::NoData { .. }
+        ));
+        assert!(matches!(
+            report.predecessors[1],
+            PredecessorMigration::Imported { .. }
+        ));
+        assert_eq!(store.get_secret(b"data").unwrap(), b"v");
+    }
+
+    #[test]
+    fn newest_snapshot_wins_halts_on_unresponsive_newest_no_fall_through() {
+        // Newest generation unreachable → NewestSnapshotWins must NOT fall through
+        // to import the older snapshot (that could resurrect keys the unknown
+        // newer state deleted). It halts; the app surfaces #204 and can retry.
+        let old = entry(1, 1);
+        let new = entry(2, 2);
+        let mut store = MemStore::default();
+        let mut io = MockIo::default()
+            .dead(&key_of(&new))
+            .executable_with(&key_of(&old), &[(b"data", b"v")]);
+        let report = block_on(migrate_delegate_secrets(
+            &mut store,
+            &mut io,
+            &[old, new],
+            ack(),
+            newest(),
+        ));
+        assert!(matches!(
+            report.predecessors[0],
+            PredecessorMigration::Unresponsive { .. }
+        ));
+        assert!(matches!(
+            report.predecessors[1],
+            PredecessorMigration::Superseded { .. }
+        ));
+        assert!(report.any_unresponsive());
+        assert!(!report.is_complete());
+        assert!(
+            store.get_secret(b"data").is_none(),
+            "must not fall through past an unknown newer state"
+        );
+        assert!(
+            !io.probed.contains(key_of(&old).bytes()),
+            "older not probed"
+        );
+    }
+
+    #[test]
+    fn union_recovers_older_data_past_an_unresponsive_newest() {
+        // Under Union the unreachable newest does not stop the walk; the older
+        // generation's data is recovered (its unresponsiveness is still reported).
+        let old = entry(1, 1);
+        let new = entry(2, 2);
+        let mut store = MemStore::default();
+        let mut io = MockIo::default()
+            .dead(&key_of(&new))
+            .executable_with(&key_of(&old), &[(b"data", b"v")]);
+        let report = block_on(migrate_delegate_secrets(
+            &mut store,
+            &mut io,
+            &[old, new],
+            ack(),
+            union(),
+        ));
+        assert!(matches!(
+            report.predecessors[0],
+            PredecessorMigration::Unresponsive { .. }
+        ));
+        assert!(matches!(
+            report.predecessors[1],
+            PredecessorMigration::Imported { .. }
+        ));
+        assert!(report.any_unresponsive());
+        assert_eq!(store.get_secret(b"data").unwrap(), b"v");
+    }
+
+    #[test]
+    fn union_classifies_each_predecessor_independently() {
+        // A realistic V4-V6 skip under Union: has-data / empty / dead each land
+        // as their own row (Union walks every generation).
         let has = entry(6, 6);
         let empty = entry(5, 5);
         let dead = entry(4, 4);
@@ -832,9 +1294,8 @@ mod tests {
             &mut io,
             &[dead, empty, has],
             ack(),
-        ))
-        .unwrap();
-        // Newest-first order: 6 (has), 5 (empty), 4 (dead).
+            union(),
+        ));
         assert!(matches!(
             report.predecessors[0],
             PredecessorMigration::Imported { .. }
@@ -847,35 +1308,221 @@ mod tests {
             report.predecessors[2],
             PredecessorMigration::Unresponsive { .. }
         ));
-        assert!(
-            report.any_unresponsive(),
-            "the dead V4 must trip the #204 gate"
-        );
+        assert!(report.any_unresponsive(), "the dead V4 trips the #204 gate");
         assert!(!report.is_complete());
         assert_eq!(report.imported_total(), 1);
     }
 
+    // ---- stop-after-incomplete (P1#1) ----------------------------------------
+
     #[test]
-    fn empty_predecessor_list_is_a_clean_empty_report() {
+    fn incomplete_newer_halts_before_older_under_both_policies() {
+        // P1#1 / Codex G2-shared-key: a partial import of the NEWER predecessor
+        // must halt the walk before the OLDER one, or a retry's newest-wins value
+        // could be shadowed by the older one under never-clobber.
+        for policy in [newest(), union()] {
+            let old = entry(1, 1);
+            let new = entry(2, 2);
+            let mut store = MemStore::default();
+            store.fail_writes_to(b"x"); // the newer generation's write fails
+            let mut io = MockIo::default()
+                .executable_with(&key_of(&new), &[(b"x", b"NEW")])
+                .executable_with(&key_of(&old), &[(b"x", b"OLD"), (b"only_old", b"o")]);
+            let report = block_on(migrate_delegate_secrets(
+                &mut store,
+                &mut io,
+                &[old, new],
+                ack(),
+                policy,
+            ));
+            assert!(
+                matches!(
+                    report.predecessors[0],
+                    PredecessorMigration::Incomplete { .. }
+                ),
+                "newer predecessor is Incomplete"
+            );
+            assert!(
+                matches!(
+                    report.predecessors[1],
+                    PredecessorMigration::Superseded { .. }
+                ),
+                "older predecessor must be Superseded (not imported) after an Incomplete newer"
+            );
+            assert!(!report.is_complete());
+            assert!(
+                store.get_secret(b"x").is_none(),
+                "the failed key must not be back-filled from the older generation"
+            );
+            assert!(
+                store.get_secret(b"only_old").is_none(),
+                "older predecessor must not be imported after the halt"
+            );
+        }
+    }
+
+    // ---- NoData writes a marker (P1#2) ---------------------------------------
+
+    #[test]
+    fn nodata_writes_a_marker_so_rerun_is_a_noop_even_if_delegate_gains_data() {
+        // P1#2: an empty predecessor still records a (empty) marker, so a later
+        // re-run does not import data the old delegate somehow gained afterwards.
+        let e = entry(1, 1);
         let mut store = MemStore::default();
-        let mut io = MockIo::default();
-        let report = block_on(migrate_delegate_secrets(&mut store, &mut io, &[], ack())).unwrap();
-        assert!(report.predecessors.is_empty());
-        assert!(report.is_complete());
+
+        let first = {
+            let mut io = MockIo::default().executable_with(&key_of(&e), &[]);
+            block_on(migrate_delegate_secrets(
+                &mut store,
+                &mut io,
+                &[e],
+                ack(),
+                newest(),
+            ))
+        };
+        assert!(matches!(
+            first.predecessors[0],
+            PredecessorMigration::NoData { .. }
+        ));
         assert!(
-            !report.any_unresponsive(),
-            "no predecessors = safe fresh install"
+            store.has_secret(&pred_done_marker(&key_of(&e))),
+            "empty marker written"
+        );
+
+        // Re-run: the old delegate now "has data", but the marker blocks re-import.
+        let second = {
+            let mut io = MockIo::default().executable_with(&key_of(&e), &[(b"late", b"data")]);
+            block_on(migrate_delegate_secrets(
+                &mut store,
+                &mut io,
+                &[e],
+                ack(),
+                newest(),
+            ))
+        };
+        assert!(matches!(
+            second.predecessors[0],
+            PredecessorMigration::AlreadyMigrated { .. }
+        ));
+        assert!(
+            store.get_secret(b"late").is_none(),
+            "a NoData predecessor's later data must not be imported on re-run"
         );
     }
 
     #[test]
-    fn io_abort_propagates_as_error() {
-        let e = entry(1, 1);
+    fn newest_snapshot_wins_rerun_does_not_import_previously_superseded_older() {
+        // The data/empty marker's reason for existing: on re-run, an older
+        // predecessor that was Superseded (never imported, no marker) must stay
+        // Superseded — the newer data-bearing predecessor's AlreadyMigrated marker
+        // must re-establish authority so the older one is not imported (which would
+        // resurrect its keys).
+        let old = entry(1, 1);
+        let new = entry(2, 2);
         let mut store = MemStore::default();
-        let mut io = MockIo::default().abort_probe(&key_of(&e));
-        let err = block_on(migrate_delegate_secrets(&mut store, &mut io, &[e], ack())).unwrap_err();
-        assert_eq!(err, IoAbort);
+        let run = |store: &mut MemStore| {
+            let mut io = MockIo::default()
+                .executable_with(&key_of(&new), &[(b"newkey", b"v")])
+                .executable_with(&key_of(&old), &[(b"oldkey", b"resurrect-me")]);
+            block_on(migrate_delegate_secrets(
+                store,
+                &mut io,
+                &[old, new],
+                ack(),
+                newest(),
+            ))
+        };
+        run(&mut store); // newer authoritative, older superseded
+        assert!(store.get_secret(b"oldkey").is_none());
+
+        let report = run(&mut store); // re-run
+        assert!(matches!(
+            report.predecessors[0],
+            PredecessorMigration::AlreadyMigrated { .. }
+        ));
+        assert!(matches!(
+            report.predecessors[1],
+            PredecessorMigration::Superseded { .. }
+        ));
+        assert!(
+            store.get_secret(b"oldkey").is_none(),
+            "a re-run must NOT import a previously-superseded older predecessor"
+        );
     }
+
+    // ---- legacy generation-marker bridge (P1#3) ------------------------------
+
+    #[test]
+    fn legacy_generation_marker_bridges_to_the_delegate_key_path() {
+        // If a store carries a legacy generation-keyed done marker (a prior
+        // `import_secrets_once` migration), the delegate-key path defensively
+        // treats predecessors it covers as AlreadyMigrated and does not re-import.
+        let covered = entry(3, 3);
+        let mut store = MemStore::default();
+        store.set_secret(&done_marker(5), b"1"); // legacy migration up to gen 5
+        let mut io = MockIo::default().executable_with(&key_of(&covered), &[(b"x", b"y")]);
+        let report = block_on(migrate_delegate_secrets(
+            &mut store,
+            &mut io,
+            &[covered],
+            ack(),
+            newest(),
+        ));
+        assert!(matches!(
+            report.predecessors[0],
+            PredecessorMigration::AlreadyMigrated { .. }
+        ));
+        assert!(
+            !io.probed.contains(key_of(&covered).bytes()),
+            "a legacy-covered predecessor must not be re-probed/imported"
+        );
+        assert!(store.get_secret(b"x").is_none());
+    }
+
+    // ---- io errors captured as report rows (P1#4) ----------------------------
+
+    #[test]
+    fn io_error_midrun_is_captured_as_a_row_not_a_bare_error() {
+        // A transport error mid-walk must not discard the predecessors already
+        // migrated: it becomes an Unresponsive row carrying the error, and the
+        // report (not an Err) is the source of truth.
+        let errs = entry(1, 1);
+        let ok = entry(2, 2);
+        let mut store = MemStore::default();
+        let mut io = MockIo::default()
+            .executable_with(&key_of(&ok), &[(b"k", b"v")])
+            .error_probe(&key_of(&errs));
+        // Union so the walk continues past the ok row to the erroring older one.
+        let report = block_on(migrate_delegate_secrets(
+            &mut store,
+            &mut io,
+            &[errs, ok],
+            ack(),
+            union(),
+        ));
+        assert!(
+            matches!(
+                report.predecessors[0],
+                PredecessorMigration::Imported { .. }
+            ),
+            "the completed row before the error is preserved"
+        );
+        assert!(
+            matches!(
+                &report.predecessors[1],
+                PredecessorMigration::Unresponsive { error: Some(_), .. }
+            ),
+            "the transport error is captured with detail, not returned bare"
+        );
+        assert!(report.any_unresponsive());
+        assert_eq!(
+            store.get_secret(b"k").unwrap(),
+            b"v",
+            "the ok import survived"
+        );
+    }
+
+    // ---- register wrapper -----------------------------------------------------
 
     #[test]
     fn register_wrapper_registers_then_migrates() {
@@ -887,6 +1534,7 @@ mod tests {
             &mut io,
             &[e],
             ack(),
+            newest(),
         ))
         .unwrap();
         assert_eq!(io.registered, 1, "the successor must be registered");
@@ -897,15 +1545,18 @@ mod tests {
         assert_eq!(store.get_secret(b"k").unwrap(), b"v");
     }
 
+    // ---- consent shape (P1#5) ------------------------------------------------
+
     #[test]
     fn authorization_is_a_non_default_enum_with_a_loud_constructor() {
-        // Pins the consent shape: the only way to obtain one is the loud
-        // constructor (there is no Default — see the compile_fail doctest on
-        // migrate_delegate_secrets), and it is an enum with room to grow.
-        assert_eq!(
+        // Pins the consent shape: the only route is the loud constructor (the
+        // variant carries a private token, so `AppAuthorAck` cannot be named/built
+        // directly, and there is no Default — see the compile_fail doctest on
+        // migrate_delegate_secrets).
+        assert!(matches!(
             MigrationAuthorization::app_author_ack(),
-            MigrationAuthorization::AppAuthorAck
-        );
+            MigrationAuthorization::AppAuthorAck(_)
+        ));
     }
 
     // ---- the seam: a non-io transport (NodeCopyForward shape) fits ------------
@@ -921,13 +1572,13 @@ mod tests {
             store: HashMap<Vec<u8>, Vec<SecretPair>>,
         }
         impl<S: SecretStore + ?Sized> SecretTransport<S> for NodeCopyForwardMock {
-            type Error = core::convert::Infallible;
             async fn migrate_from(
                 &mut self,
                 store: &mut S,
                 predecessors: &[DelegateLineageEntry],
                 _authorization: &MigrationAuthorization,
-            ) -> Result<DelegateMigrationReport, Self::Error> {
+                _policy: &SecretSelectionPolicy,
+            ) -> DelegateMigrationReport {
                 let mut out = Vec::new();
                 for e in predecessors {
                     let key = DelegateKey::new(e.delegate_key, CodeHash::new(e.code_hash));
@@ -936,7 +1587,7 @@ mod tests {
                     let outcome = import_predecessor_secrets_once(store, &key, &secrets);
                     out.push(classify_import(key, e.generation, outcome));
                 }
-                Ok(DelegateMigrationReport { predecessors: out })
+                DelegateMigrationReport { predecessors: out }
             }
         }
 
@@ -948,7 +1599,7 @@ mod tests {
                 vec![(b"nk".to_vec(), b"nv".to_vec())],
             )]),
         };
-        let report = block_on(node.migrate_from(&mut store, &[e], &ack())).unwrap();
+        let report = block_on(node.migrate_from(&mut store, &[e], &ack(), &newest()));
         assert!(matches!(
             report.predecessors[0],
             PredecessorMigration::Imported { imported: 1, .. }
@@ -957,7 +1608,13 @@ mod tests {
 
         // The app-side path now sees the node's markers and re-imports nothing.
         let mut io = MockIo::default().executable_with(&key_of(&e), &[(b"nk", b"RESURRECT")]);
-        let after = block_on(migrate_delegate_secrets(&mut store, &mut io, &[e], ack())).unwrap();
+        let after = block_on(migrate_delegate_secrets(
+            &mut store,
+            &mut io,
+            &[e],
+            ack(),
+            newest(),
+        ));
         assert!(
             matches!(
                 after.predecessors[0],

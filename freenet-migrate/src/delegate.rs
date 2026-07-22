@@ -78,6 +78,12 @@ const PRED_WIP_PREFIX: &[u8] = b"\0freenet-migrate/pred-wip:";
 /// Predecessor-delegate-key-keyed completion marker sub-prefix:
 /// `MARKER_NS ++ b"pred-done:" ++ <32 raw delegate-key bytes>` (plan §0).
 const PRED_DONE_PREFIX: &[u8] = b"\0freenet-migrate/pred-done:";
+/// Predecessor completion-marker VALUE for a data-bearing migration (the
+/// predecessor carried at least one real secret). See
+/// [`predecessor_migration_had_data`].
+const DONE_VALUE_DATA: &[u8] = b"1";
+/// Predecessor completion-marker VALUE for an empty (NoData) migration.
+const DONE_VALUE_EMPTY: &[u8] = b"0";
 
 /// One exported secret: `(raw key, value)`.
 pub type SecretPair = (Vec<u8>, Vec<u8>);
@@ -416,6 +422,7 @@ pub fn import_secrets_once<S: SecretStore + ?Sized>(
         store,
         &wip_marker(generation),
         &done_marker(generation),
+        b"1",
         &exported.secrets,
     );
     if !w.completed {
@@ -456,12 +463,16 @@ struct TwoPhaseWrite {
 ///    written and `completed` is `false` with zero counts.
 /// 2. For each secret: skip reserved markers, skip keys the successor already
 ///    holds (never clobber), attempt the write, count imported / failed.
-/// 3. Write `done_marker` ONLY if every secret wrote. `completed` is `true` only
-///    then. (Short-circuits: a prior failure never writes the done marker.)
+/// 3. Write `done_marker` (with value `done_value`) ONLY if every secret wrote.
+///    `completed` is `true` only then. (Short-circuits: a prior failure never
+///    writes the done marker.) `done_value` lets the delegate-key path record
+///    whether the migrated predecessor was data-bearing or empty (see
+///    [`import_predecessor_secrets_once`]); the generation path passes `b"1"`.
 fn write_secrets_two_phase<S: SecretStore + ?Sized>(
     store: &mut S,
     wip_marker: &[u8],
     done_marker: &[u8],
+    done_value: &[u8],
     secrets: &[(Vec<u8>, Vec<u8>)],
 ) -> TwoPhaseWrite {
     // Phase 1: record intent BEFORE writing any secret. If even this fails, we
@@ -499,7 +510,7 @@ fn write_secrets_two_phase<S: SecretStore + ?Sized>(
 
     // Phase 2: upgrade to the completion marker ONLY if every write succeeded.
     // (`&&` short-circuits: a prior failure skips the marker write entirely.)
-    let completed = failed == 0 && store.set_secret(done_marker, b"1");
+    let completed = failed == 0 && store.set_secret(done_marker, done_value);
     TwoPhaseWrite {
         imported,
         skipped,
@@ -566,9 +577,17 @@ pub enum PredecessorImportOutcome {
 ///
 /// The `source_generation` echo and the generation-monotonicity guard of
 /// [`import_secrets_once`] are deliberately absent: the predecessor key comes
-/// from the build-time-validated lineage (not an attacker-echoed field), and the
-/// driver walks predecessors newest-first so never-clobber already gives the
-/// newest generation's value precedence.
+/// from the build-time-validated lineage (not an attacker-echoed field), and
+/// cross-predecessor precedence is decided by the caller's
+/// [`crate::SecretSelectionPolicy`] plus never-clobber.
+///
+/// The completion marker records whether the migrated predecessor was
+/// **data-bearing or empty**, so a re-run can reconstruct the same selection
+/// decision (a `NewestSnapshotWins` walk stops at the newest *data-bearing*
+/// predecessor — see the crate-internal `predecessor_migration_had_data`). A
+/// NoData predecessor is imported through here with an empty `secrets` slice
+/// precisely so its marker is written and a later re-run is a true no-op even if
+/// the old delegate later gains data.
 ///
 /// ## Residual limit
 ///
@@ -587,10 +606,19 @@ pub fn import_predecessor_secrets_once<S: SecretStore + ?Sized>(
         return PredecessorImportOutcome::AlreadyMigrated;
     }
 
+    // Record whether this predecessor actually carried data (any non-marker
+    // secret), so a re-run reconstructs the same NewestSnapshotWins stop point.
+    let done_value = if secrets.iter().any(|(k, _)| !is_marker(k)) {
+        DONE_VALUE_DATA
+    } else {
+        DONE_VALUE_EMPTY
+    };
+
     let w = write_secrets_two_phase(
         store,
         &pred_wip_marker(predecessor),
         &pred_done_marker(predecessor),
+        done_value,
         secrets,
     );
     if !w.completed {
@@ -614,6 +642,38 @@ pub(crate) fn predecessor_already_migrated<S: SecretStore + ?Sized>(
     predecessor: &DelegateKey,
 ) -> bool {
     store.has_secret(&pred_done_marker(predecessor))
+}
+
+/// Reconstruct a completed predecessor migration's data/empty state from its
+/// marker value: `Some(true)` = it was data-bearing, `Some(false)` = it executed
+/// empty (NoData), `None` = no completed migration recorded.
+///
+/// A `NewestSnapshotWins` walk uses this so a re-run stops at the same newest
+/// *data-bearing* predecessor it did the first time (an empty AlreadyMigrated
+/// predecessor is fallen through, a data-bearing one is authoritative). An
+/// unrecognized value is treated conservatively as data-bearing.
+pub(crate) fn predecessor_migration_had_data<S: SecretStore + ?Sized>(
+    store: &S,
+    predecessor: &DelegateKey,
+) -> Option<bool> {
+    store
+        .get_secret(&pred_done_marker(predecessor))
+        .map(|v| v != DONE_VALUE_EMPTY)
+}
+
+/// The legacy-marker bridge (P1#3): whether a **generation-keyed**
+/// ([`import_secrets_once`]) migration has already covered `generation` — i.e.
+/// some `done:<gen>` marker exists with `gen >= generation`.
+///
+/// The two import APIs must never be mixed on one store (the delegate-key path is
+/// the seam-safe one; see the crate README). This bridge makes the delegate-key
+/// path *defensively* honor a store that a prior generation-keyed migration
+/// already wrote to, refusing to re-import a predecessor that generation covered.
+pub(crate) fn legacy_generation_migrated<S: SecretStore + ?Sized>(
+    store: &S,
+    generation: u32,
+) -> bool {
+    newest_completed_generation(store).is_some_and(|newest| newest >= generation)
 }
 
 /// The predecessor-key in-progress marker: `PRED_WIP_PREFIX ++ key bytes`.

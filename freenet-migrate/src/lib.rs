@@ -70,6 +70,7 @@ pub use delegate::{
 pub use delegate_migrate::{
     migrate_delegate_secrets, register_delegate_with_migration, DelegateMigrationReport,
     MigrationAuthorization, PredecessorMigration, PredecessorSecretsIo, RegisterAndMigrateIo,
+    SecretSelectionPolicy, UnionAck,
 };
 pub use driver::{
     contract_probe, migrate_contract, FoldAllAck, NewestFirst, Outcome, ProbeDriver, ProbeIo,

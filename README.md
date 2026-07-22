@@ -236,6 +236,7 @@ re-adoption.
 ```rust,ignore
 use freenet_migrate::{
     migrate_delegate_secrets, MigrationAuthorization, PredecessorSecretsIo,
+    SecretSelectionPolicy,
 };
 
 // `io` implements PredecessorSecretsIo: `probe_executable` sends a cheap no-op to
@@ -243,27 +244,49 @@ use freenet_migrate::{
 // both in the app's own delegate protocol (DelegateRequest::ApplicationMessages),
 // with the app's own response correlation (a browser has no request/response
 // correlation, so the app supplies it — e.g. a per-request oneshot side-table).
+// The report is the source of truth: transport errors become report rows, never a
+// bare error that would discard the predecessors already migrated.
 let report = migrate_delegate_secrets(
-    &mut ctx,                                     // successor SecretStore
-    &mut io,                                      // reaches the predecessors
-    DELEGATE_LINEAGE,                             // predecessor LIST (codegen'd)
-    MigrationAuthorization::app_author_ack(),     // consent — required, no default
-).await?;
+    &mut ctx,                                    // successor SecretStore
+    &mut io,                                     // reaches the predecessors
+    DELEGATE_LINEAGE,                            // predecessor LIST (codegen'd)
+    MigrationAuthorization::app_author_ack(),    // consent — required, no default
+    SecretSelectionPolicy::NewestSnapshotWins,   // safe default; or UnionAllGenerations(ack)
+).await;
 
-// The #204 UX fix: if a predecessor could not be reached, DO NOT fresh-install —
-// surface "your data may exist but can't auto-migrate".
-if report.any_unresponsive() {
-    // show the can't-migrate notice; never silently start empty
+// The #204 UX fix. Gate on completeness first, then classify:
+if !report.is_complete() {
+    if report.any_unresponsive() {
+        // A predecessor could not be reached — its data MAY exist but can't be
+        // auto-migrated. Surface "your data may exist but can't auto-migrate";
+        // NEVER silently fresh-install.
+    } else {
+        // Only Incomplete rows remain — a storage write failed mid-import. Safe
+        // to retry: re-run migrate_delegate_secrets (already-migrated predecessors
+        // are no-ops, the incomplete one re-runs).
+    }
 }
 ```
 
-Predecessors are processed newest-generation-first (never-clobber, so the newest
-value wins), each import keyed by the **predecessor delegate key** so a future
-node copy-forward writes the same anti-resurrection marker; a re-run is a no-op.
-Predecessor data is never deleted (`no-delete` invariant) — the marker, not
-deletion, is the anti-resurrection mechanism, and the intact predecessor is the
-rollback story. `register_delegate_with_migration` bundles registering the
-successor delegate with the same migration.
+Predecessors are a **list**, processed newest-generation-first. `SecretSelectionPolicy`
+decides the cross-generation behavior (the delegate-side analogue of the contract
+driver's `NewestFirstWins` / `FoldAll`):
+
+- `NewestSnapshotWins` (safe default): the newest predecessor that yields data is
+  authoritative; older ones are not imported after it. Preserves delete-by-absence
+  (a key the newer generation deleted can't be resurrected from an older one). Cost:
+  a key that only ever lived in an older generation stays unrecovered.
+- `UnionAllGenerations(ack)`: import every generation (never-clobber, newest still
+  wins conflicts) — the river#204 stranded-data recovery mode. It resurrects
+  delete-by-absence data, hence the loud ack.
+
+Each import is keyed by the **predecessor delegate key** (recording whether the
+predecessor was data-bearing or empty), so a future node copy-forward writes the
+same anti-resurrection marker and a re-run is a no-op. Predecessor data is never
+deleted (`no-delete` invariant) — the marker, not deletion, is the
+anti-resurrection mechanism, and the intact predecessor is the rollback story.
+`register_delegate_with_migration` bundles registering the successor delegate with
+the same migration.
 
 Underneath, the delegate-side **export/import primitives** do the mechanical work.
 The export enumerates secrets *generically* via `SecretStore::list_secrets`
@@ -335,14 +358,15 @@ match import_secrets_once(&mut ctx, &exported, successor_generation)? {
   and then retried re-imports the still-missing keys and cannot distinguish "never
   imported" from "imported then user-deleted", so a key deleted during that narrow
   window can be resurrected by the completing retry.
-- **Old-delegate-WASM retention (G1.8 preflight dependency).** The preflight can
-  only tell "predecessor can't execute" from "predecessor has no data" while the
-  node still has the old delegate WASM registered. If the old WASM has been
-  dropped, an unregistered predecessor is indistinguishable from a broken one —
-  both surface as `Unresponsive`, which the app must show rather than silently
-  fresh-installing. Old-WASM retention is a hard platform prerequisite of the
-  interim path; the node-side copy-forward removes the dependency by reading
-  storage directly.
+- **Predecessor registration/availability (G1.8 preflight dependency).** The
+  preflight can only tell "predecessor can't execute" from "predecessor has no
+  data" while the node the request reaches actually has the predecessor delegate
+  registered and available. (freenet-core retains delegate WASM indefinitely —
+  only an explicit `UnregisterDelegate` removes it — so this is not time-decay;
+  it is per-node registration/availability.) A predecessor the reached node never
+  registered is indistinguishable from a broken one — both surface as
+  `Unresponsive`, which the app must show rather than silently fresh-installing.
+  The node-side copy-forward removes the dependency by reading storage directly.
 
 ## Building & testing
 
