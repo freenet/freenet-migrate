@@ -86,8 +86,14 @@ jobs:
         with:
           workspaces: contracts/pointer-contract
       - run: cargo fmt --check
-      - run: cargo clippy --all-targets --all-features -- -D warnings
-      - run: cargo test --all-features
+      # `--locked` on every cargo invocation, not just the artifact build: an
+      # earlier unlocked step runs in the same tree and would silently rewrite
+      # Cargo.lock, so the frozen-hash step's own --locked would then compare
+      # against the rewritten lock and pass for the wrong reason.
+      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - run: cargo test --locked --all-features
+      - name: lockfile is unchanged by the build
+        run: git diff --exit-code Cargo.lock
       # The backstop. Rebuilds the WASM and fails if its code hash moved from
       # CODEHASH, whatever the cause -- a source edit, a dependency drift, a
       # toolchain change. See WASM-STABILITY.md.
@@ -99,3 +105,21 @@ jobs:
         run: |
           cmp pointer-v1.wasm \
               target/wasm32-unknown-unknown/release/freenet_pointer_contract.wasm
+      # The code hash is hand-copied into the docs, and consumers copy it out of
+      # them. A doc that names a stale hash sends integrators to an empty
+      # contract, so the copies must agree with CODEHASH.
+      - name: docs quote the current code hash
+        run: |
+          EXPECTED="$(grep -v '^#' CODEHASH | tr -d '[:space:]')"
+          for f in README.md TEST-VECTORS.md ../../FREENET.md; do
+            grep -q "$EXPECTED" "$f" || { echo "$f does not quote $EXPECTED"; exit 1; }
+          done
+          # ...and no file may quote a DIFFERENT base58 value of the same shape,
+          # except the derived keys the test vectors deliberately publish. Those
+          # are listed in KNOWN-BASE58 so adding one is a visible, reviewed act
+          # rather than a regex someone quietly loosens.
+          if grep -rhoE '\b[1-9A-HJ-NP-Za-km-z]{43,44}\b' README.md TEST-VECTORS.md ../../FREENET.md \
+             | grep -v "^$EXPECTED$" | grep -vxFf KNOWN-BASE58; then
+            echo "the above look like stale code hashes; update them or add to KNOWN-BASE58"
+            exit 1
+          fi

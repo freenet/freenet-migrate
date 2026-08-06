@@ -16,7 +16,27 @@ set -euo pipefail
 CRATE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$CRATE_DIR"
 
-CARGO_HOME_DIR="${CARGO_HOME:-$HOME/.cargo}"
+# Canonicalized: a trailing slash or a symlinked $HOME would make the remap
+# prefix not match what rustc emits, producing different bytes while Guard 2
+# still saw nothing under a known root.
+CARGO_HOME_DIR="$(cd "${CARGO_HOME:-$HOME/.cargo}" && pwd -P)"
+
+# The build must not depend on the caller's environment. CARGO_ENCODED_RUSTFLAGS
+# takes precedence over RUSTFLAGS (so invoking this from inside another cargo
+# process would silently discard the remapping below), CARGO_INCREMENTAL changes
+# codegen-unit partitioning, and a stray RUSTC_WRAPPER or CARGO_TARGET_DIR can
+# change the output too. Each of these alters the bytes with no guard to notice.
+unset CARGO_ENCODED_RUSTFLAGS CARGO_BUILD_RUSTFLAGS RUSTC_WRAPPER RUSTC_WORKSPACE_WRAPPER CARGO_TARGET_DIR RUSTC_BOOTSTRAP
+export CARGO_INCREMENTAL=0
+
+# Set the release profile through the environment, which outranks any
+# .cargo/config.toml up the tree or in $CARGO_HOME that would otherwise override
+# the manifest's [profile.release].
+export CARGO_PROFILE_RELEASE_OPT_LEVEL=s
+export CARGO_PROFILE_RELEASE_LTO=true
+export CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1
+export CARGO_PROFILE_RELEASE_PANIC=abort
+export CARGO_PROFILE_RELEASE_STRIP=true
 
 # Every path that can reach the binary is remapped to a fixed synthetic root, so
 # the output does not depend on where the source or the registry happens to live.
@@ -26,7 +46,7 @@ export SOURCE_DATE_EPOCH=0
 
 # `--locked` is load-bearing: without it a missing or stale lockfile lets cargo
 # re-resolve and pick different dependency versions, changing the bytes.
-cargo build --release --target wasm32-unknown-unknown --locked
+cargo build --release --target wasm32-unknown-unknown --locked --features freenet-main-contract
 
 WASM="target/wasm32-unknown-unknown/release/freenet_pointer_contract.wasm"
 
@@ -44,6 +64,7 @@ WASM="target/wasm32-unknown-unknown/release/freenet_pointer_contract.wasm"
 # cannot fail for the reason it exists. (Python is used only here, in the build
 # script; it is not a dependency of the artifact, so it cannot affect the bytes.)
 python3 - "$WASM" <<'PY'
+import re
 import sys
 
 data = open(sys.argv[1], "rb").read()
@@ -83,22 +104,48 @@ if missing:
 if "memory" not in memories:
     sys.exit("FATAL: the module does not export `memory`; the node cannot call it")
 print(f"exports:   OK ({len(required)} entry points + memory)")
-PY
 
-# --- Guard 2: no absolute paths from this machine may survive into the artifact.
-if strings "$WASM" | grep -qE "${CARGO_HOME_DIR}|${CRATE_DIR}|/home/|/Users/"; then
-    echo "FATAL: build is not reproducible -- absolute paths leaked into $WASM:" >&2
-    strings "$WASM" | grep -oE "(${CARGO_HOME_DIR}|${CRATE_DIR}|/home/|/Users/)[^ ]*" | head >&2
-    exit 1
-fi
+# --- Guard 2: no path from the builder's machine may survive into the artifact.
+#
+# An ALLOW-list, not a deny-list. Listing suspicious roots (/home/, /Users/)
+# only catches the ones somebody thought of: /root/, /build/, /workspace/,
+# /builds/ and C:\Users\ would all sail through. Every absolute path in a
+# correctly remapped build begins with one of the three synthetic roots below,
+# so anything else is a leak by definition.
+#
+# Folded into this Python block on purpose. As a separate `if strings ... |
+# grep`, a missing binutils made the whole guard exit non-zero and read as
+# "clean" -- `set -e` does not fire inside an `if` condition. That is the same
+# cannot-fail-for-its-own-reason shape as the old grep-based export check.
+# /rust/ and /rustc/ come from the precompiled `std` that rustup ships, so they
+# are fixed by the toolchain pin rather than by this machine. The deny-list this
+# replaced never noticed them; the allow-list surfaced them immediately, which is
+# the argument for the allow-list.
+allowed = (b"/cargo/", b"/crate/", b"/rustc/", b"/rust/")
+leaks = sorted({
+    m.group(0)
+    for m in re.finditer(rb"(?:[A-Za-z]:\\\\|/)[\w./\\-]{6,}", data)
+    if m.group(0).startswith(b"/") and not m.group(0).startswith(allowed)
+    and m.group(0).count(b"/") >= 2
+})
+if leaks:
+    shown = "\n".join(f"       {p.decode(errors='replace')}" for p in leaks[:10])
+    sys.exit(
+        "FATAL: build is not reproducible -- absolute paths leaked into the artifact:\n"
+        f"{shown}\n"
+        "       Every path must be under /cargo/, /crate/ or /rustc/.\n"
+        "       Check --remap-path-prefix, and that CARGO_HOME has no trailing slash."
+    )
+print(f"paths:     OK (all absolute paths under {', '.join(a.decode() for a in allowed)})")
+PY
 
 # The code hash, computed by stdlib's own `CodeHash::from_code` so it is the
 # same value a node derives, by construction rather than by reimplementation.
-HASH="$(cargo run --quiet --release --features publish --bin pointer-codehash -- "$WASM")"
+HASH="$(cargo run --quiet --release --locked --features publish --bin pointer-codehash -- "$WASM")"
 
 echo
 echo "wasm:      $CRATE_DIR/$WASM"
-echo "size:      $(stat -c%s "$WASM") bytes"
+echo "size:      $(wc -c < "$WASM" | tr -d ' ') bytes"
 echo "code hash: $HASH"
 
 if [[ "${1:-}" == "--check" ]]; then

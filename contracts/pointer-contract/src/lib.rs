@@ -116,6 +116,8 @@ impl core::fmt::Display for PointerError {
     }
 }
 
+impl std::error::Error for PointerError {}
+
 impl From<PointerError> for ContractError {
     fn from(e: PointerError) -> Self {
         match e {
@@ -293,13 +295,19 @@ impl ContractInterface for PointerContract {
         let params = parameters.as_ref();
         let parsed = PointerParams::parse(params)?;
 
-        // An empty state means this peer holds no pointer yet -- any valid
-        // record supersedes nothing and is accepted.
-        let mut best = if state.as_ref().is_empty() {
-            None
-        } else {
-            Some(PointerRecord::decode_verified(state.as_ref(), params)?)
-        };
+        // Unusable local state -- empty, truncated, or unverifiable -- is
+        // treated as "this peer holds no pointer yet", so a validly-signed
+        // candidate can always heal it.
+        //
+        // Returning `Err` here instead would brick the contract on that peer
+        // permanently: every later update would bail before even looking at the
+        // candidates, the network PUT path for an already-held contract also
+        // routes through `update_state`, and each rejection would feed the
+        // node's per-(contract, sender) merge backoff -- so the honest peers
+        // trying to heal it would be the ones suppressed. This is not a
+        // weakening: every record that can survive to be stored still had to
+        // pass `verify()` below.
+        let mut best = PointerRecord::decode_verified(state.as_ref(), params).ok();
 
         let mut saw_candidate = false;
         for update in &data {
@@ -318,7 +326,16 @@ impl ContractInterface for PointerContract {
 
             // A malformed or unsigned candidate is a genuinely invalid update
             // and is rejected. A *stale* candidate is not -- see below.
-            let candidate = PointerRecord::decode(bytes).map_err(ContractError::from)?;
+            //
+            // Reported as `InvalidUpdate*`, never `InvalidState`: the thing
+            // that was malformed is the INCOMING update, not what we hold. The
+            // node matches on that distinction -- only an invalid-update
+            // rejection triggers the "send our summary back" heal that tells a
+            // confused sender what we actually have.
+            let candidate =
+                PointerRecord::decode(bytes).map_err(|e| ContractError::InvalidUpdateWithInfo {
+                    reason: e.to_string(),
+                })?;
             candidate.verify(params, &parsed.author_vk).map_err(|e| {
                 ContractError::InvalidUpdateWithInfo {
                     reason: e.to_string(),
@@ -355,7 +372,20 @@ impl ContractInterface for PointerContract {
             return Ok(StateSummary::from(Vec::new()));
         }
         let record = PointerRecord::decode(state.as_ref()).map_err(ContractError::from)?;
-        Ok(StateSummary::from(record.version.to_be_bytes().to_vec()))
+        // The summary is the WHOLE record, not just the version.
+        //
+        // This is load-bearing, and a version-only summary is the trap. The
+        // node decides two peers have converged by comparing their summaries
+        // BYTE-FOR-BYTE, and skips the delta probe entirely when they match.
+        // With a version-only summary, two peers holding validly-signed but
+        // different records at the same version emit identical summaries, so
+        // they are declared converged, never exchange records, and `merge` --
+        // whose entire job is to break that tie -- is never called. The split
+        // the tiebreak exists to prevent would survive it.
+        //
+        // At 100 bytes the record is its own cheapest summary, so there is
+        // nothing to gain from a narrower one.
+        Ok(StateSummary::from(record.encode().to_vec()))
     }
 
     fn get_state_delta(
@@ -366,28 +396,28 @@ impl ContractInterface for PointerContract {
         if state.as_ref().is_empty() {
             return Ok(StateDelta::from(Vec::new()));
         }
-        let record = PointerRecord::decode(state.as_ref()).map_err(ContractError::from)?;
+        let ours = PointerRecord::decode(state.as_ref()).map_err(ContractError::from)?;
 
-        let summary_version = match summary.as_ref().len() {
-            // Empty summary: the peer holds nothing, so everything is news.
-            0 => 0,
-            4 => {
-                let mut v = [0u8; 4];
-                v.copy_from_slice(summary.as_ref());
-                u32::from_be_bytes(v)
-            }
-            _ => {
-                return Err(ContractError::Deser(
-                    "pointer summary must be 4 bytes".into(),
-                ))
-            }
+        // Any summary we cannot read -- empty, truncated, garbage -- means "I
+        // cannot tell what this peer holds", and the safe answer to that is
+        // "here is everything". Deliberately NOT an error: the summary is
+        // peer-supplied, so erroring would let any peer turn one malformed byte
+        // into a failed WASM call on every heartbeat.
+        let theirs = PointerRecord::decode(summary.as_ref()).ok();
+
+        // Send when we hold something their record would not win against.
+        // Because `merge` is a total order, exactly one of two diverged peers
+        // owes the other a delta, so a divergence resolves in a single round.
+        let owed = match theirs {
+            None => true,
+            Some(theirs) => merge(theirs, ours) != theirs,
         };
 
-        if record.version > summary_version {
+        if owed {
             // The delta *is* the whole record. At 100 bytes there is nothing
             // to gain from a narrower encoding, and a full record is
             // self-verifying at the receiver.
-            Ok(StateDelta::from(record.encode().to_vec()))
+            Ok(StateDelta::from(ours.encode().to_vec()))
         } else {
             Ok(StateDelta::from(Vec::new()))
         }
@@ -398,23 +428,37 @@ impl ContractInterface for PointerContract {
 ///
 /// Higher version always wins. At an *equal* version with different bytes --
 /// which only the author can produce, by signing twice at one version from two
-/// release machines or a retried publish -- the tie is broken by comparing
-/// `code_hash` lexicographically.
+/// release machines or a retried publish -- the **lower** encoded record wins,
+/// comparing `code_hash` first and then the signature.
 ///
-/// Without a tiebreak, two peers holding byte-different equal-version records
-/// would each treat the other's as stale forever: a permanent anti-entropy
-/// split (freenet-core#5158 documents six contracts stuck exactly this way).
-/// Neither outcome recovers the author's intent without a version bump, so
-/// deterministic convergence is strictly better than a permanent split. The
-/// primary defence is still operational: gate publishing on a single committed
-/// monotonic counter (see `README.md`).
+/// This is a **total order**, and that is the point. Comparing `code_hash`
+/// alone would leave two records with the same version and same code hash but
+/// different signatures unordered, so each peer would keep its own and the
+/// split would be permanent. That is not hypothetical: this crate's own signer
+/// is deterministic, but `README.md` tells authors to hold the key in offline
+/// or threshold custody, and threshold Ed25519 and hedged HSM signers use
+/// randomized nonces -- so re-signing identical content, which is exactly the
+/// retried-publish case, yields two different valid signatures.
+///
+/// Without a tiebreak at all, two peers holding byte-different equal-version
+/// records would each treat the other's as stale forever: a permanent
+/// anti-entropy split (freenet-core#5158 documents six contracts stuck exactly
+/// this way). Neither outcome recovers the author's intent without a version
+/// bump, so deterministic convergence is strictly better than a permanent
+/// split. The primary defence is still operational: gate publishing on a single
+/// committed monotonic counter (see `README.md`).
+///
+/// `summarize_state` must expose enough for this to be reachable -- see the
+/// note there on why a version-only summary silently disarms it.
 fn merge(current: PointerRecord, candidate: PointerRecord) -> PointerRecord {
     use core::cmp::Ordering;
     match candidate.version.cmp(&current.version) {
         Ordering::Greater => candidate,
         Ordering::Less => current,
+        // The version is equal and occupies the leading bytes, so comparing the
+        // full encoding compares `code_hash` and then `signature`.
         Ordering::Equal => {
-            if candidate.code_hash < current.code_hash {
+            if candidate.encode() < current.encode() {
                 candidate
             } else {
                 current
@@ -696,10 +740,14 @@ mod tests {
             State::from(state.clone()),
         )
         .unwrap();
-        assert_eq!(summary.as_ref(), &7u32.to_be_bytes());
+        // The summary is the whole record, not just the version: a version-only
+        // summary would make same-version divergence invisible to anti-entropy.
+        // See `diverged_peers_at_the_same_version_are_visible_to_anti_entropy`.
+        assert_eq!(summary.as_ref(), state.as_slice());
+        assert_eq!(PointerRecord::decode(summary.as_ref()).unwrap().version, 7);
 
         // A peer that is behind gets the whole record back.
-        let behind = StateSummary::from(3u32.to_be_bytes().to_vec());
+        let behind = StateSummary::from(state_bytes(&sk, &p, 3, 0xCC));
         let delta = PointerContract::get_state_delta(
             Parameters::from(p.clone()),
             State::from(state.clone()),
@@ -721,10 +769,11 @@ mod tests {
 
         // A peer that is level or ahead gets nothing.
         for v in [7u32, 8] {
+            let theirs = state_bytes(&sk, &p, v, 0xAA);
             let d = PointerContract::get_state_delta(
                 Parameters::from(p.clone()),
                 State::from(state.clone()),
-                StateSummary::from(v.to_be_bytes().to_vec()),
+                StateSummary::from(theirs),
             )
             .unwrap();
             assert!(d.as_ref().is_empty(), "no delta owed to a peer at v{v}");
@@ -823,5 +872,364 @@ mod tests {
             "pointer code_hash + own params must reproduce the node's own key derivation"
         );
         assert_eq!(derived.encoded_code_hash(), code_hash.encode());
+    }
+
+    // ------------------------------------------- convergence of diverged peers
+
+    /// The bug this pins: with a version-only summary, two peers holding
+    /// different validly-signed records at the SAME version emit identical
+    /// summaries. The node compares summaries byte-for-byte to decide two peers
+    /// have converged, so it skips the delta probe, the records never meet, and
+    /// `merge` -- whose whole job is to break that tie -- is never called.
+    ///
+    /// `equal_version_conflicts_converge_deterministically` cannot catch this:
+    /// it hands both records to `update_state` directly, bypassing the exact
+    /// layer that keeps them apart.
+    #[test]
+    fn diverged_peers_at_the_same_version_are_visible_to_anti_entropy() {
+        let sk = key(1);
+        let p = params_for(&sk, APP_ID);
+        let a = state_bytes(&sk, &p, 9, 0x11);
+        let b = state_bytes(&sk, &p, 9, 0x99);
+        assert_ne!(a, b);
+
+        let sum = |st: &[u8]| {
+            PointerContract::summarize_state(Parameters::from(p.clone()), State::from(st.to_vec()))
+                .unwrap()
+                .as_ref()
+                .to_vec()
+        };
+        assert_ne!(
+            sum(&a),
+            sum(&b),
+            "diverged peers must not summarize identically, or the node calls them converged"
+        );
+
+        // Exactly one side owes the other a delta, so it resolves in one round.
+        let delta = |mine: &[u8], theirs: &[u8]| {
+            PointerContract::get_state_delta(
+                Parameters::from(p.clone()),
+                State::from(mine.to_vec()),
+                StateSummary::from(sum(theirs)),
+            )
+            .unwrap()
+            .as_ref()
+            .to_vec()
+        };
+        let a_owes = !delta(&a, &b).is_empty();
+        let b_owes = !delta(&b, &a).is_empty();
+        assert!(
+            a_owes ^ b_owes,
+            "exactly one peer must owe a delta (a_owes={a_owes}, b_owes={b_owes})"
+        );
+
+        // Applying it lands both peers on the same record.
+        let owed = if a_owes { delta(&a, &b) } else { delta(&b, &a) };
+        let loser = if a_owes { b.clone() } else { a.clone() };
+        let healed = PointerContract::update_state(
+            Parameters::from(p.clone()),
+            State::from(loser),
+            vec![UpdateData::Delta(StateDelta::from(owed.clone()))],
+        )
+        .unwrap()
+        .unwrap_valid();
+        let winner = if a_owes { a } else { b };
+        assert_eq!(healed.as_ref(), winner.as_slice(), "peers must converge");
+    }
+
+    #[test]
+    fn merge_is_a_total_order_even_when_only_the_signature_differs() {
+        // Only the author can produce this (it needs their key), but a
+        // threshold or hedged-nonce signer re-signing identical content is
+        // exactly the retried-publish case the README anticipates.
+        let a = PointerRecord {
+            version: 9,
+            code_hash: code_hash(0x11),
+            signature: [1u8; SIGNATURE_LEN],
+        };
+        let b = PointerRecord {
+            version: 9,
+            code_hash: code_hash(0x11),
+            signature: [2u8; SIGNATURE_LEN],
+        };
+        assert_eq!(merge(a, b), merge(b, a), "merge must be commutative");
+
+        // ...and associative across three records, in every order.
+        let c = PointerRecord {
+            version: 9,
+            code_hash: code_hash(0x11),
+            signature: [3u8; SIGNATURE_LEN],
+        };
+        let expected = merge(merge(a, b), c);
+        for (x, y, z) in [(a, c, b), (b, a, c), (b, c, a), (c, a, b), (c, b, a)] {
+            assert_eq!(merge(merge(x, y), z), expected, "merge must be associative");
+        }
+    }
+
+    #[test]
+    fn a_malformed_stored_state_is_healed_rather_than_bricking_the_peer() {
+        let sk = key(1);
+        let p = params_for(&sk, APP_ID);
+        let good = state_bytes(&sk, &p, 5, 0xAA);
+
+        for corrupt in [vec![0u8; STATE_LEN], vec![9u8; 7], vec![]] {
+            let stored = update(&p, &corrupt, good.clone())
+                .expect("a valid record must be able to heal unusable local state")
+                .unwrap_valid();
+            assert_eq!(stored.as_ref(), good.as_slice());
+        }
+    }
+
+    // ------------------------------------------------------ contract-side gates
+
+    /// The confusability defence lives in `parse`, which is what the node runs.
+    /// Asserting only against `encode` would leave it untested: `encode` is a
+    /// publisher-side helper that is not even in the frozen WASM.
+    #[test]
+    fn the_contract_itself_rejects_out_of_charset_app_ids() {
+        let sk = key(1);
+        let p = params_for(&sk, APP_ID);
+        let s = state_bytes(&sk, &p, 1, 0xAA);
+
+        for bad_id in [
+            b"River".to_vec(),      // uppercase: case-confusable
+            b"river room".to_vec(), // space
+            b"river/room".to_vec(), // path separator
+            vec![0u8],              // NUL
+            vec![b'a'; MAX_APP_ID_LEN + 1],
+            vec![],
+        ] {
+            let mut params = sk.verifying_key().to_bytes().to_vec();
+            params.extend_from_slice(&bad_id);
+            assert!(
+                validate(&params, &s).is_err(),
+                "the contract must reject app_id {bad_id:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn app_id_alphabet_is_exactly_the_documented_set() {
+        let allowed: Vec<u8> = b"abcdefghijklmnopqrstuvwxyz0123456789.-_".to_vec();
+        for b in 0u8..=255 {
+            assert_eq!(
+                is_valid_app_id_byte(b),
+                allowed.contains(&b),
+                "byte {b:#04x} classified wrongly"
+            );
+        }
+    }
+
+    #[test]
+    fn app_id_length_bounds_agree_between_parse_and_encode() {
+        let sk = key(1);
+        for n in [
+            0usize,
+            1,
+            2,
+            MAX_APP_ID_LEN - 1,
+            MAX_APP_ID_LEN,
+            MAX_APP_ID_LEN + 1,
+        ] {
+            let id = vec![b'a'; n];
+            let encoded = PointerParams::encode(&sk.verifying_key(), &id);
+            let mut raw = sk.verifying_key().to_bytes().to_vec();
+            raw.extend_from_slice(&id);
+            let parsed = PointerParams::parse(&raw);
+            assert_eq!(
+                encoded.is_ok(),
+                parsed.is_ok(),
+                "publisher and contract must agree on app_id length {n}"
+            );
+            if let Ok(q) = parsed {
+                assert_eq!(q.app_id, &id[..]);
+            }
+        }
+    }
+
+    #[test]
+    fn params_with_a_non_canonical_key_are_rejected() {
+        let sk = key(1);
+        let s = state_bytes(&sk, &params_for(&sk, APP_ID), 1, 0xAA);
+        let mut params = vec![0xFFu8; VERIFYING_KEY_LEN];
+        params.extend_from_slice(APP_ID);
+        assert!(validate(&params, &s).is_err());
+    }
+
+    #[test]
+    fn sign_record_refuses_what_the_contract_would_refuse() {
+        let sk = key(1);
+        let p = params_for(&sk, APP_ID);
+        assert!(sign_record(&sk, &p, 0, code_hash(1)).is_err(), "version 0");
+        let mut bad = sk.verifying_key().to_bytes().to_vec();
+        bad.extend_from_slice(b"River");
+        assert!(
+            sign_record(&sk, &bad, 1, code_hash(1)).is_err(),
+            "bad app_id"
+        );
+    }
+
+    #[test]
+    fn a_bad_signature_is_reported_as_a_signature_failure() {
+        // `ContractError::Other` is the catch-all for three distinct causes, so
+        // assert at the `PointerError` level where they are distinguishable.
+        let author = key(1);
+        let impostor = key(2);
+        let p = params_for(&author, APP_ID);
+        let record = sign_record(&impostor, &p, 1, code_hash(0xAA)).unwrap();
+        assert_eq!(
+            record.verify(&p, &author.verifying_key()),
+            Err(PointerError::BadSignature)
+        );
+    }
+
+    // ----------------------------------------------------------- update batches
+
+    #[test]
+    fn update_folds_over_every_entry_regardless_of_order() {
+        let sk = key(1);
+        let p = params_for(&sk, APP_ID);
+        let base = state_bytes(&sk, &p, 1, 0x01);
+        let v3 = state_bytes(&sk, &p, 3, 0x03);
+        let v9 = state_bytes(&sk, &p, 9, 0x09);
+        let v5 = state_bytes(&sk, &p, 5, 0x05);
+
+        for order in [[&v3, &v9, &v5], [&v9, &v5, &v3], [&v5, &v3, &v9]] {
+            let data = order
+                .iter()
+                .map(|s| UpdateData::State(State::from(s.to_vec())))
+                .collect();
+            let stored = PointerContract::update_state(
+                Parameters::from(p.clone()),
+                State::from(base.clone()),
+                data,
+            )
+            .unwrap()
+            .unwrap_valid();
+            assert_eq!(PointerRecord::decode(stored.as_ref()).unwrap().version, 9);
+        }
+    }
+
+    #[test]
+    fn update_uses_the_state_half_of_a_state_and_delta_entry() {
+        let sk = key(1);
+        let p = params_for(&sk, APP_ID);
+        let current = state_bytes(&sk, &p, 1, 0xAA);
+        let next = state_bytes(&sk, &p, 2, 0xBB);
+        let stored = PointerContract::update_state(
+            Parameters::from(p.clone()),
+            State::from(current),
+            vec![UpdateData::StateAndDelta {
+                state: State::from(next.clone()),
+                delta: StateDelta::from(next.clone()),
+            }],
+        )
+        .unwrap()
+        .unwrap_valid();
+        assert_eq!(stored.as_ref(), next.as_slice());
+    }
+
+    #[test]
+    fn a_garbage_summary_asks_for_everything_rather_than_erroring() {
+        // The summary is peer-supplied; erroring would let any peer turn one
+        // malformed byte into a failed WASM call on every heartbeat.
+        let sk = key(1);
+        let p = params_for(&sk, APP_ID);
+        let state = state_bytes(&sk, &p, 4, 0xAA);
+        for junk in [vec![0u8; 3], vec![0u8; 5], vec![0xFFu8; 99], vec![7u8; 200]] {
+            let delta = PointerContract::get_state_delta(
+                Parameters::from(p.clone()),
+                State::from(state.clone()),
+                StateSummary::from(junk.clone()),
+            )
+            .expect("an unreadable summary must not be an error");
+            assert_eq!(delta.as_ref(), state.as_slice());
+        }
+    }
+
+    #[test]
+    fn the_maximum_version_still_validates_and_wins() {
+        let sk = key(1);
+        let p = params_for(&sk, APP_ID);
+        let max = state_bytes(&sk, &p, u32::MAX, 0xAA);
+        assert!(matches!(validate(&p, &max), Ok(ValidateResult::Valid)));
+        let prev = state_bytes(&sk, &p, u32::MAX - 1, 0xBB);
+        let stored = update(&p, &prev, max.clone()).unwrap().unwrap_valid();
+        assert_eq!(stored.as_ref(), max.as_slice());
+    }
+
+    // -------------------------------------------------------- frozen byte layout
+
+    /// A known-answer test over the whole wire format.
+    ///
+    /// Every other test signs and verifies through the same `signing_message`,
+    /// so any mutation that changes both sides together -- big-endian to
+    /// little-endian, or reordering the segments -- passes them all. Only a
+    /// literal fixture catches that, and a third party implementing this layout
+    /// in another language has nothing else to check itself against.
+    #[test]
+    fn wire_format_known_answer() {
+        let sk = key(1);
+        let p = params_for(&sk, b"river.room-contract");
+        let msg = signing_message(&p, 7, &code_hash(0xAA));
+        assert_eq!(
+            hex(&msg),
+            concat!(
+                // b"freenet-pointer/state-v1"
+                "667265656e65742d706f696e7465722f73746174652d7631",
+                // params: 32-byte author verifying key...
+                "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
+                // ...then the app_id, b"river.room-contract"
+                "72697665722e726f6f6d2d636f6e7472616374",
+                // version 7, u32 big-endian
+                "00000007",
+                // code_hash
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ),
+            "the signed message layout is frozen"
+        );
+        let state = state_bytes(&sk, &p, 7, 0xAA);
+        assert_eq!(state.len(), STATE_LEN);
+        assert_eq!(&hex(&state)[..8], "00000007", "version is u32 big-endian");
+        assert!(matches!(validate(&p, &state), Ok(ValidateResult::Valid)));
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    // ------------------------------------------- consumer derivation, delegates
+
+    /// The contract half is pinned by `consumer_derivation_matches_stdlib`; the
+    /// incident that motivated this contract (ghostkeys, 2026-08-03) was a
+    /// DELEGATE re-key, so pin that path too -- it is a different stdlib
+    /// function with a different signature.
+    #[test]
+    fn consumer_delegate_derivation_matches_stdlib() {
+        let wasm = b"pretend this is the app's delegate wasm".to_vec();
+        let my_own_params = Parameters::from(b"the consumer's own delegate params".to_vec());
+
+        let authoritative = Delegate::from((&DelegateCode::from(wasm.clone()), &my_own_params))
+            .key()
+            .clone();
+
+        // Go through a real signed record, so the 32 bytes actually travel the
+        // path an integrator uses rather than being handed over directly.
+        let sk = key(1);
+        let p = params_for(&sk, b"ghostkeys.ghostkey-delegate");
+        let code_hash = CodeHash::from_code(&wasm);
+        let record = sign_record(
+            &sk,
+            &p,
+            1,
+            code_hash.as_ref().try_into().expect("32-byte code hash"),
+        )
+        .unwrap();
+        let resolved = PointerRecord::decode_verified(&record.encode(), &p).unwrap();
+
+        let derived =
+            DelegateKey::from_params(CodeHash::new(resolved.code_hash).encode(), &my_own_params)
+                .expect("valid base58");
+        assert_eq!(derived.bytes(), authoritative.bytes());
     }
 }

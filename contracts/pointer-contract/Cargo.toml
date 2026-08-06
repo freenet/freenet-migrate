@@ -26,9 +26,17 @@ publish = false
 crate-type = ["cdylib", "rlib"]
 
 [features]
-default = ["freenet-main-contract"]
+default = []
 # Emits the four `#[no_mangle]` entry points the node calls, and pulls in
 # stdlib's WASM memory interface that they are implemented over.
+#
+# OFF BY DEFAULT, and that is deliberate. The `#[contract]` macro's exports
+# carry no target gate, so a native consumer that depends on this crate to get
+# `PointerParams` / `PointerRecord` would otherwise link four `#[no_mangle]`
+# symbols into its own binary -- and collide at link time with any other
+# contract crate in its graph. Consumers take `default-features = false`;
+# `build-wasm.sh` turns this on explicitly for the artifact build, and its
+# export check fails loudly if it is ever missing.
 #
 # These two must move together. The `#[contract]` macro gates its exports on
 # *this crate's* `freenet-main-contract` feature, while the memory interface

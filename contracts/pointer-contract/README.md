@@ -10,6 +10,29 @@ code_hash: 9xH2…            <- the app's current WASM hash
 
 That is the entire state. Everything else in this README is about how to use it.
 
+> ### This solves ADDRESSING ONLY. Read this before you build on it.
+>
+> The pointer tells you **which code hash is current**. It says **nothing about
+> whether any state or any secret held under the previous key survived the
+> re-key.** Those are two different problems, and only the first one is fixed.
+>
+> Concretely, as of 2026-08: a design review of River found that delegate
+> secrets written to its dedicated secure namespace do **not** survive a
+> delegate re-key, while secrets written to its readable blob **do**, because
+> the migration probe only reaches the latter. River re-keys roughly weekly.
+>
+> So an integrator who resolves a pointer, derives the new key, and assumes the
+> user's data came with it will be wrong, and wrong in a way that looks like
+> "this user has no data" rather than like an error. Resolving the pointer
+> correctly is necessary for a safe upgrade and nowhere near sufficient.
+>
+> What you get here: you can tell "the thing I was built against moved" apart
+> from "this user has no data" — which is exactly the distinction that was
+> missing during the ghostkeys incident, and enough to surface an honest message
+> instead of a misleading one. What you do **not** get: any guarantee that
+> reading the new key returns what the old key held. Verify data survival
+> separately, per artifact, and treat it as unsolved until you have.
+
 ## Why it exists
 
 A Freenet contract or delegate key is `BLAKE3(BLAKE3(wasm) ‖ params)`. Any byte
@@ -60,34 +83,68 @@ private key matching `author_verifying_key`. The message covers the **whole
 params blob**, so a record signed for one app cannot be replayed into another
 pointer belonging to the same author.
 
+### Step 0 — depend on this crate
+
+```toml
+[dependencies]
+freenet-pointer-contract = { git = "https://github.com/freenet/freenet-migrate", default-features = false }
+```
+
+`default-features = false` is **mandatory**, not stylistic. The default feature
+emits the four `#[no_mangle]` WASM entry points, which carry no target gate — so
+with defaults on, a native consumer links `validate_state`, `update_state`,
+`summarize_state` and `get_state_delta` into its own binary and collides at link
+time with any other contract crate in its graph.
+
+There is no crates.io release on purpose: a published source crate invites
+rebuilding the WASM locally, and a locally rebuilt WASM has a different code
+hash, which is a different and empty contract.
+
 ### Step 1 — compute the pointer's own key
 
 You need three things, all of which you have at build time: the published
 pointer code hash (`CODEHASH` in this directory, a constant you embed — see
 "Never rebuild this WASM" below), the author's verifying key, and the `app_id`.
 
+Where does the author's verifying key come from? From the app's own
+`FREENET.md`, pinned as a constant in your build, exactly like the code hash.
+That 32-byte value is the entire trust anchor: take it from the wrong place and
+you will resolve a validly-signed pointer belonging to somebody else.
+
 ```rust
-use freenet_pointer_contract::PointerParams;
-use freenet_stdlib::prelude::{ContractKey, Parameters};
+use ed25519_dalek::VerifyingKey;
+use freenet_pointer_contract::{PointerParams, PointerRecord};
+use freenet_stdlib::prelude::{CodeHash, ContractKey, DelegateKey, Parameters};
 
-const POINTER_CODE_HASH: &str = "9V7mTtJjz8Y4Vmkhta38fTzvVF1pxfwzC6NWvGx3FiEG";
+/// Both constants are pinned at build time and never recomputed.
+const POINTER_CODE_HASH: &str = "E6CUUEuYPUT4GoW9C4d279oK1p8b5RUKiSScqnExc1Yb";
+const AUTHOR_VK: [u8; 32] = [/* from the app's FREENET.md */];
 
-let params = PointerParams::encode(&author_vk, b"ghostkeys.ghostkey-delegate")?;
-let pointer_key = ContractKey::from_params(
-    POINTER_CODE_HASH,
-    Parameters::from(params.clone()),
-)?;
+type Error = Box<dyn std::error::Error>;
+
+fn pointer_key() -> Result<(ContractKey, Vec<u8>), Error> {
+    let author_vk = VerifyingKey::from_bytes(&AUTHOR_VK)?;
+    let params = PointerParams::encode(&author_vk, b"ghostkeys.ghostkey-delegate")?;
+    let key = ContractKey::from_params(POINTER_CODE_HASH, Parameters::from(params.clone()))?;
+    Ok((key, params))
+}
 ```
+
+`PointerError` implements `std::error::Error`, so it composes with stdlib's
+`bs58::decode::Error` under a boxed error and `?` works throughout.
 
 That is `BLAKE3(pointer_code_hash ‖ params)`. It never changes.
 
 ### Step 2 — GET it and verify
 
 ```rust
-// ...an ordinary GET for `pointer_key`, giving you the 100-byte state...
-let record = PointerRecord::decode_verified(&state, &params)?;
-// record.version   -> monotonic
-// record.code_hash -> the app's CURRENT wasm hash
+/// `state` is the 100 bytes an ordinary GET for the pointer key returned.
+fn resolve(state: &[u8], params: &[u8]) -> Result<PointerRecord, Error> {
+    let record = PointerRecord::decode_verified(state, params)?;
+    // record.version   -> monotonic
+    // record.code_hash -> the app's CURRENT wasm hash
+    Ok(record)
+}
 ```
 
 `decode_verified` is the only call the accept path should make: it parses the
@@ -102,27 +159,29 @@ instance's params** — the room owner's key, your delegate's config, whatever i
 is for you — to get your key:
 
 ```rust
-use freenet_stdlib::prelude::{CodeHash, ContractKey, DelegateKey, Parameters};
+/// `my_own_params` are YOUR instance's params, not the pointer's.
+fn derive_contract(record: &PointerRecord, my_own_params: Vec<u8>) -> Result<ContractKey, Error> {
+    let code_hash_b58 = CodeHash::new(record.code_hash).encode();
+    Ok(ContractKey::from_params(
+        &code_hash_b58,
+        Parameters::from(my_own_params),
+    )?)
+}
 
-let code_hash_b58 = CodeHash::new(record.code_hash).encode();
-
-// A contract:
-let current = ContractKey::from_params(
-    &code_hash_b58,
-    Parameters::from(my_own_params.clone()),   // NOT the pointer's params
-)?;
-
-// A delegate:
-let current = DelegateKey::from_params(
-    &code_hash_b58,
-    &Parameters::from(my_own_params.clone()),
-)?;
+fn derive_delegate(record: &PointerRecord, my_own_params: Vec<u8>) -> Result<DelegateKey, Error> {
+    let code_hash_b58 = CodeHash::new(record.code_hash).encode();
+    Ok(DelegateKey::from_params(
+        &code_hash_b58,
+        &Parameters::from(my_own_params),
+    )?)
+}
 ```
 
 Both compute `BLAKE3(code_hash ‖ your params)`, which is exactly what a node
-computes when it holds the code — pinned by the
-`consumer_derivation_matches_stdlib` test against stdlib's own
-`ContractKey::from_params_and_code`.
+computes when it holds the code. Both paths are pinned against stdlib's own
+derivation — `consumer_derivation_matches_stdlib` for contracts and
+`consumer_delegate_derivation_matches_stdlib` for delegates — so this
+documentation cannot drift from what the network actually does.
 
 Two traps:
 
@@ -132,9 +191,10 @@ Two traps:
   River room, every delegate registration — and a `current_key` could only ever
   have been right for one of them.
 - **Keep both halves of the key.** `from_params` returns a `ContractKey`
-  carrying both the instance id and the code hash. An UPDATE is rejected if the
-  code hash is missing, so do not reduce the key to its instance id and rebuild
-  it later (freenet-core#4978).
+  carrying both the instance id and the code hash. An UPDATE takes a full
+  `ContractKey` while a GET takes only a `ContractInstanceId`, so a consumer
+  that stores just the instance id can read but can never write
+  (freenet-core#4978). Keep the whole thing.
 
 Detecting staleness needs nothing further: compare the derived key against the
 one you were built with. To fetch the code, GET the derived key with
@@ -181,7 +241,14 @@ let record = freenet_pointer_contract::sign_record(
 // pointer key from Step 1.
 ```
 
-Three operational requirements, none of which the contract can enforce for you:
+**PUT the committed `pointer-v1.wasm`, and check its hash against `CODEHASH`
+first.** Do not build the WASM yourself as part of your release. Building it
+locally and PUTting your own bytes silently forks the convention: your pointer
+lands at a key nobody else derives, so it is invisible to every consumer while
+looking, to you, like a successful publish.
+
+Three further operational requirements, none of which the contract can enforce
+for you:
 
 1. **Gate `version` on a single committed monotonic counter**, the way River's
    `published-contract/contract-version.txt` does. Two release machines, or a
@@ -194,7 +261,13 @@ Three operational requirements, none of which the contract can enforce for you:
    shipping a new app and telling people; losing this one means every consumer
    is permanently, authoritatively pointed at a record that nothing can
    supersede. There is no recovery.
-3. **Choose `app_id` once.** It is part of the params, so it is part of the key.
+3. **Check that your publish actually landed.** A publish at an already-used
+   version is a no-op *success* — the contract deliberately does not error on a
+   stale update, because erroring would turn routine anti-entropy from a peer
+   that is merely behind into a merge failure. So the network will not tell you
+   your release was ignored. Re-read the pointer after publishing and confirm
+   the version and code hash are the ones you intended.
+4. **Choose `app_id` once.** It is part of the params, so it is part of the key.
    Changing it is publishing a different pointer. Convention:
    `<project>.<artifact>`, e.g. `river.room-contract`, `river.chat-delegate`,
    `ghostkeys.ghostkey-delegate`. Name the artifact, not its kind — this is why
