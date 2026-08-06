@@ -83,7 +83,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: contracts/pointer-contract-conformance
-      - run: cargo test
+      - run: cargo test --locked
 
   pointer-contract:
     # The pointer contract is excluded from the workspace (its bytes must not
@@ -126,19 +126,47 @@ jobs:
         run: |
           cmp pointer-v1.wasm \
               target/wasm32-unknown-unknown/release/freenet_pointer_contract.wasm
-      # Docs are scanned by discovery, not by a hardcoded list: naming files
-      # here means a stale hash in one nobody listed goes unnoticed.
-      - name: no tracked markdown quotes a stale code hash
+      # Scanned by discovery over EVERY tracked text file, not just markdown:
+      # a .rs, .html, .json or .toml copy of the hash goes just as stale, and
+      # naming file types here reintroduces the blind spot the discovery was
+      # meant to remove.
+      - name: no tracked file quotes a stale code hash
         run: |
+          set -euo pipefail
           EXPECTED="$(grep -v '^#' CODEHASH | tr -d '[:space:]')"
+          # Comments stripped: the file is documentation as much as data, and
+          # `grep -f` would otherwise treat a `#` line as a pattern.
+          ALLOW="$(mktemp)"
+          grep -vE '^\s*(#|$)' KNOWN-BASE58 > "$ALLOW"
           cd ../..
-          FILES=$(git ls-files '*.md')
-          if grep -rhoE '\b[1-9A-HJ-NP-Za-km-z]{43,44}\b' $FILES \
-             | grep -v "^$EXPECTED$" \
-             | grep -vxFf contracts/pointer-contract/KNOWN-BASE58; then
-            echo "the above look like stale code hashes; update them or add to KNOWN-BASE58"
+          # `-I` skips binaries (the .wasm and the vendored .crate tarballs).
+          mapfile -t FILES < <(git ls-files)
+          FOUND="$(grep -IhoE '\b[1-9A-HJ-NP-Za-km-z]{43,44}\b' "${FILES[@]}" 2>/dev/null | sort -u || true)"
+
+          STALE="$(printf '%s\n' "$FOUND" | grep -v "^$EXPECTED$" | grep -vxFf "$ALLOW" || true)"
+          if [ -n "$STALE" ]; then
+            echo "Base58 values of code-hash shape that are not the pointer's current hash:"
+            printf '  %s\n' $STALE
+            echo
+            echo "If one is a stale copy of the pointer's code hash, update it to:"
+            echo "  $EXPECTED"
+            echo "If it is something else entirely (another contract, a fixture),"
+            echo "add it to contracts/pointer-contract/KNOWN-BASE58 with a comment"
+            echo "saying what it is."
             exit 1
           fi
+
+          # An allowlist entry that no longer appears anywhere is itself a
+          # hazard: it sits there silencing a future stale hash that happens to
+          # match it. Same cannot-fail shape as the guards fixed in cb78d21.
+          while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            if ! printf '%s\n' "$FOUND" | grep -qxF "$line"; then
+              echo "KNOWN-BASE58 entry is stale (appears in no tracked file): $line"
+              echo "Remove it, or it will silence a real stale hash later."
+              exit 1
+            fi
+          done < "$ALLOW"
       # The code hash is hand-copied into the docs, and consumers copy it out of
       # them. A doc that names a stale hash sends integrators to an empty
       # contract, so the copies must agree with CODEHASH.

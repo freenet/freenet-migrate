@@ -1538,11 +1538,20 @@ mod tests {
     /// message and four state bytes. The signature, the full state, the pointer
     /// key and both derived keys were asserted nowhere.
     ///
-    /// This recomputes every published value AND asserts it appears verbatim in
-    /// the file, so the document cannot drift from the implementation in either
-    /// direction. The pointer key is derived from `CODEHASH` read at runtime,
-    /// because hard-coding it here would be circular: it depends on the hash of
-    /// the WASM built from this very file.
+    /// This recomputes every published value and asserts it appears verbatim in
+    /// the file, so a WRONG or MISSING vector fails here.
+    ///
+    /// What it does NOT catch, stated precisely rather than claimed away: it is
+    /// a `contains` check, so an EXTRA stale value left behind in the document
+    /// still passes. For base58 values CI closes that gap (it rejects any
+    /// base58 of code-hash shape that is neither the current `CODEHASH` nor
+    /// listed in `KNOWN-BASE58`); for hex values nothing does, so a stale hex
+    /// blob would survive both. Re-derive the hex vectors by hand when editing
+    /// them.
+    ///
+    /// The pointer key is derived from `CODEHASH` read at runtime, because
+    /// hard-coding it here would be circular: it depends on the hash of the WASM
+    /// built from this very file.
     #[test]
     fn every_published_test_vector_is_correct_and_present() {
         let doc = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/TEST-VECTORS.md"))
@@ -1872,5 +1881,112 @@ mod tests {
         assert!(PointerRecord::decode(stored.as_ref())
             .unwrap()
             .is_tombstone());
+    }
+
+    /// N1. The sampled version of this covered `update_state`'s candidate
+    /// branch and missed the params-parse rejection, which is reachable from
+    /// BOTH `update_state` and `validate_state`.
+    ///
+    /// Enumerating beats adding the missing case: the `match` below has no
+    /// wildcard arm, so adding a variant to `PointerError` fails to COMPILE
+    /// until it is listed here and therefore checked. A future variant cannot
+    /// quietly acquire an amplifying mapping.
+    #[test]
+    fn no_pointer_error_maps_to_an_amplifying_contract_error() {
+        let all = [
+            PointerError::ParamsLength(0),
+            PointerError::ParamsKey,
+            PointerError::ParamsKeyNonCanonical,
+            PointerError::ParamsKeyWeak,
+            PointerError::ParamsAppId(b'!'),
+            PointerError::StateLength(0),
+            PointerError::ZeroVersion,
+            PointerError::ReservedVersion,
+            PointerError::SignatureUnset,
+            PointerError::BadSignature,
+        ];
+
+        for e in &all {
+            // Exhaustiveness gate. No wildcard: a new variant breaks the build.
+            match e {
+                PointerError::ParamsLength(_)
+                | PointerError::ParamsKey
+                | PointerError::ParamsKeyNonCanonical
+                | PointerError::ParamsKeyWeak
+                | PointerError::ParamsAppId(_)
+                | PointerError::StateLength(_)
+                | PointerError::ZeroVersion
+                | PointerError::ReservedVersion
+                | PointerError::SignatureUnset
+                | PointerError::BadSignature => {}
+            }
+            assert_non_amplifying(&ContractError::from(e.clone()));
+        }
+
+        // Every variant must be represented above, or the enumeration is a
+        // sample wearing an exhaustive match's clothes.
+        let mut seen: Vec<String> = all.iter().map(|e| format!("{e:?}")).collect();
+        seen.sort();
+        seen.dedup();
+        assert_eq!(
+            seen.len(),
+            all.len(),
+            "duplicate variants in the enumeration"
+        );
+    }
+
+    /// The params-parse rejection specifically, through the real entry points
+    /// rather than through `From`. Malformed params are reachable from both.
+    #[test]
+    fn malformed_params_rejections_are_also_non_amplifying() {
+        let sk = key(1);
+        let good = params_for(&sk, APP_ID);
+        let state = state_bytes(&sk, &good, 3, 0xAA);
+        let candidate = state_bytes(&sk, &good, 4, 0xBB);
+
+        let bad_params = [
+            ("empty", Vec::new()),
+            (
+                "key only, no app_id",
+                sk.verifying_key().to_bytes().to_vec(),
+            ),
+            ("uppercase app_id", {
+                let mut p = sk.verifying_key().to_bytes().to_vec();
+                p.extend_from_slice(b"River");
+                p
+            }),
+            ("over-long app_id", {
+                let mut p = sk.verifying_key().to_bytes().to_vec();
+                p.extend_from_slice(&[b'a'; MAX_APP_ID_LEN + 1]);
+                p
+            }),
+            ("small-order key", {
+                let mut p = vec![0u8; VERIFYING_KEY_LEN];
+                p[0] = 1;
+                p.extend_from_slice(APP_ID);
+                p
+            }),
+        ];
+
+        for (label, params) in bad_params {
+            let err = PointerContract::update_state(
+                Parameters::from(params.clone()),
+                State::from(state.clone()),
+                vec![UpdateData::State(State::from(candidate.clone()))],
+            )
+            .unwrap_err();
+            assert_non_amplifying(&err);
+
+            // `validate_state` returns Err (not Ok(Invalid)) for malformed
+            // params, because that is a misconfigured contract rather than a bad
+            // state -- but it must still not amplify.
+            let err = PointerContract::validate_state(
+                Parameters::from(params),
+                State::from(state.clone()),
+                RelatedContracts::default(),
+            )
+            .expect_err(&format!("{label}: malformed params must not validate"));
+            assert_non_amplifying(&err);
+        }
     }
 }

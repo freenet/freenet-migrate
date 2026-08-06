@@ -1,3 +1,25 @@
+# Base58 values of code-hash shape that appear in tracked files and are
+# legitimately NOT the pointer contract's current code hash.
+#
+# CI fails on any such value that is neither the current CODEHASH nor listed
+# here, so a stale copy of the pointer's hash cannot hide anywhere in the repo.
+# CI also fails on an entry here that appears in no tracked file, because a
+# leftover line would silence a real stale hash that happened to match it.
+#
+# Adding a line is a deliberate act: say what the value IS.
+
+# --- Published in contracts/pointer-contract/TEST-VECTORS.md. Derived from the
+# fixture inputs, so they move only when the vectors or the pointer's own code
+# hash move; the vector test recomputes all three.
+# The pointer's own key for (test author key, "river.room-contract").
 Hjus5Fnb6NWxKGN64MQwmbgk1Vd6YojykLtxnXipR6Lx
+# base58 of the fixture code_hash (32 bytes of 0xAA).
 CVDFLCAjXhVWiPXH9nTCTpCgVzmDVoiPzNJYuccr1dqB
+# The derived contract instance id and delegate key for the example consumer
+# params (identical by construction: same derivation, same inputs).
 k2Nt3AT6K7L9obj1GwogHN2dpzY1MVaz9AAhXbLBkAS
+
+# --- Unrelated to the pointer contract entirely.
+# freenet-migrate's own lineage test fixture, for a different contract.
+# If freenet-migrate changes that fixture, update this line.
+8qbHbw2BbbTHBW1sbeqakYXVKRQM8Ne7pLK7m6CVfeR

@@ -14,6 +14,8 @@ This file enumerates the Freenet contracts and delegates published from this rep
 - **Params:** fixed byte layout, never serde — `author_verifying_key (32 bytes) ‖ app_id (1..=64 bytes, `a-z0-9.-_`)`.
 - **State:** fixed byte layout, exactly 100 bytes — `version (u32 big-endian) ‖ code_hash (32 bytes) ‖ signature (64 bytes)`.
 
+**Not yet publishable.** The artifact is frozen and CI-enforced, but this contract's logic has never been executed on `wasm32` — the tests run the same Rust compiled natively, and the conformance suite loads the module without calling it. One manual run against a real local node is required before the first publish; see the STOP box in [`contracts/pointer-contract/README.md`](contracts/pointer-contract/README.md). Merging code is fine; publishing is what makes the freeze load-bearing.
+
 **Integrator start here:** [`contracts/pointer-contract/README.md`](contracts/pointer-contract/README.md) has the exact four-step resolution — compute the pointer key, GET and verify, derive your own key from `code_hash` **plus your own params**, and what to persist. Step 3 is the one people get wrong.
 
 ## Delegates

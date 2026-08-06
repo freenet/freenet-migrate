@@ -10,8 +10,17 @@ publish = false
 [workspace]
 
 [dependencies]
-wasmtime = "27"
-freenet-stdlib = { version = "=0.8.5", default-features = false }
-freenet-pointer-contract = { path = "../pointer-contract", default-features = false, features = ["publish"] }
-bincode = "1"
-ed25519-dalek = { version = "=2.1.1", default-features = false, features = ["alloc"] }
+# Exact pin, with a committed lockfile and `--locked` in CI.
+#
+# A caret range here would let an upstream wasmtime patch release redden this
+# job for reasons that have nothing to do with the artifact -- and a red job on
+# the one contract whose whole premise is "nothing changes" is exactly the
+# signal that must stay trustworthy. Bumping this is a deliberate act: it
+# re-tests the same frozen bytes against a newer host, which is occasionally
+# worth doing, but on purpose.
+wasmtime = "=27.0.0"
+
+# Nothing else. `executes.rs` deliberately drives the module through wasmtime
+# alone: pulling in freenet-stdlib or the contract crate here would let the test
+# check the artifact against types compiled from source, which is the
+# agrees-with-itself failure this suite exists to avoid.

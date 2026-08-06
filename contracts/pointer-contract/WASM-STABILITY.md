@@ -70,13 +70,68 @@ and, on `wasm32`, `wasm-bindgen` contamination. Verification never needs an RNG,
 and the publisher-side signing helper is behind the non-default `publish`
 feature, so it is not in the frozen artifact at all.
 
-**Nothing else.** In particular there is no serialization crate. Both the params
-and the state are hand-written fixed byte layouts. `Parameters` and `State` are
-opaque, unframed byte blobs at the platform boundary, so a serde or CBOR crate's
-own version drift would silently re-key every pointer in the ecosystem — the
-same reasoning Atlas records in its `AGENTS.md` for its own params encoding.
-That is also why `app_id` is restricted to lowercase ASCII: it removes any need
-for a `unicode-normalization` dependency.
+**No direct dependency beyond those two**, and in particular **no serialization
+crate is used for the params or the state**. Both are hand-written fixed byte
+layouts. `Parameters` and `State` are opaque, unframed byte blobs at the platform
+boundary, so a serde or CBOR crate's own version drift would silently re-key
+every pointer in the ecosystem — the same reasoning Atlas records in its
+`AGENTS.md` for its own params encoding. That is also why `app_id` is restricted
+to lowercase ASCII: it removes any need for a `unicode-normalization` dependency.
+
+Said carefully, because the blunter version of this sentence was wrong: serde
+and **bincode 1 are in the wasm32 build graph** — they arrive transitively
+through `freenet-stdlib`, they are in `vendor-archive/`, and the bincode
+tripwires section below depends on them being there. What the fixed layouts buy
+is that no serialization crate's version drift can change the encoding of the
+two things that determine this contract's *address* and its *state*. It does not
+mean the artifact is free of serialization code.
+
+## The gate on the first publish
+
+The freeze is only partly verified, and the missing part blocks **publishing**,
+not merging.
+
+Verified: the committed artifact loads in a real wasmtime engine, imports
+exactly `freenet_contract_io::__frnt__fill_buffer` and nothing else, exports the
+four entry points with the signatures the node calls, and runs its own
+allocator (`../pointer-contract-conformance/`).
+
+**Not verified: that this contract's logic is correct when compiled to
+`wasm32`.** Every test of the logic runs the same Rust compiled natively, and
+the conformance suite never calls the entry points. A `wasm32` backend
+miscompile in `curve25519-dalek` or `blake3`, or a `ContractInterfaceResult`
+encoding mismatch, would pass both suites — and a signature check that
+misbehaves only on `wasm32` fails silently rather than loudly, which is the
+worst shape for a fault in this particular contract.
+
+So before the first publish, do one manual run against a real local node: PUT a
+signed record, GET it back and verify it, then push a stale one and a forged one
+and confirm both are refused. That is about an hour, and it closes the one gap a
+flag day cannot fix. See the STOP box in `README.md`.
+
+The freenet-core end-to-end test (exporting `ContractRuntimeInterface` from
+`dev_tool` and driving all four entry points there) is the durable follow-on,
+not the gate itself, and not a substitute for the manual run.
+
+## Inspection inherits the author's blind spots; execution does not
+
+`WASM-STABILITY.md` — this file — once stated that the artifact needed no host
+imports at all. That was false. It imports
+`freenet_contract_io::__frnt__fill_buffer`, and that import is precisely what
+tells a node to use the streaming buffer protocol rather than the legacy
+one-shot path.
+
+The claim survived being written, an export-section parser hardened specifically
+to stop guards that cannot fail, and a full green CI run. Every one of those
+checks looked at **exports**. The import was invisible to all of them, because
+nobody thought to look at imports — and a suite written by the same person who
+wrote the claim inherits that blind spot exactly.
+
+What caught it was not inspection. It was instantiation refusing to proceed
+without the host function: reality objecting to something nobody had enumerated.
+
+Keep that in mind before adding another static check here. A check you write can
+only test what you already suspected. Prefer making something actually run.
 
 ## Two guards that could once pass without checking anything
 

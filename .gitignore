@@ -11,4 +11,7 @@ Cargo.lock
 !contracts/pointer-contract/Cargo.lock
 contracts/pointer-contract/target
 contracts/pointer-contract-conformance/target
-contracts/pointer-contract-conformance/Cargo.lock
+# ...and the conformance crate's lockfile, so its wasmtime pin is exact and CI
+# can run it with --locked. An upstream patch release must not be able to redden
+# the job that checks the frozen artifact.
+!contracts/pointer-contract-conformance/Cargo.lock

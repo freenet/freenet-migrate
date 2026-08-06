@@ -272,6 +272,49 @@ let record = freenet_pointer_contract::sign_record(
 // pointer key from Step 1.
 ```
 
+> ### STOP — do not publish yet. One manual check is required first.
+>
+> The artifact is frozen, CI-enforced, and loads in a real WASM runtime. But
+> **nothing has ever executed this contract's logic on `wasm32`**, and nothing
+> has exercised the bincode boundary end to end. The unit tests run the same
+> Rust compiled natively; the conformance suite loads the module and checks its
+> shape, but never calls the four entry points.
+>
+> So a `wasm32` backend miscompile in `curve25519-dalek` or `blake3`, or a
+> `ContractInterfaceResult` encoding mismatch, is invisible to **both** suites.
+> A signature check that silently misbehaves only on `wasm32` would pass
+> everything in this repository.
+>
+> **Required before the first publish — about an hour, against a real local
+> node:**
+>
+> 1. PUT a signed record. Confirm it lands and a GET returns the same 100 bytes.
+> 2. GET it back and verify the signature client-side, so the round trip is
+>    checked and not just the storage.
+> 3. Push a **stale** record (lower version). Confirm it is refused, and that the
+>    stored record is unchanged.
+> 4. Push a **forged** record (right shape, wrong signer). Confirm it is refused.
+>
+> Steps 3 and 4 matter most: they are the paths where a `wasm32`-only fault
+> would look like success rather than like a crash.
+>
+> Why this blocks publishing and not merging: merging only lands code, and code
+> can be changed. Publishing is the moment the freeze becomes load-bearing —
+> integrators start deriving keys from this code hash and can no longer be moved
+> off it. A fault found before the first publish is an ordinary edit; found
+> after, it is a flag day that re-keys every pointer in the ecosystem.
+>
+> **The durable follow-on**, tracked separately and NOT a substitute for the
+> manual run: freenet-core exports `ContractRuntimeInterface` from `dev_tool`
+> (it is `pub use`d in its private `wasm_runtime` module today) and drives all
+> four entry points against `pointer-v1.wasm` in its own CI. That belongs there
+> rather than here because the value is a host we do not control saying no —
+> reimplementing the handshake locally would only prove this repository agrees
+> with itself.
+>
+> This box is the gate. Delete it in the commit that records the manual run, and
+> not before.
+
 **PUT the committed `pointer-v1.wasm`, and check its hash against `CODEHASH`
 first.** Do not build the WASM yourself as part of your release. Building it
 locally and PUTting your own bytes silently forks the convention: your pointer
