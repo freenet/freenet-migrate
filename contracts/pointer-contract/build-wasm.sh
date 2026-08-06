@@ -30,16 +30,60 @@ cargo build --release --target wasm32-unknown-unknown --locked
 
 WASM="target/wasm32-unknown-unknown/release/freenet_pointer_contract.wasm"
 
-# --- Guard 1: the four entry points the node calls must actually be exported.
+# --- Guard 1: the four entry points the node calls must actually be exported,
+# as real functions in the module's export section.
+#
 # Enabling `freenet-main-contract` without stdlib's `contract` feature (or vice
-# versa) yields a ~150-byte WASM with no exports that loads fine and does
-# nothing. Catch that here, not in production.
-for sym in validate_state update_state summarize_state get_state_delta; do
-    if ! grep -qa "$sym" "$WASM"; then
-        echo "FATAL: '$sym' is not exported by $WASM" >&2
-        exit 1
-    fi
-done
+# versa) yields a ~150-byte WASM with no exports that a node loads happily and
+# that does nothing. Catch that here, not in production.
+#
+# Deliberately parses the export section rather than grepping the bytes: a
+# `grep` for "validate_state" would be satisfied by the name appearing anywhere
+# at all -- in a panic message, a debug string, a data segment -- so it would
+# keep passing after the exports themselves disappeared. That is a check that
+# cannot fail for the reason it exists. (Python is used only here, in the build
+# script; it is not a dependency of the artifact, so it cannot affect the bytes.)
+python3 - "$WASM" <<'PY'
+import sys
+
+data = open(sys.argv[1], "rb").read()
+if data[:8] != b"\x00asm\x01\x00\x00\x00":
+    sys.exit(f"FATAL: {sys.argv[1]} is not a WASM module")
+
+def uleb(buf, i):
+    result = shift = 0
+    while True:
+        byte = buf[i]; i += 1
+        result |= (byte & 0x7F) << shift; shift += 7
+        if not byte & 0x80:
+            return result, i
+
+funcs, memories, i = set(), set(), 8
+while i < len(data):
+    section_id = data[i]; i += 1
+    size, i = uleb(data, i); end = i + size
+    if section_id == 7:  # export section
+        count, j = uleb(data, i)
+        for _ in range(count):
+            name_len, j = uleb(data, j)
+            name = data[j:j + name_len].decode(); j += name_len
+            kind = data[j]; j += 1
+            _idx, j = uleb(data, j)
+            (funcs if kind == 0 else memories if kind == 2 else set()).add(name)
+    i = end
+
+required = {"validate_state", "update_state", "summarize_state", "get_state_delta"}
+missing = sorted(required - funcs)
+if missing:
+    sys.exit(
+        f"FATAL: not exported as functions: {', '.join(missing)}\n"
+        f"       exported functions were: {sorted(funcs)}\n"
+        "       Check that the `freenet-main-contract` feature is enabled."
+    )
+if "memory" not in memories:
+    sys.exit("FATAL: the module does not export `memory`; the node cannot call it")
+print(f"exports:   OK ({len(required)} entry points + memory)")
+PY
 
 # --- Guard 2: no absolute paths from this machine may survive into the artifact.
 if strings "$WASM" | grep -qE "${CARGO_HOME_DIR}|${CRATE_DIR}|/home/|/Users/"; then
