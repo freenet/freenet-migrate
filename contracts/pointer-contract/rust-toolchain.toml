@@ -1,0 +1,9 @@
+# PINNED, AND A BUMP IS A FLAG DAY.
+#
+# rustc version changes the compiled WASM bytes, which changes this contract's
+# code hash, which re-keys every pointer in the ecosystem. This pin is part of
+# the freeze; see WASM-STABILITY.md. It matches the repository CI's
+# RUST_TOOLCHAIN so a contributor and CI build identical bytes.
+[toolchain]
+channel = "1.96.0"
+targets = ["wasm32-unknown-unknown"]

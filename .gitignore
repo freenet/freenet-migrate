@@ -1,3 +1,12 @@
 /target
 # This is a library workspace: do not commit the lockfile.
 Cargo.lock
+
+# ...with one deliberate exception. The pointer contract is a frozen artifact
+# whose compiled bytes must not change, so its lockfile pins the entire
+# dependency graph and `build-wasm.sh` builds with `--locked`. Without the
+# lockfile committed, a fresh resolve would pick different versions and re-key
+# every pointer in the ecosystem.
+# See contracts/pointer-contract/WASM-STABILITY.md.
+!contracts/pointer-contract/Cargo.lock
+contracts/pointer-contract/target

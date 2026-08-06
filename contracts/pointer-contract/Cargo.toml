@@ -1,0 +1,59 @@
+[package]
+name = "freenet-pointer-contract"
+version = "1.0.0"
+edition = "2021"
+rust-version = "1.80"
+license = "LGPL-3.0-only"
+description = "Canonical Freenet successor-pointer contract: a stable-keyed contract whose state names the current code hash of an app's contract or delegate."
+repository = "https://github.com/freenet/freenet-migrate"
+readme = "README.md"
+# Not published to crates.io. The artifact that matters is the compiled WASM
+# (see WASM-STABILITY.md); publishing a source crate would invite consumers to
+# rebuild it locally, which is exactly what must not happen.
+publish = false
+
+# DELIBERATELY ITS OWN WORKSPACE -- do not add this crate to the repository
+# workspace's `members`.
+#
+# A workspace shares one Cargo.lock. If this crate were a member, a dependency
+# bump anywhere else in freenet-migrate could re-resolve a transitive dependency
+# of *this* crate, changing the compiled WASM, changing this contract's code
+# hash, and re-keying every pointer in the ecosystem. Isolation is the whole
+# point. See WASM-STABILITY.md.
+[workspace]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+# Publisher-side signing helpers. NOT enabled for the canonical WASM build --
+# a node only ever verifies, never signs, so this keeps signing code out of the
+# frozen artifact.
+publish = []
+
+[dependencies]
+# EXACT pins ("=", not "^"). A caret range lets a fresh resolve on a machine
+# without the lockfile, or a `cargo update`, pick a newer semver-compatible
+# release and silently change the compiled bytes. Bumping either of these is a
+# flag day (WASM-STABILITY.md), not routine maintenance.
+#
+# freenet-stdlib 0.8.5: the current release at freeze time. `default-features`
+# is empty upstream; we take nothing beyond the contract interface and the
+# `#[contract]` FFI glue.
+freenet-stdlib = { version = "=0.8.5", default-features = false }
+# ed25519-dalek 2.1.1, `alloc` only: no `rand_core`, so no `getrandom`, so no
+# wasm-bindgen contamination in the WASM build. Verification never needs an RNG.
+ed25519-dalek = { version = "=2.1.1", default-features = false, features = ["alloc"] }
+
+[dev-dependencies]
+# Test keys are derived from fixed byte arrays, never generated, so the test
+# suite needs no RNG either -- one less dependency that can drift.
+ed25519-dalek = { version = "=2.1.1", default-features = false, features = ["alloc"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
