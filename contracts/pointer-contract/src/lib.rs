@@ -51,6 +51,28 @@ pub const SIGNATURE_LEN: usize = 64;
 /// Length of an encoded pointer record: `u32 ‖ code_hash ‖ signature`.
 pub const STATE_LEN: usize = 4 + CODE_HASH_LEN + SIGNATURE_LEN;
 
+/// Highest publishable version. `u32::MAX` is reserved: a pointer sitting there
+/// could never be superseded, because every rule here requires a strictly
+/// greater version to move it, and the equal-version tiebreak takes the LOWER
+/// encoding -- so an author who re-signed at `MAX` would lose to their own
+/// mistake. An author deriving `version` from a timestamp would land there.
+///
+/// Rejected in `sign_record` AND in the contract. The publisher-side guard
+/// alone would not cover the non-Rust publishers `TEST-VECTORS.md` exists for.
+pub const MAX_VERSION: u32 = u32::MAX - 1;
+
+/// A `code_hash` of all zeros means **this app is withdrawn**: there is no
+/// current code, and a consumer must stop resolving rather than derive a key
+/// from 32 zero bytes.
+///
+/// Defined now, while it is free, precisely because it cannot be added later.
+/// Without a reserved value, retiring an app would need a new state field, and
+/// a new state field is a flag day that re-keys every pointer in the ecosystem.
+/// The contract does not treat a tombstone specially -- it is an ordinary
+/// signed record, subject to the same monotonicity -- so this costs nothing in
+/// the frozen WASM beyond one documented constant.
+pub const TOMBSTONE_CODE_HASH: [u8; CODE_HASH_LEN] = [0u8; CODE_HASH_LEN];
+
 /// Longest permitted `app_id`. Bounded so params length is bounded, and so a
 /// pointer's params can never grow into something a consumer must stream.
 pub const MAX_APP_ID_LEN: usize = 64;
@@ -74,6 +96,37 @@ pub const fn is_valid_app_id_byte(b: u8) -> bool {
     b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'-' || b == b'_'
 }
 
+/// Is `bytes` the canonical little-endian encoding of an Ed25519 y coordinate,
+/// i.e. is `y < 2^255 - 19` once the sign bit is cleared?
+///
+/// curve25519-dalek decompresses non-canonical encodings happily, so two
+/// distinct 32-byte strings can name the same public key. For an ordinary
+/// signature check that is harmless; here the params blob IS the contract's
+/// address, so it would mean two different pointer keys with the same author.
+#[inline]
+pub fn is_canonical_field_element(bytes: &[u8; VERIFYING_KEY_LEN]) -> bool {
+    // p = 2^255 - 19, little-endian.
+    const P: [u8; VERIFYING_KEY_LEN] = {
+        let mut p = [0xffu8; VERIFYING_KEY_LEN];
+        p[0] = 0xed;
+        p[31] = 0x7f;
+        p
+    };
+    let mut y = *bytes;
+    y[31] &= 0x7f; // the top bit carries the x sign, not part of y
+    let mut i = VERIFYING_KEY_LEN;
+    while i > 0 {
+        i -= 1;
+        if y[i] < P[i] {
+            return true;
+        }
+        if y[i] > P[i] {
+            return false;
+        }
+    }
+    false // exactly p is not canonical either
+}
+
 /// Everything that can be wrong with a pointer's params or state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PointerError {
@@ -82,6 +135,19 @@ pub enum PointerError {
     ParamsLength(usize),
     /// The first 32 params bytes are not a valid Ed25519 verifying key.
     ParamsKey,
+    /// The first 32 params bytes decode to a point, but are not that point's
+    /// canonical encoding (the y coordinate is >= the field prime).
+    ///
+    /// `VerifyingKey::from_bytes` accepts these, so without this check two
+    /// different params blobs -- and therefore two different pointer keys --
+    /// would carry the same effective author. Same class of confusable identity
+    /// the `app_id` charset rules out, so it is ruled out here too.
+    ParamsKeyNonCanonical,
+    /// The author key is small-order. `verify_strict` refuses to verify under
+    /// such a key, so a pointer with one could never accept any record at all.
+    /// Rejected at parse rather than leaving a pointer that is silently
+    /// permanently empty.
+    ParamsKeyWeak,
     /// An `app_id` byte is outside the permitted set.
     ParamsAppId(u8),
     /// The state was not exactly [`STATE_LEN`] bytes.
@@ -89,8 +155,20 @@ pub enum PointerError {
     /// `version` was 0. Version numbering starts at 1, so 0 is reserved to mean
     /// "no pointer has ever been published", and must never appear on the wire.
     ZeroVersion,
+    /// The signature field is all zeros -- almost always an unsigned record
+    /// from a publisher that built the state but never signed it. Split out
+    /// from [`Self::BadSignature`] because it is the one cause of a
+    /// verification failure that is mechanically distinguishable, and it is a
+    /// common enough publisher mistake to be worth naming.
+    SignatureUnset,
     /// The signature did not verify under the params' author key.
+    ///
+    /// Ed25519 cannot say which of the remaining causes it was, so the message
+    /// enumerates them rather than asserting one. Do not "improve" this later:
+    /// this text ships inside the frozen WASM.
     BadSignature,
+    /// `version` was `u32::MAX`, which is reserved. See [`MAX_VERSION`].
+    ReservedVersion,
 }
 
 impl core::fmt::Display for PointerError {
@@ -101,6 +179,14 @@ impl core::fmt::Display for PointerError {
                 "pointer params must be {MIN_PARAMS_LEN}..={MAX_PARAMS_LEN} bytes, got {n}"
             ),
             Self::ParamsKey => write!(f, "pointer params do not start with a valid Ed25519 key"),
+            Self::ParamsKeyNonCanonical => write!(
+                f,
+                "the author key is not a canonical Ed25519 encoding (y >= the field prime)"
+            ),
+            Self::ParamsKeyWeak => write!(
+                f,
+                "the author key is small-order; no signature can ever verify under it"
+            ),
             Self::ParamsAppId(b) => {
                 write!(f, "invalid app_id byte {b:#04x}; allowed: a-z 0-9 . - _")
             }
@@ -111,7 +197,25 @@ impl core::fmt::Display for PointerError {
                 )
             }
             Self::ZeroVersion => write!(f, "pointer version 0 is reserved and never valid"),
-            Self::BadSignature => write!(f, "pointer signature verification failed"),
+            Self::ReservedVersion => write!(
+                f,
+                "pointer version {} is reserved: a pointer there could never be \
+                 superseded. Use a counter, not a timestamp",
+                u32::MAX
+            ),
+            Self::SignatureUnset => write!(
+                f,
+                "the pointer signature is all zeros: the record was built but never signed"
+            ),
+            Self::BadSignature => write!(
+                f,
+                "pointer signature verification failed. Ed25519 cannot distinguish the \
+                 cause; check, in this order: (1) you signed with the private key \
+                 matching the author_verifying_key in these exact params; (2) you signed \
+                 over these exact params bytes, app_id included, not a different app's; \
+                 (3) your signed message is DOMAIN || params || version_be || code_hash \
+                 with version big-endian -- see TEST-VECTORS.md"
+            ),
         }
     }
 }
@@ -121,7 +225,14 @@ impl std::error::Error for PointerError {}
 impl From<PointerError> for ContractError {
     fn from(e: PointerError) -> Self {
         match e {
-            PointerError::StateLength(_) | PointerError::ZeroVersion => ContractError::InvalidState,
+            // A malformed or unacceptable STATE is an invalid state.
+            PointerError::StateLength(_)
+            | PointerError::ZeroVersion
+            | PointerError::ReservedVersion
+            | PointerError::SignatureUnset
+            | PointerError::BadSignature => ContractError::InvalidState,
+            // A malformed PARAMS blob is a misconfigured contract, not a bad
+            // state, so it keeps a distinct classification.
             other => ContractError::Other(other.to_string()),
         }
     }
@@ -146,7 +257,15 @@ impl<'a> PointerParams<'a> {
         let (key_bytes, app_id) = bytes.split_at(VERIFYING_KEY_LEN);
         let mut key = [0u8; VERIFYING_KEY_LEN];
         key.copy_from_slice(key_bytes);
+        // `VerifyingKey::from_bytes` accepts non-canonical y encodings and
+        // small-order keys, so neither is caught for us.
+        if !is_canonical_field_element(&key) {
+            return Err(PointerError::ParamsKeyNonCanonical);
+        }
         let author_vk = VerifyingKey::from_bytes(&key).map_err(|_| PointerError::ParamsKey)?;
+        if author_vk.is_weak() {
+            return Err(PointerError::ParamsKeyWeak);
+        }
         if let Some(&bad) = app_id.iter().find(|b| !is_valid_app_id_byte(**b)) {
             return Err(PointerError::ParamsAppId(bad));
         }
@@ -154,6 +273,9 @@ impl<'a> PointerParams<'a> {
     }
 
     /// Build the params byte string for `(author_vk, app_id)`.
+    ///
+    /// Rejects exactly what [`Self::parse`] rejects, so a publisher cannot mint
+    /// params the contract will refuse.
     ///
     /// This is the *only* correct way to construct pointer params: the pointer's
     /// key is `BLAKE3(pointer_code_hash ‖ these bytes)`, so a single byte of
@@ -165,6 +287,12 @@ impl<'a> PointerParams<'a> {
         }
         if let Some(&bad) = app_id.iter().find(|b| !is_valid_app_id_byte(**b)) {
             return Err(PointerError::ParamsAppId(bad));
+        }
+        if !is_canonical_field_element(author_vk.as_bytes()) {
+            return Err(PointerError::ParamsKeyNonCanonical);
+        }
+        if author_vk.is_weak() {
+            return Err(PointerError::ParamsKeyWeak);
         }
         let mut out = Vec::with_capacity(VERIFYING_KEY_LEN + app_id.len());
         out.extend_from_slice(author_vk.as_bytes());
@@ -228,16 +356,30 @@ impl PointerRecord {
         out
     }
 
-    /// Check `version != 0` and that the signature verifies under the params'
-    /// author key, over the params those bytes came from.
+    /// Check the version is in `1..=MAX_VERSION`, that the signature is not
+    /// unset, and that it verifies under the params' author key over the params
+    /// those bytes came from.
     pub fn verify(&self, params: &[u8], author_vk: &VerifyingKey) -> Result<(), PointerError> {
         if self.version == 0 {
             return Err(PointerError::ZeroVersion);
+        }
+        if self.version > MAX_VERSION {
+            return Err(PointerError::ReservedVersion);
+        }
+        if self.signature == [0u8; SIGNATURE_LEN] {
+            return Err(PointerError::SignatureUnset);
         }
         let msg = signing_message(params, self.version, &self.code_hash);
         author_vk
             .verify_strict(&msg, &Signature::from_bytes(&self.signature))
             .map_err(|_| PointerError::BadSignature)
+    }
+
+    /// Whether this record withdraws the app rather than naming current code.
+    /// A consumer seeing this must stop resolving; deriving a key from 32 zero
+    /// bytes would silently address a contract that does not exist.
+    pub fn is_tombstone(&self) -> bool {
+        self.code_hash == TOMBSTONE_CODE_HASH
     }
 
     /// Decode and verify in one step -- the only call the accept path should
@@ -263,6 +405,9 @@ pub fn sign_record(
     if version == 0 {
         return Err(PointerError::ZeroVersion);
     }
+    if version > MAX_VERSION {
+        return Err(PointerError::ReservedVersion);
+    }
     // Reject params the contract itself would reject, so a publisher cannot
     // sign a record for a pointer whose params can never validate.
     PointerParams::parse(params)?;
@@ -283,8 +428,23 @@ impl ContractInterface for PointerContract {
         state: State<'static>,
         _related: RelatedContracts<'static>,
     ) -> Result<ValidateResult, ContractError> {
-        PointerRecord::decode_verified(state.as_ref(), parameters.as_ref())?;
-        Ok(ValidateResult::Valid)
+        // Params are checked first and separately. A malformed params blob is a
+        // misconfigured contract, not a bad state, and `Err` is the honest
+        // answer for it.
+        let params = PointerParams::parse(parameters.as_ref())?;
+
+        // A state-level rejection returns `Ok(Invalid)`, NOT `Err`. `Invalid` is
+        // the trait's own way to say "this state is not valid for this
+        // contract"; `Err` means the contract could not reach a verdict, and
+        // core classifies it as an execution error, which is a different and
+        // more alarming thing. This is state a peer supplied, so a bad
+        // signature is an expected outcome, not a malfunction.
+        match PointerRecord::decode(state.as_ref())
+            .and_then(|record| record.verify(parameters.as_ref(), &params.author_vk))
+        {
+            Ok(()) => Ok(ValidateResult::Valid),
+            Err(_) => Ok(ValidateResult::Invalid),
+        }
     }
 
     fn update_state(
@@ -322,25 +482,38 @@ impl ContractInterface for PointerContract {
                 // not something it can act on.
                 _ => continue,
             };
+            // An empty payload carries no candidate. Core filters empty deltas
+            // on the peer path but not on the client fan-out, so an integrator
+            // echoing a notification's delta back would otherwise turn a no-op
+            // into a rejection.
+            if bytes.is_empty() {
+                continue;
+            }
             saw_candidate = true;
 
-            // A malformed or unsigned candidate is a genuinely invalid update
-            // and is rejected. A *stale* candidate is not -- see below.
+            // A malformed or forged candidate is rejected -- but deliberately
+            // NOT as `InvalidUpdate` / `InvalidUpdateWithInfo`.
             //
-            // Reported as `InvalidUpdate*`, never `InvalidState`: the thing
-            // that was malformed is the INCOMING update, not what we hold. The
-            // node matches on that distinction -- only an invalid-update
-            // rejection triggers the "send our summary back" heal that tells a
-            // confused sender what we actually have.
+            // Both of those render with the prefix core matches on
+            // (`is_invalid_update_rejection`, "invalid contract update"), which
+            // gates `send_summary_back_on_rejection`. Core documents that
+            // predicate as matching ONLY the benign "version not higher" case
+            // and explicitly not validation failures, because those are
+            // attacker-inducible and must not amplify into extra messages.
+            //
+            // Nothing honest reaches here: a peer that is merely behind sends a
+            // validly-signed stale record, which is a no-op success below. The
+            // only inputs that reach this branch are malformed or forged, so
+            // replying would hand any peer a `summarize_state` call plus a
+            // message back per forgery, and log the forgery as a stale
+            // rebroadcast. `Deser`/`Other` still classify as a merge failure, so
+            // the node's per-(contract, sender) backoff quarantines the bad
+            // sender -- which is the response that actually helps.
             let candidate =
-                PointerRecord::decode(bytes).map_err(|e| ContractError::InvalidUpdateWithInfo {
-                    reason: e.to_string(),
-                })?;
-            candidate.verify(params, &parsed.author_vk).map_err(|e| {
-                ContractError::InvalidUpdateWithInfo {
-                    reason: e.to_string(),
-                }
-            })?;
+                PointerRecord::decode(bytes).map_err(|e| ContractError::Deser(e.to_string()))?;
+            candidate
+                .verify(params, &parsed.author_vk)
+                .map_err(|e| ContractError::Other(e.to_string()))?;
 
             best = Some(match best {
                 None => candidate,
@@ -348,8 +521,19 @@ impl ContractInterface for PointerContract {
             });
         }
 
+        // Nothing applicable arrived. If we hold a good record, that is a no-op
+        // success -- there is nothing to do and our state is still valid. Only
+        // when we have nothing to fall back on is it an error, and even then not
+        // an `InvalidUpdate*` one, for the amplification reason above.
         if !saw_candidate {
-            return Err(ContractError::InvalidUpdate);
+            return match best {
+                Some(current) => Ok(UpdateModification::valid(State::from(
+                    current.encode().to_vec(),
+                ))),
+                None => Err(ContractError::Deser(
+                    "no usable pointer record in the update, and no local state to keep".into(),
+                )),
+            };
         }
 
         // A stale or equal update is a **no-op success**, never an error.
@@ -364,14 +548,24 @@ impl ContractInterface for PointerContract {
     }
 
     fn summarize_state(
-        _parameters: Parameters<'static>,
+        parameters: Parameters<'static>,
         state: State<'static>,
     ) -> Result<StateSummary<'static>, ContractError> {
-        if state.as_ref().is_empty() {
-            // "I have nothing." A peer receiving this must send its full record.
+        // An empty summary means "I have nothing", and any local state we
+        // cannot decode AND verify is worth exactly as much as nothing -- so it
+        // is advertised the same way, rather than erroring.
+        //
+        // `update_state` deliberately tolerates unusable local state so a valid
+        // record can heal it. That is pointless unless this function can ASK for
+        // the heal: erroring here would mean the peer never advertises its
+        // ignorance, never attracts a record, and fails a WASM call on every
+        // heartbeat instead. Verifying (not merely decoding) matters too -- a
+        // right-length but corrupt state would otherwise be published as this
+        // peer's summary, and every honest peer would compute that it owes this
+        // peer nothing, permanently.
+        let Ok(record) = PointerRecord::decode_verified(state.as_ref(), parameters.as_ref()) else {
             return Ok(StateSummary::from(Vec::new()));
-        }
-        let record = PointerRecord::decode(state.as_ref()).map_err(ContractError::from)?;
+        };
         // The summary is the WHOLE record, not just the version.
         //
         // This is load-bearing, and a version-only summary is the trap. The
@@ -389,21 +583,35 @@ impl ContractInterface for PointerContract {
     }
 
     fn get_state_delta(
-        _parameters: Parameters<'static>,
+        parameters: Parameters<'static>,
         state: State<'static>,
         summary: StateSummary<'static>,
     ) -> Result<StateDelta<'static>, ContractError> {
-        if state.as_ref().is_empty() {
-            return Ok(StateDelta::from(Vec::new()));
-        }
-        let ours = PointerRecord::decode(state.as_ref()).map_err(ContractError::from)?;
+        let params = parameters.as_ref();
 
-        // Any summary we cannot read -- empty, truncated, garbage -- means "I
-        // cannot tell what this peer holds", and the safe answer to that is
-        // "here is everything". Deliberately NOT an error: the summary is
-        // peer-supplied, so erroring would let any peer turn one malformed byte
-        // into a failed WASM call on every heartbeat.
-        let theirs = PointerRecord::decode(summary.as_ref()).ok();
+        // Nothing to offer if our own state is missing or unusable. Same
+        // tolerance as `summarize_state`, and for the same reason.
+        let Ok(ours) = PointerRecord::decode_verified(state.as_ref(), params) else {
+            return Ok(StateDelta::from(Vec::new()));
+        };
+
+        // The peer's summary is VERIFIED, not merely decoded.
+        //
+        // Without the signature check this is a downgrade oracle: a peer sends a
+        // hand-crafted 100-byte summary claiming version 0xFFFFFFFF with
+        // garbage where the signature goes, every honest peer computes that it
+        // owes that peer nothing, and the liar is never sent the real record --
+        // so it keeps answering GETs with a stale version forever. That turns
+        // the transient rollback window the README describes into a permanent,
+        // self-maintaining one. Requiring a valid signature means a peer can
+        // only ever claim a position the author actually signed.
+        //
+        // Any summary we cannot read or cannot verify -- empty, truncated,
+        // garbage, forged -- means "I cannot tell what this peer holds", and the
+        // safe answer is "here is everything". Deliberately NOT an error: the
+        // summary is peer-supplied, so erroring would let any peer turn one
+        // malformed byte into a failed WASM call on every heartbeat.
+        let theirs = PointerRecord::decode_verified(summary.as_ref(), params).ok();
 
         // Send when we hold something their record would not win against.
         // Because `merge` is a total order, exactly one of two diverged peers
@@ -509,6 +717,32 @@ mod tests {
         .to_vec()
     }
 
+    /// A state-level rejection: `Ok(Invalid)`, never `Err`. Asserting the exact
+    /// variant matters -- `Err` would mean the contract could not reach a
+    /// verdict, which core classifies as an execution error.
+    #[track_caller]
+    fn assert_state_rejected(params: &[u8], state: &[u8]) {
+        match validate(params, state) {
+            Ok(ValidateResult::Invalid) => {}
+            other => panic!("expected Ok(Invalid), got {other:?}"),
+        }
+    }
+
+    /// Core gates `send_summary_back_on_rejection` on the rendered error
+    /// starting with "invalid contract update". That reply is meant for the
+    /// benign version-not-higher case only; ours is a no-op success, so nothing
+    /// honest reaches an error at all. Anything that does is malformed or
+    /// forged, and must not buy the sender a `summarize_state` call plus a
+    /// message back.
+    #[track_caller]
+    fn assert_non_amplifying(err: &ContractError) {
+        let rendered = err.to_string();
+        assert!(
+            !rendered.starts_with("invalid contract update"),
+            "error would trigger core's summary-back amplification: {rendered}"
+        );
+    }
+
     fn validate(params: &[u8], state: &[u8]) -> Result<ValidateResult, ContractError> {
         PointerContract::validate_state(
             Parameters::from(params.to_vec()),
@@ -545,9 +779,11 @@ mod tests {
         let p = params_for(&sk, APP_ID);
         // Correctly signed, correctly framed -- only the version is 0.
         let s = forced_state(&sk, &p, 0, 0xAA);
-        assert!(
-            matches!(validate(&p, &s), Err(ContractError::InvalidState)),
-            "version 0 must be rejected: it is reserved to mean 'no pointer published'"
+        assert_state_rejected(&p, &s);
+        // ...and the cause is distinguishable at the PointerError level.
+        assert_eq!(
+            PointerRecord::decode_verified(&s, &p),
+            Err(PointerError::ZeroVersion)
         );
     }
 
@@ -558,7 +794,7 @@ mod tests {
         let p = params_for(&author, APP_ID);
         // Signed by the wrong key, against the author's params.
         let s = state_bytes(&impostor, &p, 1, 0xAA);
-        assert!(matches!(validate(&p, &s), Err(ContractError::Other(_))));
+        assert_state_rejected(&p, &s);
     }
 
     #[test]
@@ -570,10 +806,7 @@ mod tests {
         let p_delegate = params_for(&sk, b"river.chat-delegate");
         let s = state_bytes(&sk, &p_room, 7, 0xAA);
         assert!(matches!(validate(&p_room, &s), Ok(ValidateResult::Valid)));
-        assert!(
-            matches!(validate(&p_delegate, &s), Err(ContractError::Other(_))),
-            "a record signed for one app_id must not validate under another"
-        );
+        assert_state_rejected(&p_delegate, &s);
     }
 
     #[test]
@@ -582,11 +815,9 @@ mod tests {
         let p = params_for(&sk, APP_ID);
         let mut s = state_bytes(&sk, &p, 1, 0xAA);
         s.push(0);
-        assert!(matches!(validate(&p, &s), Err(ContractError::InvalidState)));
-        assert!(matches!(
-            validate(&p, &[]),
-            Err(ContractError::InvalidState)
-        ));
+        assert_state_rejected(&p, &s);
+        assert_state_rejected(&p, &[]);
+        assert_state_rejected(&p, &s[..STATE_LEN - 1]);
     }
 
     #[test]
@@ -645,6 +876,66 @@ mod tests {
         }
     }
 
+    /// Pins S1: no rejection `update_state` can produce may render with core's
+    /// `is_invalid_update_rejection` prefix, or any peer could buy itself a
+    /// `summarize_state` call plus a reply per forged 100 bytes.
+    #[test]
+    fn no_rejection_path_triggers_core_summary_back_amplification() {
+        let author = key(1);
+        let impostor = key(2);
+        let p = params_for(&author, APP_ID);
+        let current = state_bytes(&author, &p, 5, 0xAA);
+
+        let forged = state_bytes(&impostor, &p, 99, 0xFF);
+        let zero_version = forced_state(&author, &p, 0, 0xBB);
+        let reserved = forced_state(&author, &p, u32::MAX, 0xBB);
+        let unsigned = {
+            let mut r = PointerRecord::decode(&state_bytes(&author, &p, 9, 0xCC)).unwrap();
+            r.signature = [0u8; SIGNATURE_LEN];
+            r.encode().to_vec()
+        };
+        let cross_app = state_bytes(&author, &params_for(&author, b"other.app"), 9, 0xDD);
+
+        for (label, bad) in [
+            ("forged", forged),
+            ("version 0", zero_version),
+            ("reserved version", reserved),
+            ("unsigned", unsigned),
+            ("cross-app replay", cross_app),
+            ("truncated", vec![0u8; STATE_LEN - 1]),
+            ("over-long", vec![0u8; STATE_LEN + 1]),
+            ("one byte", vec![7u8]),
+        ] {
+            let err = update(&p, &current, bad).expect_err(&format!("{label} must be rejected"));
+            assert_non_amplifying(&err);
+        }
+    }
+
+    /// I7: a malformed-LENGTH candidate. The pre-existing malformed-state test
+    /// covers the opposite direction (a corrupt STORED state healed by a good
+    /// record), so without this the length check on the candidate path had no
+    /// coverage and deleting it would have failed nothing.
+    #[test]
+    fn update_rejects_a_candidate_of_the_wrong_length() {
+        let sk = key(1);
+        let p = params_for(&sk, APP_ID);
+        let current = state_bytes(&sk, &p, 5, 0xAA);
+        let good = state_bytes(&sk, &p, 6, 0xBB);
+
+        for wrong in [
+            good[..STATE_LEN - 1].to_vec(),
+            [good.clone(), vec![0u8]].concat(),
+            good[..4].to_vec(),
+        ] {
+            let err = update(&p, &current, wrong).unwrap_err();
+            assert!(
+                matches!(err, ContractError::Deser(_)),
+                "a wrong-length candidate is a framing error, got {err:?}"
+            );
+            assert_non_amplifying(&err);
+        }
+    }
+
     #[test]
     fn update_rejects_an_unsigned_or_forged_candidate() {
         let author = key(1);
@@ -653,10 +944,9 @@ mod tests {
         let current = state_bytes(&author, &p, 1, 0xAA);
         // Higher version, but signed by the wrong key.
         let forged = state_bytes(&impostor, &p, 99, 0xFF);
-        assert!(matches!(
-            update(&p, &current, forged),
-            Err(ContractError::InvalidUpdateWithInfo { .. })
-        ));
+        let err = update(&p, &current, forged).unwrap_err();
+        assert!(matches!(err, ContractError::Other(_)));
+        assert_non_amplifying(&err);
     }
 
     #[test]
@@ -717,14 +1007,38 @@ mod tests {
     }
 
     #[test]
-    fn update_with_no_usable_data_is_an_error() {
+    fn update_with_no_usable_data_keeps_what_we_have() {
         let sk = key(1);
         let p = params_for(&sk, APP_ID);
         let current = state_bytes(&sk, &p, 1, 0xAA);
-        assert!(matches!(
-            PointerContract::update_state(Parameters::from(p), State::from(current), vec![]),
-            Err(ContractError::InvalidUpdate)
-        ));
+
+        // No entries at all, and an empty delta -- which core does NOT filter on
+        // the client fan-out path, so an integrator echoing a notification's
+        // delta back arrives here. Both are no-ops, not rejections.
+        for data in [
+            vec![],
+            vec![UpdateData::Delta(StateDelta::from(Vec::new()))],
+            vec![UpdateData::State(State::from(Vec::new()))],
+        ] {
+            let stored = PointerContract::update_state(
+                Parameters::from(p.clone()),
+                State::from(current.clone()),
+                data,
+            )
+            .expect("an empty update must not be a rejection")
+            .unwrap_valid();
+            assert_eq!(stored.as_ref(), current.as_slice());
+        }
+
+        // With nothing to keep either, it is an honest error -- but not an
+        // `InvalidUpdate*` one, which would trigger core's summary-back reply.
+        let err = PointerContract::update_state(
+            Parameters::from(p),
+            State::from(Vec::new()),
+            vec![UpdateData::Delta(StateDelta::from(Vec::new()))],
+        )
+        .unwrap_err();
+        assert_non_amplifying(&err);
     }
 
     // --------------------------------------------------------- summary / delta
@@ -1148,14 +1462,34 @@ mod tests {
     }
 
     #[test]
-    fn the_maximum_version_still_validates_and_wins() {
+    fn the_reserved_maximum_version_is_refused_everywhere() {
+        // A pointer at u32::MAX could never be superseded: every rule requires a
+        // strictly greater version, and the equal-version tiebreak takes the
+        // LOWER encoding, so even the author re-signing at MAX would lose to
+        // their own mistake. An author deriving version from a timestamp lands
+        // there. Refused publisher-side AND in the contract, because the
+        // publisher-side guard is not in the frozen WASM and would not cover the
+        // non-Rust publishers TEST-VECTORS.md exists for.
         let sk = key(1);
         let p = params_for(&sk, APP_ID);
-        let max = state_bytes(&sk, &p, u32::MAX, 0xAA);
-        assert!(matches!(validate(&p, &max), Ok(ValidateResult::Valid)));
-        let prev = state_bytes(&sk, &p, u32::MAX - 1, 0xBB);
-        let stored = update(&p, &prev, max.clone()).unwrap().unwrap_valid();
-        assert_eq!(stored.as_ref(), max.as_slice());
+
+        assert_eq!(
+            sign_record(&sk, &p, u32::MAX, code_hash(0xAA)),
+            Err(PointerError::ReservedVersion),
+            "the publisher-side helper must refuse it"
+        );
+
+        let max = forced_state(&sk, &p, u32::MAX, 0xAA);
+        assert_state_rejected(&p, &max);
+
+        // ...and it cannot be smuggled in as an update either.
+        let prev = state_bytes(&sk, &p, MAX_VERSION, 0xBB);
+        let err = update(&p, &prev, max).unwrap_err();
+        assert_non_amplifying(&err);
+
+        // MAX_VERSION itself is publishable.
+        assert!(sign_record(&sk, &p, MAX_VERSION, code_hash(0xAA)).is_ok());
+        assert!(matches!(validate(&p, &prev), Ok(ValidateResult::Valid)));
     }
 
     // -------------------------------------------------------- frozen byte layout
@@ -1198,6 +1532,97 @@ mod tests {
         bytes.iter().map(|b| format!("{b:02x}")).collect()
     }
 
+    /// S2. `TEST-VECTORS.md` is the only thing a non-Rust reimplementer has to
+    /// check itself against, and it previously claimed to be "pinned by the
+    /// wire_format_known_answer test" while that test pinned only the signing
+    /// message and four state bytes. The signature, the full state, the pointer
+    /// key and both derived keys were asserted nowhere.
+    ///
+    /// This recomputes every published value AND asserts it appears verbatim in
+    /// the file, so the document cannot drift from the implementation in either
+    /// direction. The pointer key is derived from `CODEHASH` read at runtime,
+    /// because hard-coding it here would be circular: it depends on the hash of
+    /// the WASM built from this very file.
+    #[test]
+    fn every_published_test_vector_is_correct_and_present() {
+        let doc = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/TEST-VECTORS.md"))
+            .expect("TEST-VECTORS.md");
+        let codehash = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/CODEHASH"))
+            .expect("CODEHASH");
+        let pointer_code_hash = codehash
+            .lines()
+            .find(|l| !l.starts_with('#') && !l.trim().is_empty())
+            .expect("a hash line")
+            .trim();
+
+        let sk = key(1);
+        let vk = sk.verifying_key();
+        let app_id: &[u8] = b"river.room-contract";
+        let params = params_for(&sk, app_id);
+        let ch = code_hash(0xAA);
+        let record = sign_record(&sk, &params, 7, ch).unwrap();
+
+        let mut published = vec![
+            ("verifying_key", hex(vk.as_bytes())),
+            ("app_id", hex(app_id)),
+            ("params", hex(&params)),
+            ("signing_message", hex(&signing_message(&params, 7, &ch))),
+            ("signature", hex(&record.signature)),
+            ("state", hex(&record.encode())),
+            ("pointer_code_hash", pointer_code_hash.to_string()),
+        ];
+
+        // The pointer's own key.
+        let pointer_key =
+            ContractKey::from_params(pointer_code_hash, Parameters::from(params.clone()))
+                .expect("valid base58");
+        published.push(("pointer_key", pointer_key.id().to_string()));
+
+        // The consumer-side derivation, both flavours.
+        let consumer: Vec<u8> = b"example-consumer-params".to_vec();
+        let ch_b58 = CodeHash::new(ch).encode();
+        published.push(("code_hash_b58", ch_b58.clone()));
+        published.push(("consumer_params", hex(&consumer)));
+        published.push((
+            "derived_contract",
+            ContractKey::from_params(&ch_b58, Parameters::from(consumer.clone()))
+                .unwrap()
+                .id()
+                .to_string(),
+        ));
+        published.push((
+            "derived_delegate",
+            DelegateKey::from_params(&ch_b58, &Parameters::from(consumer))
+                .unwrap()
+                .to_string(),
+        ));
+
+        // The document wraps long hex across lines and annotates some of them
+        // with a trailing `<- ...` note, so compare against a normalized copy:
+        // annotations dropped, all whitespace removed, table pipes removed.
+        let flattened: String = doc
+            .lines()
+            .map(|line| line.split("<-").next().unwrap_or(line))
+            .collect::<Vec<_>>()
+            .concat()
+            .chars()
+            .filter(|c| !c.is_whitespace() && *c != '|' && *c != '`')
+            .collect();
+
+        for (label, value) in &published {
+            assert!(
+                flattened.contains(value.as_str()),
+                "TEST-VECTORS.md does not publish the correct {label}\n  expected: {value}"
+            );
+        }
+
+        // ...and the document must not claim a guarantee it does not have.
+        assert!(
+            doc.contains("every_published_test_vector_is_correct_and_present"),
+            "TEST-VECTORS.md must name the test that actually pins it"
+        );
+    }
+
     // ------------------------------------------- consumer derivation, delegates
 
     /// The contract half is pinned by `consumer_derivation_matches_stdlib`; the
@@ -1231,5 +1656,221 @@ mod tests {
             DelegateKey::from_params(CodeHash::new(resolved.code_hash).encode(), &my_own_params)
                 .expect("valid base58");
         assert_eq!(derived.bytes(), authoritative.bytes());
+    }
+
+    // ------------------------------------------------ the downgrade oracle (B1)
+
+    /// Pins B1. `get_state_delta` must VERIFY the peer's summary, not merely
+    /// decode it.
+    ///
+    /// Without that, a peer advertises a hand-crafted summary claiming a huge
+    /// version with garbage where the signature goes; every honest peer computes
+    /// that it owes that peer nothing; the liar is never sent the real record
+    /// and keeps serving a stale version forever. That converts the transient
+    /// rollback window into a permanent, self-maintaining downgrade.
+    #[test]
+    fn a_forged_summary_cannot_suppress_the_real_record() {
+        let author = key(1);
+        let impostor = key(2);
+        let p = params_for(&author, APP_ID);
+        let ours = state_bytes(&author, &p, 5, 0xAA);
+
+        let liars = [
+            // Right length, absurd version, garbage signature.
+            (
+                "unsigned max-version claim",
+                PointerRecord {
+                    version: MAX_VERSION,
+                    code_hash: code_hash(0xFF),
+                    signature: [0xFFu8; SIGNATURE_LEN],
+                }
+                .encode()
+                .to_vec(),
+            ),
+            // Correctly signed, but by somebody who is not the author.
+            (
+                "forged by another key",
+                state_bytes(&impostor, &p, MAX_VERSION, 0xFF),
+            ),
+            // Signed by the real author, but for a different app.
+            (
+                "cross-app replay",
+                state_bytes(
+                    &author,
+                    &params_for(&author, b"other.app"),
+                    MAX_VERSION,
+                    0xFF,
+                ),
+            ),
+            // Right length, right shape, corrupt body.
+            ("corrupt", vec![0x5Au8; STATE_LEN]),
+        ];
+
+        for (label, forged_summary) in liars {
+            let delta = PointerContract::get_state_delta(
+                Parameters::from(p.clone()),
+                State::from(ours.clone()),
+                StateSummary::from(forged_summary),
+            )
+            .unwrap();
+            assert_eq!(
+                delta.as_ref(),
+                ours.as_slice(),
+                "{label}: an unverifiable summary must be owed the full record"
+            );
+        }
+
+        // A genuinely ahead peer is still owed nothing -- the check must not
+        // simply always send.
+        let ahead = state_bytes(&author, &p, 6, 0xBB);
+        let delta = PointerContract::get_state_delta(
+            Parameters::from(p.clone()),
+            State::from(ours),
+            StateSummary::from(ahead),
+        )
+        .unwrap();
+        assert!(
+            delta.as_ref().is_empty(),
+            "a legitimately ahead peer is owed nothing"
+        );
+    }
+
+    /// Pins I1 for the right-length-but-corrupt case: a peer whose local state
+    /// is unusable must advertise "I have nothing" so it attracts the heal that
+    /// `update_state` was made tolerant for, rather than failing a WASM call on
+    /// every heartbeat.
+    #[test]
+    fn unusable_local_state_advertises_nothing_and_is_healed() {
+        let sk = key(1);
+        let p = params_for(&sk, APP_ID);
+        let good = state_bytes(&sk, &p, 5, 0xAA);
+
+        for (label, broken) in [
+            ("wrong length", vec![9u8; 7]),
+            ("right length, corrupt", vec![0x5Au8; STATE_LEN]),
+            ("right length, unsigned", {
+                let mut r = PointerRecord::decode(&good).unwrap();
+                r.signature = [0u8; SIGNATURE_LEN];
+                r.encode().to_vec()
+            }),
+        ] {
+            let summary = PointerContract::summarize_state(
+                Parameters::from(p.clone()),
+                State::from(broken.clone()),
+            )
+            .unwrap_or_else(|e| panic!("{label}: summarize must not error: {e}"));
+            assert!(
+                summary.as_ref().is_empty(),
+                "{label}: must advertise nothing"
+            );
+
+            let delta = PointerContract::get_state_delta(
+                Parameters::from(p.clone()),
+                State::from(broken.clone()),
+                StateSummary::from(good.clone()),
+            )
+            .unwrap_or_else(|e| panic!("{label}: delta must not error: {e}"));
+            assert!(delta.as_ref().is_empty(), "{label}: has nothing to offer");
+
+            // ...and a peer seeing that empty summary owes it everything.
+            let owed = PointerContract::get_state_delta(
+                Parameters::from(p.clone()),
+                State::from(good.clone()),
+                StateSummary::from(Vec::new()),
+            )
+            .unwrap();
+            assert_eq!(owed.as_ref(), good.as_slice());
+
+            let healed = update(&p, &broken, good.clone()).unwrap().unwrap_valid();
+            assert_eq!(healed.as_ref(), good.as_slice(), "{label}: must heal");
+        }
+    }
+
+    // ------------------------------------------------------- author key hygiene
+
+    /// I6. The previous version of this test signed with a different key than it
+    /// put in params, so `verify_strict` failed on its own and it passed whether
+    /// or not the key check existed. This calls `parse` directly and asserts the
+    /// exact variant.
+    #[test]
+    fn params_reject_non_canonical_and_weak_author_keys() {
+        // y = p - 1 + 2^255 style: a y value at or above the field prime is a
+        // non-canonical encoding of a point that still decompresses.
+        let mut non_canonical = [0xffu8; VERIFYING_KEY_LEN];
+        non_canonical[0] = 0xee; // p = ...ed, so ...ee > p
+        non_canonical[31] = 0x7f;
+        assert!(
+            !is_canonical_field_element(&non_canonical),
+            "fixture must actually be non-canonical"
+        );
+        let mut params = non_canonical.to_vec();
+        params.extend_from_slice(APP_ID);
+        assert_eq!(
+            PointerParams::parse(&params).unwrap_err(),
+            PointerError::ParamsKeyNonCanonical
+        );
+
+        // The identity point is small-order: verify_strict can never accept it,
+        // so a pointer carrying it would be permanently, silently empty.
+        let mut identity = [0u8; VERIFYING_KEY_LEN];
+        identity[0] = 1;
+        let mut params = identity.to_vec();
+        params.extend_from_slice(APP_ID);
+        assert_eq!(
+            PointerParams::parse(&params).unwrap_err(),
+            PointerError::ParamsKeyWeak
+        );
+
+        // Bytes that are not a point at all.
+        let mut not_a_point = [0xffu8; VERIFYING_KEY_LEN];
+        not_a_point[31] = 0x00;
+        let mut params = not_a_point.to_vec();
+        params.extend_from_slice(APP_ID);
+        assert!(matches!(
+            PointerParams::parse(&params),
+            Err(PointerError::ParamsKey | PointerError::ParamsKeyNonCanonical)
+        ));
+
+        // A real key still parses.
+        assert!(PointerParams::parse(&params_for(&key(1), APP_ID)).is_ok());
+    }
+
+    #[test]
+    fn canonical_field_element_boundaries() {
+        // p itself is not canonical; p - 1 is.
+        let mut p_bytes = [0xffu8; VERIFYING_KEY_LEN];
+        p_bytes[0] = 0xed;
+        p_bytes[31] = 0x7f;
+        assert!(!is_canonical_field_element(&p_bytes));
+        let mut below = p_bytes;
+        below[0] = 0xec;
+        assert!(is_canonical_field_element(&below));
+        // The top bit is the x sign and must be ignored.
+        let mut signed = below;
+        signed[31] |= 0x80;
+        assert!(is_canonical_field_element(&signed));
+        assert!(is_canonical_field_element(&[0u8; VERIFYING_KEY_LEN]));
+    }
+
+    #[test]
+    fn a_tombstone_is_an_ordinary_record_that_consumers_can_recognise() {
+        let sk = key(1);
+        let p = params_for(&sk, APP_ID);
+        let live = sign_record(&sk, &p, 4, code_hash(0xAA)).unwrap();
+        let dead = sign_record(&sk, &p, 5, TOMBSTONE_CODE_HASH).unwrap();
+
+        assert!(!live.is_tombstone());
+        assert!(dead.is_tombstone());
+        // It is a normal signed record: valid, and subject to the same ordering.
+        assert!(matches!(
+            validate(&p, &dead.encode()),
+            Ok(ValidateResult::Valid)
+        ));
+        let stored = update(&p, &live.encode(), dead.encode().to_vec())
+            .unwrap()
+            .unwrap_valid();
+        assert!(PointerRecord::decode(stored.as_ref())
+            .unwrap()
+            .is_tombstone());
     }
 }

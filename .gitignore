@@ -10,3 +10,5 @@ Cargo.lock
 # See contracts/pointer-contract/WASM-STABILITY.md.
 !contracts/pointer-contract/Cargo.lock
 contracts/pointer-contract/target
+contracts/pointer-contract-conformance/target
+contracts/pointer-contract-conformance/Cargo.lock

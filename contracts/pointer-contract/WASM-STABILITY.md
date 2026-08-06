@@ -26,6 +26,7 @@ embedded verbatim in consumer code, not something anyone recomputes.
 | A stale lockfile rewritten by an earlier CI step | Every cargo invocation in the pointer job passes `--locked`, and CI fails if `Cargo.lock` changed during the build. Without that, an unlocked `cargo test` earlier in the same job would rewrite the lock, and the artifact build's own `--locked` would then compare against the rewritten file and pass for the wrong reason. |
 | A doc quoting a stale code hash | CI fails unless `README.md`, `TEST-VECTORS.md` and `FREENET.md` all quote the current `CODEHASH` and no other value of that shape. Consumers copy the constant out of the docs, so a stale copy sends them to an empty contract. |
 | A half-configured feature set | `build-wasm.sh` fails unless all four entry points are exported. Enabling `freenet-main-contract` without stdlib's `contract` feature silently produces a ~150-byte WASM with no exports, which loads fine and does nothing. |
+| crates.io or the rustup archive losing a file | `vendor-archive/` holds the exact `.crate` tarballs for the wasm32 build graph. `--locked` survives a yank but not a deletion. Read `vendor-archive/README.md` first: vendoring must never become the *build path*, because `cargo vendor` changes the embedded registry path strings and re-keys the contract. |
 | Any of the above slipping through anyway | CI runs `./build-wasm.sh --check`, which rebuilds and fails if the hash moved from `CODEHASH`. This is the backstop: it does not care *why* the bytes changed. |
 
 That last row is the one that matters. The others are best-effort; the rebuild
@@ -99,6 +100,42 @@ ships) — harmless, but previously unaccounted for.
 
 The general question worth asking of any guard here: **what input makes this go
 red?** If there isn't an easy answer, the guard is decoration.
+
+## The bincode tripwires: what an upstream change can break silently
+
+The artifact talks to the node over **bincode 1**, which is positional and
+unframed. There are no field names and no tags on the wire, so a change upstream
+that Rust considers source-compatible can silently change the bytes this frozen
+WASM produces or expects. Nothing in this repository can detect it, because the
+frozen side never recompiles.
+
+Named explicitly, because these are the types on that boundary:
+
+| Change | Effect |
+|---|---|
+| Appending a field to `UpdateModification` or `RelatedContracts` | The frozen WASM writes/reads the old arity; the node reads/writes the new one. Silent misparse. |
+| Inserting a variant **mid-list** into `ContractError`, `ValidateResult`, or `UpdateData` | Variants are encoded by index. Every variant after the insertion point shifts, so the frozen WASM's `Valid` could decode as `Invalid`. |
+| Appending a variant at the end | Safe for what the frozen WASM emits, but it can never emit or understand the new one. |
+| Changing a field's type | Silent misparse. |
+
+**`UpdateData` carries `#[non_exhaustive]`, and that attribute is misleading
+here.** It advertises "new variants may be added safely", which is true at the
+Rust source level and **false at the bincode layer** for an artifact that will
+never be recompiled. Treat adding a variant anywhere but the end as a flag day.
+
+The same applies to the guest/host buffer protocol
+(`__frnt__fill_buffer`, `__frnt__initiate_buffer`, `BufferBuilder`'s `#[repr(C)]`
+layout, the `ContractInterfaceResult{ptr,kind,size}` return convention). That
+surface is not historically stable: freenet-stdlib changed it in `0af23c0`
+(streaming refill buffers), `925f34b`, and the `feat!` at `a87b998`, and
+`contract_interface/` took 14 commits in 12 months across 0.1.24 to 0.8.5.
+
+The `pointer-contract-conformance` crate is the guard: it loads the **committed**
+artifact into a real wasmtime engine and asserts its import set, entry-point
+signatures and buffer-header layout are exactly what a node provides and calls.
+It caught a real error while being written -- the artifact does import
+`freenet_contract_io::__frnt__fill_buffer`, contradicting an earlier assumption
+here that it needed no host imports at all.
 
 ## The flag day
 

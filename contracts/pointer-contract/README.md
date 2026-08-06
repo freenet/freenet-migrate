@@ -87,14 +87,21 @@ pointer belonging to the same author.
 
 ```toml
 [dependencies]
-freenet-pointer-contract = { git = "https://github.com/freenet/freenet-migrate", default-features = false }
+freenet-pointer-contract = { git = "https://github.com/freenet/freenet-migrate", rev = "<pin a commit>" }
 ```
 
-`default-features = false` is **mandatory**, not stylistic. The default feature
-emits the four `#[no_mangle]` WASM entry points, which carry no target gate — so
-with defaults on, a native consumer links `validate_state`, `update_state`,
-`summarize_state` and `get_state_delta` into its own binary and collides at link
-time with any other contract crate in its graph.
+**Pin a `rev`.** Without one you get a floating dependency on the default
+branch, which is a strange thing to accept from a crate whose entire premise is
+that its bytes never move. It cannot re-key anything — the code hash you embed
+is a constant, not something this crate computes — but a resolver that silently
+changes your `PointerRecord` parsing is not what you want either.
+
+You do **not** need `default-features = false`: the default feature set is empty
+(`default = []`), and the four `#[no_mangle]` WASM entry points are gated behind
+`freenet-main-contract`, which is off unless you ask for it. Just never enable
+that feature in a native consumer — those exports carry no target gate, so they
+would land in your binary and collide at link time with any other contract crate
+in your graph.
 
 There is no crates.io release on purpose: a published source crate invites
 rebuilding the WASM locally, and a locally rebuilt WASM has a different code
@@ -117,7 +124,7 @@ use freenet_pointer_contract::{PointerParams, PointerRecord};
 use freenet_stdlib::prelude::{CodeHash, ContractKey, DelegateKey, Parameters};
 
 /// Both constants are pinned at build time and never recomputed.
-const POINTER_CODE_HASH: &str = "E6CUUEuYPUT4GoW9C4d279oK1p8b5RUKiSScqnExc1Yb";
+const POINTER_CODE_HASH: &str = "8wnAPaSRY1oYZCz723fdwK6BgzL6q8ozP3buVovXnt6v";
 const AUTHOR_VK: [u8; 32] = [/* from the app's FREENET.md */];
 
 type Error = Box<dyn std::error::Error>;
@@ -200,6 +207,30 @@ Detecting staleness needs nothing further: compare the derived key against the
 one you were built with. To fetch the code, GET the derived key with
 `return_contract_code: true`; `BLAKE3(fetched wasm) == record.code_hash` is a
 free integrity check.
+
+### Step 3a — when the code hash cannot be fetched
+
+A pointer can verify perfectly and still name code you cannot get. That is a
+normal condition on this network, not an edge case: hosting is demand-driven and
+contracts are evicted when demand drops, and the project accepts a residual
+~5-9% near-miss rate on finding a contract that does exist.
+
+So distinguish three outcomes, and do not collapse them:
+
+| Outcome | Meaning | What to do |
+|---|---|---|
+| Pointer resolves, derived key fetches | Normal | Proceed. |
+| Pointer resolves, derived key does not fetch | The app is current; this lookup did not land | **Retry with backoff.** Keep using the derived key — it is correct. Do not fall back to your baked-in key, and do not alarm on the first failure. |
+| Pointer does not resolve at all | Unknown | Step 4's rule: last-known-good if you have one, baked-in only if a pointer has *never* resolved here. |
+
+Alarm only if the derived key stays unfetchable across several attempts spanning
+minutes, and report it as "the current version could not be fetched", never as
+"you have no data" — conflating those two is the original sin this contract
+exists to correct.
+
+A verified pointer whose `code_hash` is all zeros is a **tombstone**: the author
+has withdrawn the app. Stop resolving and say so. Do not derive a key from 32
+zero bytes; it addresses a contract that does not exist.
 
 ### Step 4 — persist the right thing
 

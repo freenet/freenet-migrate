@@ -1,0 +1,17 @@
+[package]
+name = "pointer-contract-conformance"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Its own workspace, like the contract it tests. This crate exists to load the
+# FROZEN artifact in a real WASM runtime; it must never be able to perturb that
+# artifact's dependency resolution, so it shares no lockfile with it.
+[workspace]
+
+[dependencies]
+wasmtime = "27"
+freenet-stdlib = { version = "=0.8.5", default-features = false }
+freenet-pointer-contract = { path = "../pointer-contract", default-features = false, features = ["publish"] }
+bincode = "1"
+ed25519-dalek = { version = "=2.1.1", default-features = false, features = ["alloc"] }

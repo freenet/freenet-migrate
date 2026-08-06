@@ -13,6 +13,21 @@
 #   ./build-wasm.sh --check  additionally fail if the hash moved from CODEHASH
 set -euo pipefail
 
+# Argument handling is strict on purpose. This used to be a bare
+# `if [[ "${1:-}" == "--check" ]]`, so `-check`, `--check=1` and
+# `--quiet --check` all built, printed, and exited 0 having compared nothing --
+# a guard that cannot fail, in the guard the docs call the one that matters.
+CHECK=0
+for arg in "$@"; do
+    case "$arg" in
+        --check) CHECK=1 ;;
+        *)
+            echo "FATAL: unknown argument '$arg' (expected nothing, or --check)" >&2
+            exit 2
+            ;;
+    esac
+done
+
 CRATE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$CRATE_DIR"
 
@@ -122,11 +137,16 @@ print(f"exports:   OK ({len(required)} entry points + memory)")
 # replaced never noticed them; the allow-list surfaced them immediately, which is
 # the argument for the allow-list.
 allowed = (b"/cargo/", b"/crate/", b"/rustc/", b"/rust/")
+# Unix-style absolute paths only. An earlier version also matched a
+# `C:\\Users\\` shape, but then discarded anything not starting with "/", so the
+# Windows arm was dead code and the comment claiming it was covered was wrong.
+# The toolchain is pinned to a Linux build and the artifact is produced by CI on
+# ubuntu, so Windows paths cannot arise; saying so is better than a branch that
+# looks like a check and is not one.
 leaks = sorted({
     m.group(0)
-    for m in re.finditer(rb"(?:[A-Za-z]:\\\\|/)[\w./\\-]{6,}", data)
-    if m.group(0).startswith(b"/") and not m.group(0).startswith(allowed)
-    and m.group(0).count(b"/") >= 2
+    for m in re.finditer(rb"/[\w./-]{6,}", data)
+    if not m.group(0).startswith(allowed) and m.group(0).count(b"/") >= 2
 })
 if leaks:
     shown = "\n".join(f"       {p.decode(errors='replace')}" for p in leaks[:10])
@@ -148,7 +168,7 @@ echo "wasm:      $CRATE_DIR/$WASM"
 echo "size:      $(wc -c < "$WASM" | tr -d ' ') bytes"
 echo "code hash: $HASH"
 
-if [[ "${1:-}" == "--check" ]]; then
+if [[ "$CHECK" == 1 ]]; then
     EXPECTED="$(grep -v '^#' CODEHASH | tr -d '[:space:]')"
     if [[ "$HASH" != "$EXPECTED" ]]; then
         cat >&2 <<EOF
@@ -163,9 +183,19 @@ BLAKE3(code_hash || params); if the code hash moves, every published pointer
 re-keys and every consumer that resolved through one is stranded -- with no
 pointer left to point at the pointer.
 
-Something changed the compiled bytes: the source, a dependency version, the
-pinned toolchain, or the build flags. Find out which, and revert it unless you
-are deliberately running the flag-day process in WASM-STABILITY.md.
+Something changed the compiled bytes. In rough order of likelihood:
+
+  * the source -- INCLUDING comments and whitespace, because Rust bakes
+    panic-site file and line strings into the binary;
+  * a dependency version (check `git diff Cargo.lock`);
+  * the toolchain, cargo included, not just rustc (`rustup show active-toolchain`);
+  * the build flags, or a `.cargo/config.toml` anywhere up the tree;
+  * a registry protocol or mirror difference: `[source]` replacement,
+    `[registries]`, or CARGO_REGISTRIES_* / CARGO_NET_GIT_FETCH_WITH_CLI, which
+    change the embedded registry path strings.
+
+Find out which, and revert it unless you are deliberately running the flag-day
+process in WASM-STABILITY.md.
 EOF
         exit 1
     fi

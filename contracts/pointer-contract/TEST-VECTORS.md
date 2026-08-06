@@ -8,8 +8,12 @@ All values hex unless marked base58. Base58 is the **Bitcoin** alphabet
 (`123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz`, no `0OIl`), which
 is what Freenet uses everywhere a key or hash is rendered as text.
 
-These are generated from the same code the contract runs and are pinned by the
-`wire_format_known_answer` test, so they cannot drift from the implementation.
+Every value below is recomputed and checked against this file by the
+`every_published_test_vector_is_correct_and_present` test, so the document
+cannot drift from the implementation in either direction. (An earlier version of
+this file claimed to be pinned by `wire_format_known_answer`, which pinned only
+the signing message and the first four state bytes — the signature, the full
+state and all three derived keys were asserted nowhere.)
 
 ## Inputs
 
@@ -50,9 +54,25 @@ appears in the contract key derivation. Do not re-encode or re-order it.
 
 ## Signature
 
-Ed25519 over the message above, verified with `verify_strict` (which rejects
-small-order public keys and non-canonical scalars — a plain `verify` is not
-equivalent and will accept records this contract rejects):
+Ed25519 over the message above, verified with dalek's `verify_strict`. Match its
+rejection rules exactly or your implementation will be more permissive than the
+contract on adversarial input:
+
+- **Non-canonical `S`**: reject unless the scalar `S` (the trailing 32 bytes of
+  the signature) is fully reduced, i.e. `S < L` where
+  `L = 2^252 + 27742317777372353535851937790883648493`. This is the standard
+  malleability check.
+- **Small-order `A`**: reject if the public key is one of the 8 small-order
+  points. (This contract additionally rejects such keys at params-parse time, so
+  they cannot appear in a valid pointer's params at all.)
+- **Small-order `R`**: reject if the signature's `R` component is small-order.
+- **Non-canonical point encodings**: reject a 32-byte encoding whose `y` is
+  `>= 2^255 - 19`. `VerifyingKey::from_bytes` does *not* do this for you, so the
+  contract checks it explicitly for the author key.
+- **Cofactored vs cofactorless**: `verify_strict` uses the **cofactorless**
+  equation, `[8][S]B = [8]R + [8][k]A` is *not* what it checks; it checks
+  `[S]B = R + [k]A` directly. A cofactored verifier accepts signatures this
+  contract rejects.
 
 ```
 ee3c33cf7bac4f2c2dc4d3a0eff2300a12174d44084f340d6d68c98d63a63953
@@ -86,8 +106,8 @@ above:
 
 | | |
 |---|---|
-| pointer code hash (base58) | `E6CUUEuYPUT4GoW9C4d279oK1p8b5RUKiSScqnExc1Yb` |
-| pointer key (base58) | `C1i9ugGuhG4hoJrdD8YxXsrQa688yb7vGnBKc7muL9AB` |
+| pointer code hash (base58) | `8wnAPaSRY1oYZCz723fdwK6BgzL6q8ozP3buVovXnt6v` |
+| pointer key (base58) | `Hjus5Fnb6NWxKGN64MQwmbgk1Vd6YojykLtxnXipR6Lx` |
 
 **Your own instance's key**, from the `code_hash` carried in the state plus
 **your own** params (not the pointer's) — this is step 3, the one integrators

@@ -64,6 +64,27 @@ jobs:
       - name: ui feature
         run: cargo build -p freenet-migrate --no-default-features --features ui --target wasm32-unknown-unknown
 
+  pointer-conformance:
+    # Does the FROZEN artifact actually load and run? Everything in the job
+    # below checks the contract's SOURCE -- native unit tests, an export-section
+    # parse, a hash. None of it executes pointer-v1.wasm, and the artifact is
+    # frozen forever, so an artifact a node cannot instantiate would be a flag
+    # day to fix.
+    name: pointer contract (executes in a real wasm runtime)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: contracts/pointer-contract-conformance
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.0"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: contracts/pointer-contract-conformance
+      - run: cargo test
+
   pointer-contract:
     # The pointer contract is excluded from the workspace (its bytes must not
     # move when anything else here changes), so the jobs above do not touch it.
@@ -105,6 +126,19 @@ jobs:
         run: |
           cmp pointer-v1.wasm \
               target/wasm32-unknown-unknown/release/freenet_pointer_contract.wasm
+      # Docs are scanned by discovery, not by a hardcoded list: naming files
+      # here means a stale hash in one nobody listed goes unnoticed.
+      - name: no tracked markdown quotes a stale code hash
+        run: |
+          EXPECTED="$(grep -v '^#' CODEHASH | tr -d '[:space:]')"
+          cd ../..
+          FILES=$(git ls-files '*.md')
+          if grep -rhoE '\b[1-9A-HJ-NP-Za-km-z]{43,44}\b' $FILES \
+             | grep -v "^$EXPECTED$" \
+             | grep -vxFf contracts/pointer-contract/KNOWN-BASE58; then
+            echo "the above look like stale code hashes; update them or add to KNOWN-BASE58"
+            exit 1
+          fi
       # The code hash is hand-copied into the docs, and consumers copy it out of
       # them. A doc that names a stale hash sends integrators to an empty
       # contract, so the copies must agree with CODEHASH.

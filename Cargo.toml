@@ -7,7 +7,7 @@ members = ["freenet-migrate", "freenet-migrate-build"]
 # code hash, and re-key every pointer in the ecosystem. It carries its own
 # `[workspace]`, lockfile and toolchain pin instead.
 # See contracts/pointer-contract/WASM-STABILITY.md.
-exclude = ["contracts/pointer-contract"]
+exclude = ["contracts/pointer-contract", "contracts/pointer-contract-conformance"]
 resolver = "2"
 
 # The two crates are independent: `freenet-migrate-build` is a *build-dependency*
