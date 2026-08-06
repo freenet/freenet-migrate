@@ -63,3 +63,39 @@ jobs:
         run: cargo build -p freenet-migrate --no-default-features --features delegate --target wasm32-unknown-unknown
       - name: ui feature
         run: cargo build -p freenet-migrate --no-default-features --features ui --target wasm32-unknown-unknown
+
+  pointer-contract:
+    # The pointer contract is excluded from the workspace (its bytes must not
+    # move when anything else here changes), so the jobs above do not touch it.
+    name: pointer contract (fmt / clippy / test / frozen wasm)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: contracts/pointer-contract
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          # Deliberately NOT ${{ env.RUST_TOOLCHAIN }}: this crate pins its own
+          # toolchain in rust-toolchain.toml because rustc changes the compiled
+          # bytes. Bumping the repo-wide pin must not silently re-key it.
+          toolchain: "1.96.0"
+          targets: wasm32-unknown-unknown
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: contracts/pointer-contract
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo test --all-features
+      # The backstop. Rebuilds the WASM and fails if its code hash moved from
+      # CODEHASH, whatever the cause -- a source edit, a dependency drift, a
+      # toolchain change. See WASM-STABILITY.md.
+      - name: frozen code hash
+        run: ./build-wasm.sh --check
+      # The committed artifact must be the one CODEHASH describes, or consumers
+      # embedding the hash and users loading the .wasm would get different code.
+      - name: committed artifact matches the build
+        run: |
+          cmp pointer-v1.wasm \
+              target/wasm32-unknown-unknown/release/freenet_pointer_contract.wasm

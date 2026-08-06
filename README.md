@@ -17,6 +17,8 @@ consumers, not a runtime dependency of `freenet-migrate`.
 Horizon-A step A3 of the graceful-upgrades design,
 [freenet-core#2776](https://github.com/freenet/freenet-core/issues/2776).
 
+**Contracts published from this repo: [FREENET.md](./FREENET.md)** — including the canonical successor-pointer contract.
+
 **Design & rationale: [docs/design.md](./docs/design.md)** — why the crate is
 shaped this way (backward-probe over signed-pointer, preconditions as
 compile-time bounds, the `SecretTransport` seam) and the field-validated River

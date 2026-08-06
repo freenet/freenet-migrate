@@ -105,7 +105,10 @@ impl core::fmt::Display for PointerError {
                 write!(f, "invalid app_id byte {b:#04x}; allowed: a-z 0-9 . - _")
             }
             Self::StateLength(n) => {
-                write!(f, "pointer state must be exactly {STATE_LEN} bytes, got {n}")
+                write!(
+                    f,
+                    "pointer state must be exactly {STATE_LEN} bytes, got {n}"
+                )
             }
             Self::ZeroVersion => write!(f, "pointer version 0 is reserved and never valid"),
             Self::BadSignature => write!(f, "pointer signature verification failed"),
@@ -156,9 +159,7 @@ impl<'a> PointerParams<'a> {
     /// contract.
     pub fn encode(author_vk: &VerifyingKey, app_id: &[u8]) -> Result<Vec<u8>, PointerError> {
         if app_id.is_empty() || app_id.len() > MAX_APP_ID_LEN {
-            return Err(PointerError::ParamsLength(
-                VERIFYING_KEY_LEN + app_id.len(),
-            ));
+            return Err(PointerError::ParamsLength(VERIFYING_KEY_LEN + app_id.len()));
         }
         if let Some(&bad) = app_id.iter().find(|b| !is_valid_app_id_byte(**b)) {
             return Err(PointerError::ParamsAppId(bad));
@@ -280,9 +281,7 @@ impl ContractInterface for PointerContract {
         state: State<'static>,
         _related: RelatedContracts<'static>,
     ) -> Result<ValidateResult, ContractError> {
-        // SKELETON: framing only. Version and signature checks come next.
-        let _ = PointerParams::parse(parameters.as_ref())?;
-        PointerRecord::decode(state.as_ref())?;
+        PointerRecord::decode_verified(state.as_ref(), parameters.as_ref())?;
         Ok(ValidateResult::Valid)
     }
 
@@ -291,15 +290,60 @@ impl ContractInterface for PointerContract {
         state: State<'static>,
         data: Vec<UpdateData<'static>>,
     ) -> Result<UpdateModification<'static>, ContractError> {
-        // SKELETON: last-write-wins, no ordering, no signature check,
-        // `UpdateData::State` only.
-        let _ = (parameters, state);
+        let params = parameters.as_ref();
+        let parsed = PointerParams::parse(params)?;
+
+        // An empty state means this peer holds no pointer yet -- any valid
+        // record supersedes nothing and is accepted.
+        let mut best = if state.as_ref().is_empty() {
+            None
+        } else {
+            Some(PointerRecord::decode_verified(state.as_ref(), params)?)
+        };
+
+        let mut saw_candidate = false;
         for update in &data {
-            if let UpdateData::State(s) = update {
-                return Ok(UpdateModification::valid(State::from(s.as_ref().to_vec())));
-            }
+            // `get_state_delta` emits the full record as the delta, so a delta
+            // and a state carry identical bytes here. Handling only
+            // `UpdateData::State` would make anti-entropy silently fail.
+            let bytes: &[u8] = match update {
+                UpdateData::State(s) => s.as_ref(),
+                UpdateData::Delta(d) => d.as_ref(),
+                UpdateData::StateAndDelta { state, .. } => state.as_ref(),
+                // This contract has no related contracts; any other variant is
+                // not something it can act on.
+                _ => continue,
+            };
+            saw_candidate = true;
+
+            // A malformed or unsigned candidate is a genuinely invalid update
+            // and is rejected. A *stale* candidate is not -- see below.
+            let candidate = PointerRecord::decode(bytes).map_err(ContractError::from)?;
+            candidate.verify(params, &parsed.author_vk).map_err(|e| {
+                ContractError::InvalidUpdateWithInfo {
+                    reason: e.to_string(),
+                }
+            })?;
+
+            best = Some(match best {
+                None => candidate,
+                Some(current) => merge(current, candidate),
+            });
         }
-        Err(ContractError::InvalidUpdate)
+
+        if !saw_candidate {
+            return Err(ContractError::InvalidUpdate);
+        }
+
+        // A stale or equal update is a **no-op success**, never an error.
+        // Returning `Err` here would turn routine anti-entropy from a peer that
+        // is merely behind into a merge failure, feeding the node's merge
+        // backoff. `best` is unchanged in that case, so the node stores what it
+        // already had.
+        let winner = best.expect("saw_candidate implies best is Some");
+        Ok(UpdateModification::valid(State::from(
+            winner.encode().to_vec(),
+        )))
     }
 
     fn summarize_state(
@@ -332,7 +376,11 @@ impl ContractInterface for PointerContract {
                 v.copy_from_slice(summary.as_ref());
                 u32::from_be_bytes(v)
             }
-            _ => return Err(ContractError::Deser("pointer summary must be 4 bytes".into())),
+            _ => {
+                return Err(ContractError::Deser(
+                    "pointer summary must be 4 bytes".into(),
+                ))
+            }
         };
 
         if record.version > summary_version {
@@ -491,7 +539,10 @@ mod tests {
         let mut s = state_bytes(&sk, &p, 1, 0xAA);
         s.push(0);
         assert!(matches!(validate(&p, &s), Err(ContractError::InvalidState)));
-        assert!(matches!(validate(&p, &[]), Err(ContractError::InvalidState)));
+        assert!(matches!(
+            validate(&p, &[]),
+            Err(ContractError::InvalidState)
+        ));
     }
 
     #[test]
@@ -627,11 +678,7 @@ mod tests {
         let p = params_for(&sk, APP_ID);
         let current = state_bytes(&sk, &p, 1, 0xAA);
         assert!(matches!(
-            PointerContract::update_state(
-                Parameters::from(p),
-                State::from(current),
-                vec![]
-            ),
+            PointerContract::update_state(Parameters::from(p), State::from(current), vec![]),
             Err(ContractError::InvalidUpdate)
         ));
     }
@@ -644,9 +691,11 @@ mod tests {
         let p = params_for(&sk, APP_ID);
         let state = state_bytes(&sk, &p, 7, 0xAA);
 
-        let summary =
-            PointerContract::summarize_state(Parameters::from(p.clone()), State::from(state.clone()))
-                .unwrap();
+        let summary = PointerContract::summarize_state(
+            Parameters::from(p.clone()),
+            State::from(state.clone()),
+        )
+        .unwrap();
         assert_eq!(summary.as_ref(), &7u32.to_be_bytes());
 
         // A peer that is behind gets the whole record back.
@@ -721,7 +770,11 @@ mod tests {
         let p = params_for(&sk, APP_ID);
         let s = state_bytes(&sk, &p, 0x01020304, 0xAA);
         assert_eq!(s.len(), 100);
-        assert_eq!(&s[..4], &[0x01, 0x02, 0x03, 0x04], "version is u32 big-endian");
+        assert_eq!(
+            &s[..4],
+            &[0x01, 0x02, 0x03, 0x04],
+            "version is u32 big-endian"
+        );
         assert_eq!(&s[4..36], &[0xAAu8; 32], "code_hash follows the version");
         assert_eq!(s[36..].len(), 64, "signature is the trailing 64 bytes");
         assert_eq!(PointerRecord::decode(&s).unwrap().version, 0x01020304);

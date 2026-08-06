@@ -26,7 +26,17 @@ publish = false
 crate-type = ["cdylib", "rlib"]
 
 [features]
-default = []
+default = ["freenet-main-contract"]
+# Emits the four `#[no_mangle]` entry points the node calls, and pulls in
+# stdlib's WASM memory interface that they are implemented over.
+#
+# These two must move together. The `#[contract]` macro gates its exports on
+# *this crate's* `freenet-main-contract` feature, while the memory interface
+# those exports call lives behind *stdlib's* `contract` feature. Enabling one
+# without the other silently produces a WASM with no exports at all -- a
+# 149-byte file that a node loads and that does nothing. `build-wasm.sh`
+# re-checks the exports are present for exactly this reason.
+freenet-main-contract = ["freenet-stdlib/contract"]
 # Publisher-side signing helpers. NOT enabled for the canonical WASM build --
 # a node only ever verifies, never signs, so this keeps signing code out of the
 # frozen artifact.
@@ -57,3 +67,10 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+
+# Gated on `publish` so the canonical WASM build (default features only) never
+# tries to compile a host binary for the wasm32 target.
+[[bin]]
+name = "pointer-codehash"
+path = "src/bin/pointer-codehash.rs"
+required-features = ["publish"]

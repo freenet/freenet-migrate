@@ -1,0 +1,10 @@
+# The pointer contract's code hash: base58(BLAKE3(pointer-v1.wasm)).
+#
+# This value is the root of the whole convention. Every pointer key in the
+# ecosystem is BLAKE3(this || that pointer's params), so if this changes, every
+# published pointer re-keys and every consumer resolving through one is
+# stranded -- with no pointer left to point at the pointer.
+#
+# It is enforced by CI (`./build-wasm.sh --check`). Changing it is a flag day.
+# See WASM-STABILITY.md.
+9V7mTtJjz8Y4Vmkhta38fTzvVF1pxfwzC6NWvGx3FiEG
