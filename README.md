@@ -226,6 +226,43 @@ let pointer = signer.sign(successor_code_hash, generation, app_id)?;
 pointer.verify_and_check_supersedes(&signer.public_key(), app_id, current_generation)?;
 ```
 
+### 2c. Forward discovery: resolving an author's pointer contract
+
+Everything above looks **backward** — it walks an app's own lineage, which only
+helps the app's own author. A **third party** that baked a key into its build
+has no lineage to walk. For that, resolve the author's
+[canonical pointer contract](./contracts/pointer-contract) (freenet-core#5194):
+its address is derivable offline from `(author_vk, app_id)`, and its state names
+the app's current `code_hash`.
+
+```rust,ignore
+use freenet_migrate::{resolve_successor_pointer, PointerFloor, PointerOutcome};
+
+// `floor` is what you already verified — persist (version, code_hash) and pass
+// it back next time. It is the anti-rollback anchor.
+let floor = stored_floor.unwrap_or_else(PointerFloor::never_resolved);
+
+match resolve_successor_pointer(&mut io, &AUTHOR_VK, b"river.room-contract", floor).await? {
+    PointerOutcome::Resolved(p) | PointerOutcome::Unchanged(p) => {
+        // Step 3, the one integrators get wrong: combine the pointer's
+        // code_hash with YOUR OWN params, not the pointer's.
+        let key = p.contract_id(&my_own_params);
+        persist(p.version(), p.code_hash());
+    }
+    PointerOutcome::Withdrawn { .. } => stop_resolving(),
+    // The ONLY case where falling back to your build-time key is safe.
+    o if o.may_use_baked_in_fallback() => use_baked_in_key(),
+    // Unavailable: keep using whatever you last resolved. Never downgrade.
+    _ => keep_last_resolved(),
+}
+```
+
+Signature verification is local and never trusts the responding node, and
+`ResolvedPointer` has no public constructor, so the only way to hold one is to
+have resolved it. **Note the trust model:** the `author_vk` you pass in is the
+entire trust anchor — there is no delegation, rotation or revocation, and that
+question is still open on freenet-core#5194.
+
 ### 3. Delegate secret carry-forward (runtime)
 
 **The app-facing entry point is `migrate_delegate_secrets`** — carry each

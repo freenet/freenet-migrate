@@ -567,8 +567,13 @@ impl PointerFloor {
     }
 
     /// The caller has previously verified `version` but did not keep the code
-    /// hash. Rollback is still refused; the equal-version conflict check is
-    /// not available.
+    /// hash.
+    ///
+    /// **Weaker than [`Self::at`].** Rollback is still refused, but the
+    /// equal-version conflict check cannot run, so if the author ever signed
+    /// two different code hashes at one version this floor will accept
+    /// whichever one the network serves. Use [`Self::at`] wherever the code
+    /// hash can be persisted.
     #[must_use]
     pub fn at_version_only(version: u32) -> Self {
         Self {
@@ -715,6 +720,11 @@ impl PointerResolver {
     ///
     /// The [`Step::Get`] this emits wants neither the contract code nor a
     /// subscription — the record is the whole answer.
+    ///
+    /// A resolution is exactly one GET and the resolver does not retry:
+    /// [`PointerOutcome::Unavailable`] is terminal for this instance. To retry,
+    /// build a new resolver with the same floor. That keeps the retry policy
+    /// (and its backoff) with the app, where the transport is.
     pub fn next_action(&mut self) -> Step {
         if matches!(self.phase, Phase::Done(_)) {
             return Step::Done;
