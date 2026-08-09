@@ -237,7 +237,7 @@ fn derived_addresses_match_the_published_vectors() {
 /// source-scrape below pins the same numbers on the other side, so together
 /// these two tests make a divergence in either direction fail.
 #[test]
-fn the_resolvers_mirrored_constants_match_the_contracts_literals() {
+fn the_resolvers_mirrored_constants_match_their_expected_literals() {
     use freenet_migrate::pointer::{
         MAX_APP_ID_LEN, MAX_POINTER_PARAMS_LEN, MAX_POINTER_VERSION, MIN_POINTER_PARAMS_LEN,
         POINTER_STATE_LEN, SIGNATURE_LEN, TOMBSTONE_CODE_HASH, VERIFYING_KEY_LEN,
@@ -265,12 +265,14 @@ fn the_resolvers_mirrored_constants_match_the_contracts_literals() {
 /// there is no self-match.
 #[test]
 fn the_resolver_still_verifies_the_way_the_contract_does() {
-    let src: String =
-        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/pointer.rs"))
-            .expect("the resolver's own source must be readable")
-            .chars()
-            .filter(|c| !c.is_whitespace())
-            .collect();
+    let raw = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/pointer.rs"))
+        .expect("the resolver's own source must be readable");
+    // Scope to production code: a needle satisfied by a string literal inside
+    // `mod tests` would pin nothing.
+    let production = raw
+        .split_once("#[cfg(test)]")
+        .map_or(raw.as_str(), |(before, _)| before);
+    let src: String = production.chars().filter(|c| !c.is_whitespace()).collect();
 
     for (what, needle) in [
         (
@@ -278,12 +280,19 @@ fn the_resolver_still_verifies_the_way_the_contract_does() {
             ".verify_strict(&msg,&Signature::from_bytes(&self.signature))",
         ),
         (
-            "the canonical-encoding check on the author key",
+            // Two DISTINCT needles, one per function. A single needle written
+            // against `parse_pointer_params` (which spells the argument `&key`)
+            // silently failed to pin `pointer_params`, and `pointer_params` is
+            // the load-bearing one: it builds the address the resolver derives.
+            "the canonical-encoding check when PARSING a params blob",
             "if!is_canonical_field_element(&key){returnErr(PointerError::ParamsKeyNonCanonical);}",
         ),
         (
-            "the small-order author-key rejection",
-            "ifauthor_vk.is_weak(){returnErr(PointerError::ParamsKeyWeak);}",
+            "the canonical-encoding check when BUILDING params",
+            concat!(
+                "if!is_canonical_field_element(author_vk.as_bytes())",
+                "{returnErr(PointerError::ParamsKeyNonCanonical);}",
+            ),
         ),
         (
             "the signed-message field order",
@@ -297,10 +306,23 @@ fn the_resolver_still_verifies_the_way_the_contract_does() {
     ] {
         assert!(
             src.contains(needle),
-            "{what} changed in freenet-migrate/src/pointer.rs. The resolver must stay              exactly as strict as the frozen contract; being more permissive means              adopting a code hash the network would never store.
-Expected to find: {needle}"
+            "{what} changed in freenet-migrate/src/pointer.rs. The resolver must stay exactly \
+             as strict as the frozen contract; being more permissive means adopting a code \
+             hash the network would never store. Expected to find: {needle}"
         );
     }
+
+    // `pointer_params` and `parse_pointer_params` must BOTH reject a
+    // small-order author key, and those two sites are textually identical. A
+    // `contains` needle matching N sites pins only N-1 deletions, because
+    // deleting one leaves the needle satisfied by its sibling. Count instead.
+    let weak_guard = "ifauthor_vk.is_weak(){returnErr(PointerError::ParamsKeyWeak);}";
+    let found = src.matches(weak_guard).count();
+    assert_eq!(
+        found, 2,
+        "both pointer_params and parse_pointer_params must reject a small-order author key; \
+         found {found} of the 2 expected is_weak guards"
+    );
 }
 
 /// Whitespace-stripped source scrape of the contract, so `cargo fmt` on the
@@ -349,6 +371,14 @@ fn the_contract_source_still_says_what_this_resolver_assumes() {
         (
             "strict signature verification",
             ".verify_strict(&msg,&Signature::from_bytes(&self.signature))",
+        ),
+        (
+            // The resolver's `order()` derives its equal-version tiebreak
+            // direction from this function. If the contract flipped to
+            // higher-encoding-wins, consumers would diverge from the network
+            // permanently, which is the exact split the tiebreak prevents.
+            "the merge tiebreak direction",
+            "ifcandidate.encode()<current.encode(){candidate}else{current}",
         ),
         (
             "the canonical-encoding check on the author key",

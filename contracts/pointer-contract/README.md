@@ -265,10 +265,20 @@ A verified pointer whose `code_hash` is all zeros is a **tombstone**: the author
 has withdrawn the app. Stop resolving and say so. Do not derive a key from 32
 zero bytes; it addresses a contract that does not exist.
 
+**Persist the withdrawal's version as your floor before you stop.** A tombstone
+is an ordinary signed record at a version like any other. A consumer that stops
+resolving without recording that version leaves its floor at the pre-withdrawal
+value, and any peer can then serve a real, validly signed pre-withdrawal record,
+which supersedes that stale floor and resurrects code the author explicitly
+withdrew. Store the tombstone's version with an all-zero `code_hash` and treat
+it exactly like any other floor.
+
 ### Step 4 — persist the right thing
 
-Persist `(highest_version_ever_verified, resolved_key)`, not merely "I know a
-pointer exists".
+Persist `(highest_version_ever_verified, code_hash_accepted_at_it)`, not merely
+"I know a pointer exists". Keep one such pair **per `(author_vk, app_id)`**:
+each pointer has its own address and its own independent version space, so a
+shared floor either rejects good records or carries a bound that is too low.
 
 - Reject any record whose `version` is strictly less than your highest ever
   seen. The contract enforces monotonicity across the network, but a node that

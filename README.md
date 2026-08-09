@@ -242,14 +242,23 @@ the app's current `code_hash`.
 > **Nothing has published a pointer yet.** The contract's WASM is frozen and
 > CI-enforced, but it has not been published to the network and the first
 > publish is gated on a manual end-to-end run (see the STOP box in
-> [FREENET.md](./FREENET.md)). Until then every resolve returns `Unavailable`.
+> [`contracts/pointer-contract/README.md`](./contracts/pointer-contract/README.md)).
+> Until then a resolve returns `NeverPublished` if your transport reports a real
+> "not found", and `Unavailable` if it cannot tell (which is what
+> `ConservativeProbeIo` always reports). So during this period a first-run
+> consumer legitimately falls back to its baked-in key.
 
 ```rust,ignore
 use freenet_migrate::{resolve_app_pointer, PointerFloor, PointerOutcome};
 
-// `floor` is what you already verified. Persist it per (author_vk, app_id) and
-// pass it back: it is the anti-rollback anchor.
-let floor = stored_floor.unwrap_or_else(PointerFloor::never_resolved);
+// `floor` is what you already verified, stored per (author_vk, app_id). It is
+// the anti-rollback anchor. A consumer that knows the app's version and hash at
+// build time should seed from those constants rather than starting empty: a
+// first resolve has nothing to compare against and adopts any signed record.
+let floor = match load_floor(&AUTHOR_VK, b"river.room-contract") {
+    Some((version, code_hash)) => PointerFloor::at(version, code_hash)?,
+    None => PointerFloor::never_resolved(),
+};
 
 let outcome = match resolve_app_pointer(&mut io, &AUTHOR_VK, b"river.room-contract", floor).await {
     Ok(outcome) => outcome,
@@ -259,9 +268,10 @@ let outcome = match resolve_app_pointer(&mut io, &AUTHOR_VK, b"river.room-contra
 };
 
 // Persist first: this is what stops a later replay, including after a
-// withdrawal.
+// withdrawal (a tombstone is a signed record at a version like any other, so
+// its version has to become your floor or a pre-withdrawal record replays).
 if let Some(next) = outcome.next_floor() {
-    persist_floor(next);
+    store_floor(&AUTHOR_VK, b"river.room-contract", next.version(), next.code_hash());
 }
 
 match outcome {
@@ -273,7 +283,8 @@ match outcome {
     // The author withdrew the app. There is no current code; do not fall back.
     PointerOutcome::Withdrawn { .. } => stop_resolving(),
     // A peer served an older record. Routine on a freshly-bootstrapped node,
-    // not an attack signal. Already refused; keep what you have and retry.
+    // and not an attack signal. Already refused; keep whatever your floor says
+    // (which may itself be a withdrawal) and retry.
     PointerOutcome::Stale { .. } => keep_last_resolved_and_retry(),
     // The ONLY case where falling back to your build-time key is safe.
     PointerOutcome::NeverPublished => use_baked_in_key(),
@@ -289,9 +300,17 @@ the error so no caller has to re-derive when a fallback is legitimate: only
 `NeverPublished`, ever.
 
 Reaching `NeverPublished` needs a `PointerIo` that can report a real
-`PointerFetch::Absent`. If you wrap an existing `ProbeIo` in
-`ConservativeProbeIo`, its ambiguous `Ok(None)` maps to `Unreachable`, so that
-adapter can never unlock the fallback.
+`PointerFetch::Absent`. Implementing `PointerIo` directly is the recommended
+path. `ConservativeProbeIo` wraps an existing `ProbeIo` and is useful for
+reusing plumbing you already have, with two inherited costs: its ambiguous
+`Ok(None)` maps to `Unreachable` so it can never unlock the fallback, and
+`ProbeIo`'s GET is specified with `return_contract_code: true`, so it pulls the
+pointer's ~130 KB WASM on every resolve to read a 100-byte record.
+
+Note also that absence is unauthenticated: Freenet has no proof a contract has
+no state, so a responding node can always claim "not found". That is why the
+fallback is confined to the case where nothing has ever resolved, where the
+worst outcome is the key the consumer already shipped with.
 
 **Trust model:** the `author_vk` you pass in is the entire trust anchor. Per
 freenet-core#5194's settled decisions there is no delegated signing and no

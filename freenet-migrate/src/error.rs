@@ -90,8 +90,12 @@ pub enum MigrateError {
     /// A serialized payload could not be encoded/decoded.
     Codec(String),
     /// Forward discovery through an author's successor-pointer contract failed:
-    /// bad params, a record that did not verify, or one that would roll the
-    /// caller back. See [`crate::pointer::PointerError`].
+    /// bad params, a record that did not verify, or a corrupt caller-supplied
+    /// floor. See [`crate::pointer::PointerError`].
+    ///
+    /// Note this does **not** cover ordering. A record that loses to the
+    /// caller's floor is [`crate::PointerOutcome::Stale`], an ordinary outcome,
+    /// because a freshly-bootstrapped peer serving one is routine.
     ///
     /// Distinct from [`Self::BadSignature`] / [`Self::StaleGeneration`], which
     /// belong to the older, unrelated [`crate::SuccessorPointer`] primitive:

@@ -45,6 +45,23 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --all-features
 
+  docs:
+    # `pointer`'s safety story is carried substantially by its doc comments, and
+    # a link to a type a redesign deleted is how that rots. `cargo test` never
+    # runs rustdoc, so the `deny(rustdoc::broken_intra_doc_links)` in lib.rs
+    # needs this job to fire at all.
+    name: rustdoc (no broken links)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo doc --no-deps --all-features --workspace
+        env:
+          RUSTDOCFLAGS: -D warnings
+
   wasm:
     name: wasm build (contract / delegate / ui)
     runs-on: ubuntu-latest

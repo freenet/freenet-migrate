@@ -55,6 +55,11 @@
 //! testable natively.
 
 #![forbid(unsafe_code)]
+// The safety story of `pointer` is carried substantially by its prose, and a
+// link to a type that no longer exists is how that prose rots. Two such links
+// survived a redesign here and CI did not notice, so the lint is on and the
+// `docs` CI job runs rustdoc.
+#![deny(rustdoc::broken_intra_doc_links)]
 
 pub mod contract;
 pub mod delegate;
@@ -89,11 +94,12 @@ pub use driver::{
 pub use error::MigrateError;
 pub use lineage::{ContractLineageEntry, DelegateLineageEntry, Lineage};
 pub use pointer::{
-    parse_pointer_params, pointer_contract_id, pointer_params, pointer_signing_message,
-    resolve_app_pointer, ConservativeProbeIo, PointerError, PointerFetch, PointerFloor, PointerIo,
-    PointerOutcome, PointerRecord, PointerResolver, ResolveError, ResolvedPointer, CODE_HASH_LEN,
-    MAX_APP_ID_LEN, MAX_POINTER_PARAMS_LEN, MAX_POINTER_VERSION, MIN_POINTER_PARAMS_LEN,
-    POINTER_CODE_HASH_B58, POINTER_SIGNING_DOMAIN, POINTER_STATE_LEN, SIGNATURE_LEN,
-    TOMBSTONE_CODE_HASH, VERIFYING_KEY_LEN,
+    is_canonical_field_element, is_valid_app_id_byte, parse_pointer_params, pointer_contract_id,
+    pointer_params, pointer_signing_message, resolve_app_pointer, ConservativeProbeIo,
+    PointerError, PointerFetch, PointerFloor, PointerIo, PointerOutcome, PointerRecord,
+    PointerResolver, ResolveError, ResolvedPointer, CODE_HASH_LEN, MAX_APP_ID_LEN,
+    MAX_POINTER_PARAMS_LEN, MAX_POINTER_VERSION, MIN_POINTER_PARAMS_LEN, POINTER_CODE_HASH_B58,
+    POINTER_SIGNING_DOMAIN, POINTER_STATE_LEN, SIGNATURE_LEN, TOMBSTONE_CODE_HASH,
+    VERIFYING_KEY_LEN,
 };
 pub use successor::{ReleaseSigner, SuccessorPointer};

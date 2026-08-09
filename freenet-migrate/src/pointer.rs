@@ -47,8 +47,24 @@
 //!
 //! So the limitation is real but bounded and deliberate: a **forward**
 //! compromise (the author's key is stolen) is unmitigated at this layer and
-//! always will be. What the resolver *does* bound is **backward** replay: see
-//! [`PointerFloor`].
+//! always will be. What the resolver bounds is **backward** replay, and only
+//! relative to a floor the caller supplies: see [`PointerFloor`].
+//!
+//! Two further assumptions worth stating, because they are easy to read past:
+//!
+//! * **Absence is unauthenticated.** Freenet has no proof that a contract has
+//!   no state; a responding node can always answer "not found". So
+//!   [`PointerOutcome::NeverPublished`], the one outcome that unlocks a
+//!   baked-in fallback, ultimately rests on a peer's unverifiable claim. The
+//!   blast radius is bounded (it applies only when nothing has ever resolved,
+//!   and the result is the key the consumer already shipped with), which is why
+//!   the fallback is confined to that case.
+//! * **A first resolve has no recency bound.** Against
+//!   [`PointerFloor::never_resolved`] there is nothing to compare with, so any
+//!   validly-signed record is adopted, including a genuine but superseded one a
+//!   peer chooses to serve. It self-heals on the next honest response. A
+//!   consumer that knows the app's version and code hash at build time should
+//!   seed its floor with [`PointerFloor::at`] instead of starting empty.
 //!
 //! # Verification is local, always
 //!
@@ -176,9 +192,11 @@ pub fn is_canonical_field_element(bytes: &[u8; VERIFYING_KEY_LEN]) -> bool {
 /// Everything that can be wrong with a pointer's params, its record, or its
 /// ordering relative to what the caller already trusts.
 ///
-/// Variant-for-variant a mirror of the contract's own `PointerError`, plus the
-/// two ordering outcomes ([`Self::Rollback`], [`Self::Conflict`]) that only a
-/// consumer holding a [`PointerFloor`] can detect.
+/// A mirror of the contract's own `PointerError`, plus [`Self::FloorVersion`]
+/// for a caller-supplied [`PointerFloor`] that no real resolution could have
+/// produced. Ordering is **not** an error here: a record that loses to the
+/// caller's floor is [`PointerOutcome::Stale`], because the contract documents
+/// a bootstrapping peer serving one as routine.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PointerError {
@@ -208,6 +226,16 @@ pub enum PointerError {
     SignatureUnset,
     /// The signature did not verify under the author key over these params.
     BadSignature,
+    /// A [`PointerFloor`] was built at a version outside `1..=MAX_POINTER_VERSION`.
+    ///
+    /// No real resolution can produce one: the contract refuses to sign or
+    /// accept version 0 or `u32::MAX`. So a floor at either end is corrupt
+    /// caller state (a defaulted database column, a partial write), and it is
+    /// refused rather than interpreted. The ends are unsafe in opposite
+    /// directions: version 0 would read as "never resolved" and unlock the
+    /// baked-in fallback, while a version above the maximum could never be
+    /// superseded by any valid record, wedging the caller on `Stale` forever.
+    FloorVersion(u32),
 }
 
 impl PointerError {
@@ -262,6 +290,11 @@ impl core::fmt::Display for PointerError {
             Self::BadSignature => write!(
                 f,
                 "pointer signature verification failed under the author key for these params"
+            ),
+            Self::FloorVersion(v) => write!(
+                f,
+                "pointer floor version {v} is outside 1..={MAX_POINTER_VERSION}; no real \
+                 resolution produces one, so this floor is corrupt caller state"
             ),
         }
     }
@@ -372,11 +405,13 @@ fn pointer_contract_id_from_params(params: &[u8]) -> ContractInstanceId {
 
 /// A pointer record exactly as it appears on the wire.
 ///
-/// Decoding is separate from verifying, and only [`Self::decode_verified`]
-/// yields a record you may act on. Prefer the resolver
-/// ([`PointerResolver`] / [`resolve_app_pointer`]) over handling records
-/// directly: it also enforces the anti-rollback ordering, which no single
-/// record can express.
+/// Decoding is separate from verifying: [`Self::decode`] checks only the
+/// length, and [`Self::verify`] is what makes a record safe to act on. There is
+/// deliberately no combined helper (see the note below the impl).
+///
+/// Prefer the resolver ([`PointerResolver`] / [`resolve_app_pointer`]) over
+/// handling records directly: it also enforces the anti-rollback ordering,
+/// which no single record can express.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PointerRecord {
     /// Monotonically increasing. Starts at 1; 0 is never valid.
@@ -560,22 +595,53 @@ impl PointerFloor {
     /// constructor; it was removed because without the code hash the resolver
     /// cannot apply the equal-version tiebreak, so it would report a
     /// *substituted* code hash at the caller's current version as
-    /// [`PointerOutcome::Unchanged`] — telling the caller nothing had changed
+    /// [`PointerOutcome::Unchanged`], telling the caller nothing had changed
     /// while handing back a different key.
     ///
-    /// `version` 0 means "never resolved" everywhere in this module, so
-    /// `at(0, _)` is equivalent to [`Self::never_resolved`] and the code hash
-    /// is discarded: a floor at version 0 cannot be the result of a real
-    /// resolution, because the contract never accepts a version-0 record.
-    #[must_use]
-    pub fn at(version: u32, code_hash: [u8; CODE_HASH_LEN]) -> Self {
-        if version == 0 {
-            return Self::never_resolved();
+    /// # Errors
+    ///
+    /// Fails with [`PointerError::FloorVersion`] unless `version` is in
+    /// `1..=MAX_POINTER_VERSION`. Neither end is reachable from a real
+    /// resolution, so a floor at either one is corrupt caller state, and
+    /// guessing at it is unsafe in both directions: version 0 would read as
+    /// "never resolved" and unlock the baked-in fallback, while a version above
+    /// the maximum can never be superseded by a valid record. Surfacing the
+    /// corruption lets the caller decide.
+    ///
+    /// # Seeding from build-time knowledge
+    ///
+    /// A consumer that ships knowing the app's current version and code hash
+    /// should seed its first floor from those constants rather than starting at
+    /// [`Self::never_resolved`]. A first resolve has nothing to compare
+    /// against, so it adopts any validly-signed record, including a genuine but
+    /// superseded one that a peer chooses to serve. A build-time floor bounds
+    /// that.
+    pub fn at(version: u32, code_hash: [u8; CODE_HASH_LEN]) -> Result<Self, PointerError> {
+        if version == 0 || version > MAX_POINTER_VERSION {
+            return Err(PointerError::FloorVersion(version));
         }
+        Ok(Self::trusted(version, code_hash))
+    }
+
+    /// Internal constructor for a version this module has already verified to
+    /// be in range, because it came off a record that passed
+    /// [`PointerRecord::verify`].
+    fn trusted(version: u32, code_hash: [u8; CODE_HASH_LEN]) -> Self {
         Self {
             version,
             code_hash: Some(code_hash),
         }
+    }
+
+    /// The code hash accepted at [`Self::version`], or `None` when nothing has
+    /// ever resolved.
+    ///
+    /// Persist this together with the version. The pair is exactly what
+    /// [`Self::at`] takes, so a floor round-trips through a caller's own
+    /// storage without this module defining a serialization format.
+    #[must_use]
+    pub fn code_hash(&self) -> Option<[u8; CODE_HASH_LEN]> {
+        self.code_hash
     }
 
     /// The highest version verified so far; 0 when never resolved.
@@ -592,13 +658,26 @@ impl PointerFloor {
 }
 
 /// The result of a resolution attempt.
+///
+/// `#[non_exhaustive]`: a future outcome (for example, surfacing that a
+/// competing equal-version record exists) must not be a source break for
+/// downstream `match` sites.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PointerOutcome {
     /// A record strictly newer than the floor. Adopt its code hash, derive your
     /// key, and persist `(version, code_hash)` as the new floor.
     Resolved(ResolvedPointer),
-    /// The current record is the one the caller already had: same version, and
-    /// (where the floor carried one) the same code hash. Nothing to do.
+    /// The caller's floor already holds the winning record. Nothing to do.
+    ///
+    /// Two ways to get here, both at the caller's current version: the network
+    /// served the byte-identical record, or it served a *different*
+    /// equal-version record that lost the lower-code-hash tiebreak. Either way
+    /// the [`ResolvedPointer`] carries the **floor's** code hash and never a
+    /// losing served one, so acting on it can never switch keys.
+    ///
+    /// The second case means the author signed two records at one version,
+    /// which is a publisher mistake. It is not surfaced separately today.
     Unchanged(ResolvedPointer),
     /// The author has **withdrawn** this app: the current record carries the
     /// all-zero tombstone code hash. Stop resolving. Do not fall back to a
@@ -677,13 +756,20 @@ impl PointerOutcome {
     ///
     /// `None` for [`Self::NeverPublished`], [`Self::Stale`] and
     /// [`Self::Unavailable`], which learn nothing that moves the floor.
+    ///
+    /// To persist it across a restart, store [`PointerFloor::version`] and
+    /// [`PointerFloor::code_hash`] and rebuild with [`PointerFloor::at`]. That
+    /// pair is the whole floor, and it must be stored per
+    /// `(author_vk, app_id)`.
     #[must_use]
     pub fn next_floor(&self) -> Option<PointerFloor> {
         match self {
             Self::Resolved(r) | Self::Unchanged(r) => {
-                Some(PointerFloor::at(r.version, r.code_hash))
+                Some(PointerFloor::trusted(r.version, r.code_hash))
             }
-            Self::Withdrawn { version } => Some(PointerFloor::at(*version, TOMBSTONE_CODE_HASH)),
+            Self::Withdrawn { version } => {
+                Some(PointerFloor::trusted(*version, TOMBSTONE_CODE_HASH))
+            }
             Self::NeverPublished | Self::Stale { .. } | Self::Unavailable => None,
         }
     }
@@ -715,7 +801,11 @@ enum Phase {
 /// Every event method returns whether the event was accepted, so a caller
 /// pumping events by hand (the browser's shared-handler `WebApi`, which has no
 /// request/response correlation) can tell "ignored, still waiting" apart from
-/// "delivered" instead of hanging silently on a mis-correlated id.
+/// "delivered" rather than hanging silently. The gate catches an event for a
+/// *different* contract and one arriving before the GET was issued; it cannot
+/// separate two in-flight GETs for the **same** pointer, because there is no
+/// per-request nonce. Do not run two concurrent resolutions for one
+/// `(author_vk, app_id)` on a shared handler.
 #[derive(Debug)]
 pub struct PointerResolver {
     params: Vec<u8>,
@@ -770,6 +860,16 @@ impl PointerResolver {
     /// The [`Step::Get`] this emits wants neither the contract code nor a
     /// subscription — the 100-byte record is the whole answer, and fetching the
     /// pointer's own ~130 KB WASM on every resolve would be pure waste.
+    ///
+    /// Calling this **arms the event gate**: an event delivered before the
+    /// first `next_action()` is rejected (see [`Self::on_response`]), so use
+    /// [`Self::pointer_id`] if you only want to look at the address. The gate
+    /// correlates on the contract id alone, and a pointer's id is a pure
+    /// function of `(author_vk, app_id)`, so on a hand-pumped shared handler a
+    /// late event from a *superseded* GET for the same pointer is
+    /// indistinguishable from the live one. Ordering safety does not depend on
+    /// this (the floor gates every record), but it is why a shared handler
+    /// should not run two concurrent resolutions for one pointer.
     ///
     /// One resolution needs one GET, and the resolver does not retry:
     /// [`PointerOutcome::Unavailable`] is terminal for this instance. To retry,
@@ -864,6 +964,12 @@ impl PointerResolver {
         }
     }
 
+    /// The `Done` check is defensive redundancy: `outstanding` is set only by
+    /// `next_action`, which returns early once the phase is `Done`, and every
+    /// event handler clears `outstanding` before setting it. Kept because the
+    /// cost is one comparison and the failure it guards against (a finished
+    /// resolver accepting an event) is exactly the kind a future refactor
+    /// reintroduces.
     fn accepts(&self, id: ContractInstanceId) -> bool {
         self.outstanding && id == self.pointer_id && !matches!(self.phase, Phase::Done(_))
     }
@@ -888,11 +994,25 @@ impl PointerResolver {
     fn order(&self, record: PointerRecord) -> PointerOutcome {
         use core::cmp::Ordering;
 
-        // `PointerFloor::at` never yields a resolved floor without a code hash
-        // (and coerces version 0 to `never_resolved`), so `None` here means
-        // "nothing has ever resolved" and any valid record supersedes it.
-        let Some(floor_hash) = self.floor.code_hash else {
-            return self.adopt(record);
+        // Matched as a pair so the shape fails CLOSED. A floor with no code
+        // hash but a non-zero version is unconstructible today (private fields;
+        // `at` rejects version 0 and always stores a hash), but if a future
+        // constructor broke that invariant, an unconditional `adopt` on `None`
+        // would silently disable anti-rollback. Here it degrades to the version
+        // check instead.
+        let floor_hash = match self.floor.code_hash {
+            None if self.floor.version == 0 => return self.adopt(record),
+            None => {
+                return if record.version > self.floor.version {
+                    self.adopt(record)
+                } else {
+                    PointerOutcome::Stale {
+                        served: record.version,
+                        floor: self.floor.version,
+                    }
+                };
+            }
+            Some(hash) => hash,
         };
 
         match record.version.cmp(&self.floor.version) {
@@ -996,12 +1116,19 @@ pub trait PointerIo {
 /// Adapts an existing [`ProbeIo`] to [`PointerIo`] by mapping its ambiguous
 /// `Ok(None)` to [`PointerFetch::Unreachable`].
 ///
-/// The name is the warning. This is the **safe** mapping, not the complete one:
-/// `ProbeIo` cannot report a real negative answer, so a pointer resolved
-/// through this adapter can never return [`PointerOutcome::NeverPublished`] and
-/// a first-run consumer can never legitimately reach its baked-in fallback. Use
-/// it to reuse an adapter you already have; implement [`PointerIo`] directly
-/// when you need the first-run path.
+/// The name is the warning. Two limitations, both inherited from `ProbeIo`:
+///
+/// * **It cannot report a real negative answer**, so a pointer resolved through
+///   this adapter never returns [`PointerOutcome::NeverPublished`] and a
+///   first-run consumer never reaches its baked-in fallback.
+/// * **It fetches the contract code.** `ProbeIo::get` is specified as a GET
+///   with `return_contract_code: true`, which is right for a backward probe and
+///   pure waste here: it pulls the pointer's own ~130 KB WASM on every resolve
+///   to read a 100-byte record.
+///
+/// Implement [`PointerIo`] directly for anything that resolves often or needs
+/// the first-run path. Reach for this adapter to reuse plumbing you already
+/// have.
 #[derive(Debug)]
 pub struct ConservativeProbeIo<T>(pub T);
 
@@ -1092,11 +1219,24 @@ pub async fn resolve_app_pointer<IO: PointerIo>(
     loop {
         match resolver.next_action() {
             Step::Get(id) => {
-                match io.get_pointer(id).await.map_err(ResolveError::Transport)? {
+                let accepted = match io.get_pointer(id).await.map_err(ResolveError::Transport)? {
                     PointerFetch::State(bytes) => resolver.on_response(id, &bytes),
                     PointerFetch::Absent => resolver.on_absent(id),
                     PointerFetch::Unreachable => resolver.on_unreachable(id),
                 };
+                // The id came straight from `Step::Get`, so the resolver always
+                // accepts it and this loop runs at most twice. Bailing on a
+                // rejected event keeps a future change from spinning here
+                // forever: an unbounded loop turns a broken resolver into a
+                // CI *hang* rather than a test failure, which is far harder to
+                // read. The `debug_assert` makes it loud in development.
+                debug_assert!(
+                    accepted,
+                    "the resolver must accept the id it just asked for"
+                );
+                if !accepted {
+                    return Ok(PointerOutcome::Unavailable);
+                }
             }
             Step::Done => {
                 return resolver
@@ -1162,6 +1302,11 @@ mod tests {
         PointerFetch::State(bytes.to_vec())
     }
 
+    /// `PointerFloor::at` for a version these tests already know is in range.
+    fn floor(version: u32, code_hash: [u8; 32]) -> PointerFloor {
+        PointerFloor::at(version, code_hash).expect("test floor version is in range")
+    }
+
     // ---- happy path -----------------------------------------------------
 
     #[test]
@@ -1178,7 +1323,7 @@ mod tests {
         assert!(matches!(outcome, PointerOutcome::Resolved(_)));
         assert_eq!(
             outcome.next_floor(),
-            Some(PointerFloor::at(3, [0x11; 32])),
+            Some(floor(3, [0x11; 32])),
             "a resolution must advance the floor"
         );
     }
@@ -1186,17 +1331,17 @@ mod tests {
     #[test]
     fn a_newer_version_supersedes_the_floor() {
         let (vk, _params, s) = published(7, 9, [0x22; 32]);
-        let outcome = resolve_with(&vk, PointerFloor::at(4, [0x11; 32]), state(&s)).unwrap();
+        let outcome = resolve_with(&vk, floor(4, [0x11; 32]), state(&s)).unwrap();
         assert!(matches!(outcome, PointerOutcome::Resolved(r) if r.version() == 9));
     }
 
     #[test]
     fn the_same_record_again_is_unchanged_not_stale() {
         let (vk, _params, s) = published(7, 5, [0x33; 32]);
-        let outcome = resolve_with(&vk, PointerFloor::at(5, [0x33; 32]), state(&s)).unwrap();
+        let outcome = resolve_with(&vk, floor(5, [0x33; 32]), state(&s)).unwrap();
         assert!(matches!(outcome, PointerOutcome::Unchanged(r) if r.code_hash() == [0x33; 32]));
         assert!(!outcome.may_use_baked_in_fallback());
-        assert_eq!(outcome.next_floor(), Some(PointerFloor::at(5, [0x33; 32])));
+        assert_eq!(outcome.next_floor(), Some(floor(5, [0x33; 32])));
     }
 
     #[test]
@@ -1339,8 +1484,7 @@ mod tests {
         // The classic replay -- and also what a freshly-bootstrapped peer
         // serves by accident, which is why it is an outcome, not an error.
         let (vk, _params, old_state) = published(7, 2, [0xaa; 32]);
-        let outcome =
-            resolve_with(&vk, PointerFloor::at(6, [0xbb; 32]), state(&old_state)).unwrap();
+        let outcome = resolve_with(&vk, floor(6, [0xbb; 32]), state(&old_state)).unwrap();
         assert_eq!(
             outcome,
             PointerOutcome::Stale {
@@ -1366,7 +1510,7 @@ mod tests {
 
         // Holding the HIGHER hash, served the lower: adopt it.
         let (vk, _p, low_state) = published(7, 5, low);
-        let outcome = resolve_with(&vk, PointerFloor::at(5, high), state(&low_state)).unwrap();
+        let outcome = resolve_with(&vk, floor(5, high), state(&low_state)).unwrap();
         assert!(
             matches!(outcome, PointerOutcome::Resolved(r) if r.code_hash() == low),
             "the lower code hash must win, got {outcome:?}"
@@ -1375,7 +1519,7 @@ mod tests {
         // Holding the LOWER hash, served the higher: keep what we have -- and
         // report OUR hash, never the served one.
         let (_vk2, _p2, high_state) = published(7, 5, high);
-        let outcome = resolve_with(&vk, PointerFloor::at(5, low), state(&high_state)).unwrap();
+        let outcome = resolve_with(&vk, floor(5, low), state(&high_state)).unwrap();
         let PointerOutcome::Unchanged(r) = outcome else {
             panic!("expected Unchanged, got {outcome:?}");
         };
@@ -1396,8 +1540,8 @@ mod tests {
         let (vk, _p, low_state) = published(7, 5, low);
         let (_v, _p2, high_state) = published(7, 5, high);
 
-        let a = resolve_with(&vk, PointerFloor::at(5, high), state(&low_state)).unwrap();
-        let b = resolve_with(&vk, PointerFloor::at(5, low), state(&high_state)).unwrap();
+        let a = resolve_with(&vk, floor(5, high), state(&low_state)).unwrap();
+        let b = resolve_with(&vk, floor(5, low), state(&high_state)).unwrap();
         assert_eq!(
             a.next_floor().unwrap(),
             b.next_floor().unwrap(),
@@ -1475,8 +1619,7 @@ mod tests {
         // cannot legitimately become unpublished, so this must not read as
         // "never published" -- that would be a downgrade primitive.
         let vk = signing_key(7).verifying_key();
-        let outcome =
-            resolve_with(&vk, PointerFloor::at(4, [0x11; 32]), PointerFetch::Absent).unwrap();
+        let outcome = resolve_with(&vk, floor(4, [0x11; 32]), PointerFetch::Absent).unwrap();
         assert_eq!(outcome, PointerOutcome::Unavailable);
         assert!(!outcome.may_use_baked_in_fallback());
     }
@@ -1519,7 +1662,7 @@ mod tests {
         let (_vk, _p, s) = published(7, 3, [0x11; 32]);
         for outcome in [
             resolve_with(&vk, PointerFloor::never_resolved(), state(&s)).unwrap(),
-            resolve_with(&vk, PointerFloor::at(9, [0x11; 32]), state(&s)).unwrap(),
+            resolve_with(&vk, floor(9, [0x11; 32]), state(&s)).unwrap(),
             resolve_with(
                 &vk,
                 PointerFloor::never_resolved(),
@@ -1551,7 +1694,7 @@ mod tests {
     fn a_tombstone_is_withdrawn_and_carries_no_resolved_pointer() {
         assert_eq!(TOMBSTONE_CODE_HASH, [0u8; 32]);
         let (vk, _params, s) = published(7, 8, TOMBSTONE_CODE_HASH);
-        let outcome = resolve_with(&vk, PointerFloor::at(4, [0x11; 32]), state(&s)).unwrap();
+        let outcome = resolve_with(&vk, floor(4, [0x11; 32]), state(&s)).unwrap();
         assert_eq!(outcome, PointerOutcome::Withdrawn { version: 8 });
         assert!(outcome.resolved().is_none());
         assert!(
@@ -1572,16 +1715,24 @@ mod tests {
         let tomb = sign(&key, &params, 8, TOMBSTONE_CODE_HASH)
             .encode()
             .to_vec();
-        let outcome = resolve_with(&vk, PointerFloor::at(4, [0x11; 32]), state(&tomb)).unwrap();
-        let floor = outcome
+        let outcome = resolve_with(&vk, floor(4, [0x11; 32]), state(&tomb)).unwrap();
+        let after = outcome
             .next_floor()
             .expect("a withdrawal must advance the floor");
-        assert_eq!(floor, PointerFloor::at(8, TOMBSTONE_CODE_HASH));
+        assert_eq!(after, floor(8, TOMBSTONE_CODE_HASH));
+        // And it round-trips through a caller's own storage, which is what the
+        // documented persist flow depends on.
+        assert_eq!(after.version(), 8);
+        assert_eq!(after.code_hash(), Some(TOMBSTONE_CODE_HASH));
+        assert_eq!(
+            PointerFloor::at(after.version(), after.code_hash().unwrap()).unwrap(),
+            after
+        );
 
         // A real, validly-signed pre-withdrawal record no longer resurrects it.
         let pre = sign(&key, &params, 5, [0x55; 32]).encode().to_vec();
         assert_eq!(
-            resolve_with(&vk, floor, state(&pre)).unwrap(),
+            resolve_with(&vk, after, state(&pre)).unwrap(),
             PointerOutcome::Stale {
                 served: 5,
                 floor: 8
@@ -1589,8 +1740,33 @@ mod tests {
         );
         // Re-reading the withdrawal is still a withdrawal, not a resurrection.
         assert_eq!(
-            resolve_with(&vk, floor, state(&tomb)).unwrap(),
+            resolve_with(&vk, after, state(&tomb)).unwrap(),
             PointerOutcome::Withdrawn { version: 8 }
+        );
+    }
+
+    #[test]
+    fn a_tombstone_wins_an_equal_version_tie_against_real_code() {
+        // TOMBSTONE_CODE_HASH is all zeros, the minimum, so "lower code hash
+        // wins" makes a same-version withdrawal beat a real hash, in the
+        // contract's merge and here alike. Withdrawal is the safe way to
+        // resolve that tie.
+        let (vk, _params, tomb) = published(7, 5, TOMBSTONE_CODE_HASH);
+        assert_eq!(
+            resolve_with(&vk, floor(5, [0x11; 32]), state(&tomb)).unwrap(),
+            PointerOutcome::Withdrawn { version: 5 }
+        );
+    }
+
+    #[test]
+    fn real_code_cannot_win_an_equal_version_tie_against_a_tombstone() {
+        // The mirror image: already withdrawn at v, served real code at the
+        // same v. The tombstone is the lower hash, so the floor holds and the
+        // withdrawal is not undone without a version bump.
+        let (vk, _params, real) = published(7, 5, [0x11; 32]);
+        assert_eq!(
+            resolve_with(&vk, floor(5, TOMBSTONE_CODE_HASH), state(&real)).unwrap(),
+            PointerOutcome::Withdrawn { version: 5 }
         );
     }
 
@@ -1598,7 +1774,7 @@ mod tests {
     fn a_rolled_back_tombstone_is_still_refused() {
         let (vk, _params, s) = published(7, 2, TOMBSTONE_CODE_HASH);
         assert_eq!(
-            resolve_with(&vk, PointerFloor::at(6, [0x11; 32]), state(&s)).unwrap(),
+            resolve_with(&vk, floor(6, [0x11; 32]), state(&s)).unwrap(),
             PointerOutcome::Stale {
                 served: 2,
                 floor: 6
@@ -1735,14 +1911,134 @@ mod tests {
     // ---- the floor -------------------------------------------------------
 
     #[test]
-    fn a_floor_at_version_zero_is_never_resolved() {
-        // Version 0 can never be the result of a real resolution, so a floor
-        // claiming one is treated as "never resolved" rather than silently
-        // trusting a code hash that no record could have carried.
-        let floor = PointerFloor::at(0, [0x11; 32]);
-        assert_eq!(floor, PointerFloor::never_resolved());
-        assert!(!floor.has_ever_resolved());
-        assert_eq!(floor.version(), 0);
+    fn a_floor_outside_the_valid_version_range_is_refused() {
+        // Neither end can come from a real resolution, so both are corrupt
+        // caller state, and guessing is unsafe in OPPOSITE directions: version
+        // 0 would read as "never resolved" and unlock the baked-in fallback,
+        // while a version above the maximum could never be superseded.
+        assert_eq!(
+            PointerFloor::at(0, [0x11; 32]).unwrap_err(),
+            PointerError::FloorVersion(0)
+        );
+        assert_eq!(
+            PointerFloor::at(u32::MAX, [0x11; 32]).unwrap_err(),
+            PointerError::FloorVersion(u32::MAX)
+        );
+        assert!(PointerFloor::at(1, [0x11; 32]).is_ok());
+        assert!(PointerFloor::at(MAX_POINTER_VERSION, [0x11; 32]).is_ok());
+    }
+
+    #[test]
+    fn a_floor_round_trips_through_a_callers_own_storage() {
+        // The documented persist flow is "store version + code_hash, rebuild
+        // with at()". If the accessors could not express a floor, that flow
+        // would be unimplementable and the withdrawal-replay guard unbuildable.
+        let (vk, _p, s) = published(7, 3, [0x11; 32]);
+        let outcome = resolve_with(&vk, PointerFloor::never_resolved(), state(&s)).unwrap();
+        let next = outcome
+            .next_floor()
+            .expect("a resolution advances the floor");
+        let restored = PointerFloor::at(next.version(), next.code_hash().unwrap()).unwrap();
+        assert_eq!(restored, next);
+        assert_eq!(restored.version(), 3);
+        assert_eq!(restored.code_hash(), Some([0x11; 32]));
+        assert_eq!(PointerFloor::never_resolved().code_hash(), None);
+    }
+
+    /// Both params functions must apply the SAME rules.
+    ///
+    /// `pointer_params` builds the address the resolver actually derives, and
+    /// `parse_pointer_params` reads one back. A guard present in only one of
+    /// them is invisible to a test that exercises the other, which is exactly
+    /// how four deletions survived an earlier suite: the canonical-key check in
+    /// `pointer_params`, and the weak-key, charset and upper-length checks in
+    /// `parse_pointer_params`. Driving one bad-input table through both closes
+    /// that and stops the two drifting apart.
+    #[test]
+    fn both_params_functions_apply_the_same_rules() {
+        let good = signing_key(7).verifying_key();
+
+        // y = p exactly: decodes to a point, but is not the canonical encoding.
+        let mut non_canonical = [0xffu8; 32];
+        non_canonical[0] = 0xed;
+        non_canonical[31] = 0x7f;
+        // The guard is only meaningful if dalek accepts such a key, so prove it
+        // does rather than assuming the check is reachable.
+        let non_canonical_vk = VerifyingKey::from_bytes(&non_canonical)
+            .expect("dalek accepts a non-canonical y, which is why we check it ourselves");
+        assert!(!is_canonical_field_element(&non_canonical));
+
+        let weak = VerifyingKey::from_bytes(&[
+            0xc7, 0x17, 0x6a, 0x70, 0x3d, 0x4d, 0xd8, 0x4f, 0xba, 0x3c, 0x0b, 0x76, 0x0d, 0x10,
+            0x67, 0x0f, 0x2a, 0x20, 0x53, 0xfa, 0x2c, 0x39, 0xcc, 0xc6, 0x4e, 0xc7, 0xfd, 0x77,
+            0x92, 0xac, 0x03, 0x7a,
+        ])
+        .unwrap();
+        assert!(weak.is_weak());
+
+        let long = vec![b'a'; MAX_APP_ID_LEN + 1];
+        let cases: [(&str, VerifyingKey, &[u8], PointerError); 5] = [
+            (
+                "non-canonical author key",
+                non_canonical_vk,
+                APP_ID,
+                PointerError::ParamsKeyNonCanonical,
+            ),
+            (
+                "small-order author key",
+                weak,
+                APP_ID,
+                PointerError::ParamsKeyWeak,
+            ),
+            (
+                "uppercase app_id byte",
+                good,
+                b"River.Room",
+                PointerError::ParamsAppId(b'R'),
+            ),
+            (
+                "over-long app_id",
+                good,
+                &long,
+                PointerError::ParamsLength(VERIFYING_KEY_LEN + MAX_APP_ID_LEN + 1),
+            ),
+            (
+                "empty app_id",
+                good,
+                b"",
+                PointerError::ParamsLength(VERIFYING_KEY_LEN),
+            ),
+        ];
+
+        for (what, vk, app_id, expected) in cases {
+            assert_eq!(
+                pointer_params(&vk, app_id).unwrap_err(),
+                expected,
+                "pointer_params accepted {what}"
+            );
+            // Feed the same bad input to the parser as a raw blob.
+            let blob = [vk.as_bytes().as_slice(), app_id].concat();
+            assert_eq!(
+                parse_pointer_params(&blob).unwrap_err(),
+                expected,
+                "parse_pointer_params accepted {what}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_author_key_that_is_not_on_the_curve_is_refused() {
+        // Canonical `y`, but no corresponding curve point: the
+        // `VerifyingKey::from_bytes` failure path, which nothing else covers.
+        let mut bytes = [0u8; 32];
+        bytes[0] = 2; // y = 2 is not a valid compressed Ed25519 point
+        assert!(is_canonical_field_element(&bytes));
+        assert!(VerifyingKey::from_bytes(&bytes).is_err());
+        let blob = [&bytes[..], APP_ID].concat();
+        assert_eq!(
+            parse_pointer_params(&blob).unwrap_err(),
+            PointerError::ParamsKey
+        );
     }
 
     // ---- driver semantics ------------------------------------------------
@@ -1990,7 +2286,7 @@ mod tests {
                 &mut io,
                 &vk,
                 APP_ID,
-                PointerFloor::at(6, [0xbb; 32])
+                floor(6, [0xbb; 32])
             ))
             .unwrap(),
             PointerOutcome::Stale {
