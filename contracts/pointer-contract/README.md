@@ -57,6 +57,39 @@ This contract is the missing forward reference. See
 
 ## Consumer side: resolving a pointer
 
+> ### Rust integrators: use the `freenet-migrate` resolver, not the steps below
+>
+> `freenet-migrate` ships `freenet_migrate::pointer`, a resolver built directly
+> against this contract's wire format. It carries the anti-rollback floor, the
+> absence-vs-unreachability distinction, and key derivation, none of which a
+> hand-rolled `PointerRecord::decode_verified` call gets for free. Each
+> integrator that decodes records itself has to re-derive the rules in Step 4
+> below on its own.
+>
+> ```rust
+> use freenet_migrate::pointer::{resolve_app_pointer, PointerFloor, PointerOutcome};
+>
+> // floor starts at `PointerFloor::never_resolved()`; persist
+> // `outcome.next_floor()` and pass it back on the next call, keyed by
+> // (author_vk, app_id).
+> let outcome = resolve_app_pointer(&mut io, &author_vk, b"river.room-contract", floor).await?;
+>
+> if let Some(record) = outcome.resolved() {
+>     let key = record.contract_id(&my_own_params); // your own instance's params
+> }
+> ```
+>
+> `io` implements the `PointerIo` trait (an async `PointerFetch` GET); wrap an
+> existing `ProbeIo` with `ConservativeProbeIo` if you have one already. See the
+> module docs on `freenet_migrate::pointer` for the full API
+> (`PointerResolver` is the sans-IO driver for environments without awaitable
+> request/response correlation, e.g. the browser's shared-handler `WebApi`).
+>
+> The rest of this section documents the same resolution by hand: the wire
+> format and the raw `PointerRecord` path. It is what the resolver above does
+> internally, and it is still where you should look if you are implementing a
+> consumer in a language other than Rust, or want the primitives directly.
+
 This is the part integrators get wrong, so here it is exactly.
 
 ### The shapes
@@ -237,11 +270,19 @@ zero bytes; it addresses a contract that does not exist.
 Persist `(highest_version_ever_verified, resolved_key)`, not merely "I know a
 pointer exists".
 
-- Reject any record whose `version` is `<=` your highest ever seen. The contract
-  enforces monotonicity across the network, but a node that holds no copy yet
-  (freshly bootstrapped, recently evicted) can transiently serve an older validly
-  signed record, because `validate_state` has no prior state to compare against.
-  Your own high-water mark is what closes that window for you.
+- Reject any record whose `version` is strictly less than your highest ever
+  seen. The contract enforces monotonicity across the network, but a node that
+  holds no copy yet (freshly bootstrapped, recently evicted) can transiently
+  serve an older validly signed record, because `validate_state` has no prior
+  state to compare against. Your own high-water mark is what closes that
+  window for you.
+- At an **equal** version, a byte-identical record is a no-op: keep what you
+  have. A record that is equal in version but names a **different** code hash
+  can only come from the author signing two records at the same version (a
+  retried or threshold-signed publish); break the tie the same way the
+  contract's own `merge` does, on the **lower** code hash, so that two
+  consumers who saw different equal-version records converge on the same
+  answer instead of splitting permanently.
 - Fall back to your baked-in key **only if a pointer has never resolved on this
   install**. Once one has, an unresolvable pointer means *unavailable* — say so,
   or use the last-known-good resolved key. Silently regressing to the baked-in

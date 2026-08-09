@@ -210,8 +210,12 @@ first). Native callers with awaitable I/O can use the pumped wrapper
 `migrate_contract(ops, io, local, &params, lineage, policy)` instead of the
 raw driver.
 
-Optionally publish an author-signed pointer from v1 → v2 so clients can discover
-the successor:
+Optionally record an author-signed pointer from v1 → v2 for your own use. Note
+this is a **local primitive only**: nothing addresses it, publishes it or
+consumes it on the network, and it is not the ecosystem's forward-discovery
+mechanism. For that, see 2c, which resolves the canonical pointer contract.
+`SuccessorPointer` uses a different signing domain and message layout and the
+two are not interchangeable.
 
 ```rust,ignore
 use freenet_migrate::ReleaseSigner;
@@ -235,33 +239,65 @@ has no lineage to walk. For that, resolve the author's
 its address is derivable offline from `(author_vk, app_id)`, and its state names
 the app's current `code_hash`.
 
-```rust,ignore
-use freenet_migrate::{resolve_successor_pointer, PointerFloor, PointerOutcome};
+> **Nothing has published a pointer yet.** The contract's WASM is frozen and
+> CI-enforced, but it has not been published to the network and the first
+> publish is gated on a manual end-to-end run (see the STOP box in
+> [FREENET.md](./FREENET.md)). Until then every resolve returns `Unavailable`.
 
-// `floor` is what you already verified — persist (version, code_hash) and pass
-// it back next time. It is the anti-rollback anchor.
+```rust,ignore
+use freenet_migrate::{resolve_app_pointer, PointerFloor, PointerOutcome};
+
+// `floor` is what you already verified. Persist it per (author_vk, app_id) and
+// pass it back: it is the anti-rollback anchor.
 let floor = stored_floor.unwrap_or_else(PointerFloor::never_resolved);
 
-match resolve_successor_pointer(&mut io, &AUTHOR_VK, b"river.room-contract", floor).await? {
+let outcome = match resolve_app_pointer(&mut io, &AUTHOR_VK, b"river.room-contract", floor).await {
+    Ok(outcome) => outcome,
+    // A rejected record says nothing about whether a pointer exists, so this
+    // must never fall back. `err.may_use_baked_in_fallback()` is always false.
+    Err(err) => return keep_last_resolved(err),
+};
+
+// Persist first: this is what stops a later replay, including after a
+// withdrawal.
+if let Some(next) = outcome.next_floor() {
+    persist_floor(next);
+}
+
+match outcome {
     PointerOutcome::Resolved(p) | PointerOutcome::Unchanged(p) => {
         // Step 3, the one integrators get wrong: combine the pointer's
         // code_hash with YOUR OWN params, not the pointer's.
-        let key = p.contract_id(&my_own_params);
-        persist(p.version(), p.code_hash());
+        use_key(p.contract_id(&my_own_params));
     }
+    // The author withdrew the app. There is no current code; do not fall back.
     PointerOutcome::Withdrawn { .. } => stop_resolving(),
+    // A peer served an older record. Routine on a freshly-bootstrapped node,
+    // not an attack signal. Already refused; keep what you have and retry.
+    PointerOutcome::Stale { .. } => keep_last_resolved_and_retry(),
     // The ONLY case where falling back to your build-time key is safe.
-    o if o.may_use_baked_in_fallback() => use_baked_in_key(),
-    // Unavailable: keep using whatever you last resolved. Never downgrade.
-    _ => keep_last_resolved(),
+    PointerOutcome::NeverPublished => use_baked_in_key(),
+    // Timed out, unreachable, or an empty body. Never downgrade on this.
+    PointerOutcome::Unavailable => keep_last_resolved_and_retry(),
 }
 ```
 
 Signature verification is local and never trusts the responding node, and
 `ResolvedPointer` has no public constructor, so the only way to hold one is to
-have resolved it. **Note the trust model:** the `author_vk` you pass in is the
-entire trust anchor — there is no delegation, rotation or revocation, and that
-question is still open on freenet-core#5194.
+have resolved it. `may_use_baked_in_fallback()` exists on both the outcome and
+the error so no caller has to re-derive when a fallback is legitimate: only
+`NeverPublished`, ever.
+
+Reaching `NeverPublished` needs a `PointerIo` that can report a real
+`PointerFetch::Absent`. If you wrap an existing `ProbeIo` in
+`ConservativeProbeIo`, its ambiguous `Ok(None)` maps to `Unreachable`, so that
+adapter can never unlock the fallback.
+
+**Trust model:** the `author_vk` you pass in is the entire trust anchor. Per
+freenet-core#5194's settled decisions there is no delegated signing and no
+in-protocol rotation; rotation is by convention, so publishers should use a
+dedicated long-lived pointer key kept offline. A stolen author key is
+unmitigated at this layer.
 
 ### 3. Delegate secret carry-forward (runtime)
 

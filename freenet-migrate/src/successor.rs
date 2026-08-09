@@ -11,6 +11,30 @@
 //! **unmitigated** and must be managed out of band. The only constructor for a
 //! signer is [`ReleaseSigner::from_key`], so a pointer cannot be minted without
 //! the key.
+//!
+//! # Not the pointer contract
+//!
+//! This primitive is **not** [`crate::pointer`], the canonical pointer
+//! contract's resolver, and the two are not interchangeable:
+//!
+//! * **Signing domain.** `SuccessorPointer` signs under
+//!   `freenet-migrate/successor-v1`; the pointer contract signs under
+//!   `freenet-pointer/state-v1`. A signature under one domain never verifies
+//!   under the other.
+//! * **Message layout.** `SuccessorPointer` signs
+//!   `successor_code_hash ‖ generation_le ‖ app_id`, generation
+//!   little-endian, with no binding to the target contract's params. The
+//!   pointer contract signs `params ‖ version_be ‖ code_hash`, binding the
+//!   whole params blob, which is what stops a record signed for one app being
+//!   replayed into another pointer belonging to the same author.
+//! * **`app_id`.** Here it is free-form bytes, any non-empty slice the caller
+//!   chooses. In [`crate::pointer`] it is address-forming: `1..=64` bytes
+//!   restricted to lowercase ASCII (`a-z 0-9 . - _`), because it is part of
+//!   the pointer's own params and therefore part of its key.
+//!
+//! For forward discovery via the canonical, frozen pointer contract, use
+//! [`crate::pointer`] (`resolve_app_pointer` / `PointerResolver`) instead of
+//! this module. This module is shipped by nobody today.
 
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};

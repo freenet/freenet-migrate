@@ -230,6 +230,79 @@ fn derived_addresses_match_the_published_vectors() {
     assert_published(&doc, "the frozen pointer code hash", POINTER_CODE_HASH_B58);
 }
 
+/// The resolver's own mirrored constants, asserted against **literals**.
+///
+/// Every unit test in `pointer.rs` refers to these symbolically, so it checks
+/// the code against itself and a drift here would pass unnoticed. The contract
+/// source-scrape below pins the same numbers on the other side, so together
+/// these two tests make a divergence in either direction fail.
+#[test]
+fn the_resolvers_mirrored_constants_match_the_contracts_literals() {
+    use freenet_migrate::pointer::{
+        MAX_APP_ID_LEN, MAX_POINTER_PARAMS_LEN, MAX_POINTER_VERSION, MIN_POINTER_PARAMS_LEN,
+        POINTER_STATE_LEN, SIGNATURE_LEN, TOMBSTONE_CODE_HASH, VERIFYING_KEY_LEN,
+    };
+    assert_eq!(POINTER_SIGNING_DOMAIN, b"freenet-pointer/state-v1");
+    assert_eq!(POINTER_STATE_LEN, 100);
+    assert_eq!(MAX_APP_ID_LEN, 64);
+    assert_eq!(MAX_POINTER_VERSION, u32::MAX - 1);
+    assert_eq!(TOMBSTONE_CODE_HASH, [0u8; 32]);
+    assert_eq!(VERIFYING_KEY_LEN, 32);
+    assert_eq!(SIGNATURE_LEN, 64);
+    assert_eq!(MIN_POINTER_PARAMS_LEN, 33);
+    assert_eq!(MAX_POINTER_PARAMS_LEN, 96);
+}
+
+/// The resolver must verify **exactly as strictly** as the contract.
+///
+/// A silent `verify_strict` -> `verify` regression would make this resolver
+/// strictly MORE permissive than the frozen node (small-order `R`,
+/// non-canonical `A`, the cofactored equation), i.e. it would adopt a code hash
+/// the network would never store. That mutation is invisible to the behavioural
+/// tests, because the `S + L` malleability vector is rejected by dalek's
+/// S-canonicity check under both functions -- so it is pinned here on the
+/// source instead. Reads `src/pointer.rs`; the needles live in this file, so
+/// there is no self-match.
+#[test]
+fn the_resolver_still_verifies_the_way_the_contract_does() {
+    let src: String =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/pointer.rs"))
+            .expect("the resolver's own source must be readable")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+
+    for (what, needle) in [
+        (
+            "strict signature verification",
+            ".verify_strict(&msg,&Signature::from_bytes(&self.signature))",
+        ),
+        (
+            "the canonical-encoding check on the author key",
+            "if!is_canonical_field_element(&key){returnErr(PointerError::ParamsKeyNonCanonical);}",
+        ),
+        (
+            "the small-order author-key rejection",
+            "ifauthor_vk.is_weak(){returnErr(PointerError::ParamsKeyWeak);}",
+        ),
+        (
+            "the signed-message field order",
+            concat!(
+                "m.extend_from_slice(POINTER_SIGNING_DOMAIN);",
+                "m.extend_from_slice(params);",
+                "m.extend_from_slice(&version.to_be_bytes());",
+                "m.extend_from_slice(code_hash);",
+            ),
+        ),
+    ] {
+        assert!(
+            src.contains(needle),
+            "{what} changed in freenet-migrate/src/pointer.rs. The resolver must stay              exactly as strict as the frozen contract; being more permissive means              adopting a code hash the network would never store.
+Expected to find: {needle}"
+        );
+    }
+}
+
 /// Whitespace-stripped source scrape of the contract, so `cargo fmt` on the
 /// other side of the repo cannot break the pin, but a semantic change does.
 #[test]
@@ -266,8 +339,12 @@ fn the_contract_source_still_says_what_this_resolver_assumes() {
         ),
         (
             "the signed-message field order",
-            "m.extend_from_slice(SIGNING_DOMAIN);m.extend_from_slice(params);\
-             m.extend_from_slice(&version.to_be_bytes());m.extend_from_slice(code_hash);",
+            concat!(
+                "m.extend_from_slice(SIGNING_DOMAIN);",
+                "m.extend_from_slice(params);",
+                "m.extend_from_slice(&version.to_be_bytes());",
+                "m.extend_from_slice(code_hash);",
+            ),
         ),
         (
             "strict signature verification",

@@ -10,6 +10,11 @@ repository = "https://github.com/freenet/freenet-migrate"
 readme = "README.md"
 keywords = ["freenet", "migration", "upgrade", "contract", "delegate"]
 categories = ["cryptography::cryptocurrencies", "web-programming"]
+# The parity test pins this crate's pointer wire format against the frozen
+# contract at ../contracts/pointer-contract, which is outside this package. It
+# is a repo-CI guard, so it ships nowhere: left in, `cargo test` on an unpacked
+# published crate would panic on the missing files.
+exclude = ["tests/pointer_contract_parity.rs"]
 
 [features]
 # Target profiles, mirroring freenet-stdlib's wasm/native split.
