@@ -213,13 +213,18 @@ impl FoldAllAck {
     }
 }
 
-/// What the app should do next. Obtained from [`ProbeDriver::next_action`].
+/// What the app should do next. Obtained from [`ProbeDriver::next_action`], or
+/// from [`crate::PointerResolver::next_action`] on the forward-discovery path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Step {
     /// Send a GET for this candidate (with `return_contract_code: true`,
     /// without subscribing — never subscribe to a legacy key), and arm a
     /// timeout (see [`RECOMMENDED_PROBE_TIMEOUT_MS`]). Deliver the result via
     /// [`ProbeDriver::on_response`] / [`ProbeDriver::on_timeout`].
+    ///
+    /// A [`crate::PointerResolver`] emits the same step for the pointer
+    /// contract, where the GET needs neither the code nor a subscription — the
+    /// 100-byte record is the whole answer.
     Get(ContractInstanceId),
     /// The probe is finished; adopt the outcome. Repeated calls keep
     /// returning this.

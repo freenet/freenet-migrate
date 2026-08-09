@@ -16,7 +16,14 @@
 //!   [`freenet_scaffold::ComposableState`]) with a fail-closed `verify()` gate;
 //!   [`predecessor_ids`] (backward probe) and [`resolve_predecessors`]
 //!   (in-contract pull).
-//! * **Author-signed successor pointer** — [`SuccessorPointer`] / [`ReleaseSigner`].
+//! * **Forward discovery** — [`resolve_successor_pointer`] / [`PointerResolver`]
+//!   resolve an author's canonical pointer contract (freenet-core#5194) to the
+//!   `code_hash` that is current *now*, with local signature verification and
+//!   an anti-rollback [`PointerFloor`]. This is the only entry point that looks
+//!   forward; everything else here walks backward through predecessors.
+//! * **Author-signed successor pointer** — [`SuccessorPointer`] / [`ReleaseSigner`],
+//!   an older, unrelated primitive with its own signing domain (not the pointer
+//!   contract's; the two are not interchangeable).
 //! * **Delegate carry-forward** — the app-facing [`migrate_delegate_secrets`] /
 //!   [`register_delegate_with_migration`] entry points (consent-parameterized via
 //!   [`MigrationAuthorization`]) over the [`PredecessorSecretsIo`] adapter, plus
@@ -55,6 +62,7 @@ pub mod delegate_migrate;
 pub mod driver;
 pub mod error;
 pub mod lineage;
+pub mod pointer;
 pub mod successor;
 
 pub use contract::{
@@ -80,4 +88,10 @@ pub use driver::{
 };
 pub use error::MigrateError;
 pub use lineage::{ContractLineageEntry, DelegateLineageEntry, Lineage};
+pub use pointer::{
+    parse_pointer_params, pointer_contract_id, pointer_params, pointer_signing_message,
+    resolve_successor_pointer, PointerError, PointerFloor, PointerOutcome, PointerRecord,
+    PointerResolver, ResolveError, ResolvedPointer, MAX_APP_ID_LEN, MAX_POINTER_VERSION,
+    POINTER_CODE_HASH_B58, POINTER_SIGNING_DOMAIN, POINTER_STATE_LEN, TOMBSTONE_CODE_HASH,
+};
 pub use successor::{ReleaseSigner, SuccessorPointer};

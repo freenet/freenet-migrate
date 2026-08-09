@@ -1,0 +1,293 @@
+//! Parity between this crate's pointer resolver and the frozen pointer
+//! contract it must agree with, byte for byte.
+//!
+//! `freenet-migrate/src/pointer.rs` deliberately re-implements the pointer wire
+//! format instead of depending on `contracts/pointer-contract/`: that crate is
+//! workspace-excluded and unpublished on purpose (its compiled bytes must never
+//! move), and a crates.io crate cannot carry a git or path dependency on it.
+//!
+//! Duplication is only safe if drift is loud, so this file pins it from both
+//! sides:
+//!
+//! 1. Against the contract's committed `TEST-VECTORS.md` — the artifact that
+//!    exists so a non-Rust implementation can be checked, and which the
+//!    contract's own CI recomputes against its implementation. Every value here
+//!    is asserted to be **both** what this crate produces **and** present in
+//!    that document, so a change on either side goes red.
+//! 2. Against the contract's `CODEHASH`, the root of the whole convention.
+//! 3. Against the constants and the verification call in the contract's source,
+//!    so a change to the signing domain, the layout, or the strictness of the
+//!    signature check cannot land silently on the other side of the repo.
+//!
+//! These read files outside this package. They are integration tests, never
+//! compiled into the published artifact, and a missing file is a hard failure
+//! rather than a skip: a pin that can quietly not run is not a pin.
+
+use ed25519_dalek::{Signer, SigningKey};
+use freenet_migrate::pointer::{
+    pointer_contract_id, pointer_params, pointer_signing_message, PointerRecord,
+    POINTER_CODE_HASH_B58, POINTER_SIGNING_DOMAIN,
+};
+use freenet_stdlib::prelude::{ContractCode, ContractInstanceId, Parameters};
+
+// ---------------------------------------------------------------------------
+// The published vectors. Changing any of these is a change to the ecosystem's
+// wire format, not a test fixup.
+// ---------------------------------------------------------------------------
+
+/// 32 bytes of 0x01 — the seed `TEST-VECTORS.md` publishes.
+const SEED: [u8; 32] = [1u8; 32];
+const AUTHOR_VK_HEX: &str = "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c";
+const APP_ID: &[u8] = b"river.room-contract";
+const VERSION: u32 = 7;
+const CODE_HASH: [u8; 32] = [0xAAu8; 32];
+
+const PARAMS_HEX: &str = concat!(
+    "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
+    "72697665722e726f6f6d2d636f6e7472616374",
+);
+
+const SIGNING_MESSAGE_HEX: &str = concat!(
+    "667265656e65742d706f696e7465722f73746174652d7631",
+    "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
+    "72697665722e726f6f6d2d636f6e7472616374",
+    "00000007",
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+);
+
+const SIGNATURE_HEX: &str = concat!(
+    "ee3c33cf7bac4f2c2dc4d3a0eff2300a12174d44084f340d6d68c98d63a63953",
+    "5fece9eed85c2218af2ba566bda24f4c63ec2fca140f6a35bc6230811f27a10d",
+);
+
+const STATE_HEX: &str = concat!(
+    "00000007",
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "ee3c33cf7bac4f2c2dc4d3a0eff2300a12174d44084f340d6d68c98d63a63953",
+    "5fece9eed85c2218af2ba566bda24f4c63ec2fca140f6a35bc6230811f27a10d",
+);
+
+const POINTER_KEY_B58: &str = "Hjus5Fnb6NWxKGN64MQwmbgk1Vd6YojykLtxnXipR6Lx";
+const CONSUMER_PARAMS: &[u8] = b"example-consumer-params";
+const CONSUMER_INSTANCE_ID_B58: &str = "k2Nt3AT6K7L9obj1GwogHN2dpzY1MVaz9AAhXbLBkAS";
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn contract_file(relative: &str) -> String {
+    let path = format!(
+        "{}/../contracts/pointer-contract/{relative}",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    std::fs::read_to_string(&path).unwrap_or_else(|e| {
+        panic!(
+            "the pointer contract's {relative} must be readable to pin parity against it \
+             ({path}): {e}"
+        )
+    })
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn unhex(s: &str) -> Vec<u8> {
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("valid hex"))
+        .collect()
+}
+
+/// `TEST-VECTORS.md` with its inline `<- annotations` and all whitespace
+/// removed, so a multi-line hex block reads as one contiguous string.
+fn normalized_vectors() -> String {
+    contract_file("TEST-VECTORS.md")
+        .lines()
+        .map(|line| line.split("<-").next().unwrap_or(line))
+        .collect::<Vec<_>>()
+        .join("")
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect()
+}
+
+fn assert_published(doc: &str, label: &str, value: &str) {
+    assert!(
+        doc.contains(value),
+        "{label} is not in the contract's TEST-VECTORS.md any more: {value}\n\
+         Either the contract's wire format moved (this resolver must move with it) \
+         or the vectors were edited. Do not update this constant without \
+         establishing which."
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn pointer_code_hash_matches_the_frozen_artifact() {
+    let committed = contract_file("CODEHASH");
+    let value = committed
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty() && !l.starts_with('#'))
+        .expect("CODEHASH carries one non-comment line");
+    assert_eq!(
+        value, POINTER_CODE_HASH_B58,
+        "the frozen pointer WASM's code hash moved. Every published pointer \
+         re-keys when that happens; this is a flag day, not a constant bump."
+    );
+}
+
+#[test]
+fn params_encoding_matches_the_published_vector() {
+    let vk = SigningKey::from_bytes(&SEED).verifying_key();
+    assert_eq!(hex(vk.as_bytes()), AUTHOR_VK_HEX);
+
+    let params = pointer_params(&vk, APP_ID).unwrap();
+    assert_eq!(hex(&params), PARAMS_HEX);
+    assert_eq!(params.len(), 51);
+
+    let doc = normalized_vectors();
+    assert_published(&doc, "the author verifying key", AUTHOR_VK_HEX);
+    assert_published(&doc, "the params encoding", PARAMS_HEX);
+}
+
+#[test]
+fn signing_message_matches_the_published_vector() {
+    let params = unhex(PARAMS_HEX);
+    let msg = pointer_signing_message(&params, VERSION, &CODE_HASH);
+    assert_eq!(hex(&msg), SIGNING_MESSAGE_HEX);
+    assert_eq!(msg.len(), 111);
+    // The domain is a prefix, and it is the one the contract uses.
+    assert!(msg.starts_with(POINTER_SIGNING_DOMAIN));
+    assert_eq!(POINTER_SIGNING_DOMAIN, b"freenet-pointer/state-v1");
+
+    assert_published(
+        &normalized_vectors(),
+        "the signing message",
+        SIGNING_MESSAGE_HEX,
+    );
+}
+
+#[test]
+fn the_published_signature_verifies_and_is_reproduced_byte_for_byte() {
+    let key = SigningKey::from_bytes(&SEED);
+    let vk = key.verifying_key();
+    let params = pointer_params(&vk, APP_ID).unwrap();
+
+    // Ed25519 signing is deterministic (RFC 8032), so this must be the exact
+    // published signature — not merely *a* valid one.
+    let produced = key.sign(&pointer_signing_message(&params, VERSION, &CODE_HASH));
+    assert_eq!(hex(&produced.to_bytes()), SIGNATURE_HEX);
+
+    // And this crate's verifier accepts the published record.
+    let record = PointerRecord::decode(&unhex(STATE_HEX)).unwrap();
+    assert_eq!(record.version, VERSION);
+    assert_eq!(record.code_hash, CODE_HASH);
+    assert_eq!(hex(&record.signature), SIGNATURE_HEX);
+    record
+        .verify(&params, &vk)
+        .expect("the published vector must verify under this crate's rules");
+    assert_eq!(hex(&record.encode()), STATE_HEX);
+
+    let doc = normalized_vectors();
+    assert_published(&doc, "the signature", SIGNATURE_HEX);
+    assert_published(&doc, "the state encoding", STATE_HEX);
+}
+
+#[test]
+fn derived_addresses_match_the_published_vectors() {
+    let vk = SigningKey::from_bytes(&SEED).verifying_key();
+
+    // The pointer's own address, from the frozen code hash + its params.
+    let pointer = pointer_contract_id(&vk, APP_ID).unwrap();
+    assert_eq!(pointer.encode(), POINTER_KEY_B58);
+
+    // And step 3: the consumer's own key, from the record's code_hash plus the
+    // CONSUMER's params — not the pointer's.
+    let record = PointerRecord::decode(&unhex(STATE_HEX)).unwrap();
+    let mine = Parameters::from(CONSUMER_PARAMS.to_vec());
+    let derived = freenet_migrate::contract_id_from_code_hash(&record.code_hash, &mine);
+    assert_eq!(derived.encode(), CONSUMER_INSTANCE_ID_B58);
+
+    // The vectors cannot cover this leg (no WASM is known whose hash is
+    // 0xAA…AA), so pin the derivation itself against stdlib over real code:
+    // whatever a node computes from (code, params), step 3 computes from
+    // (code_hash, params).
+    let code = ContractCode::from(b"pretend this is the app's current wasm".to_vec());
+    assert_eq!(
+        freenet_migrate::contract_id_from_code_hash(code.hash(), &mine),
+        ContractInstanceId::from_params_and_code(&mine, &code),
+        "step-3 derivation diverged from stdlib's own key derivation"
+    );
+
+    let doc = normalized_vectors();
+    assert_published(&doc, "the pointer key", POINTER_KEY_B58);
+    assert_published(&doc, "the derived consumer id", CONSUMER_INSTANCE_ID_B58);
+    assert_published(&doc, "the frozen pointer code hash", POINTER_CODE_HASH_B58);
+}
+
+/// Whitespace-stripped source scrape of the contract, so `cargo fmt` on the
+/// other side of the repo cannot break the pin, but a semantic change does.
+#[test]
+fn the_contract_source_still_says_what_this_resolver_assumes() {
+    let src: String = contract_file("src/lib.rs")
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+
+    for (what, needle) in [
+        (
+            "the signing domain",
+            r#"pubconstSIGNING_DOMAIN:&[u8]=b"freenet-pointer/state-v1";"#,
+        ),
+        (
+            "the 100-byte state layout",
+            "pubconstSTATE_LEN:usize=4+CODE_HASH_LEN+SIGNATURE_LEN;",
+        ),
+        (
+            "the reserved top version",
+            "pubconstMAX_VERSION:u32=u32::MAX-1;",
+        ),
+        (
+            "the app_id length bound",
+            "pubconstMAX_APP_ID_LEN:usize=64;",
+        ),
+        (
+            "the app_id charset",
+            "b.is_ascii_lowercase()||b.is_ascii_digit()||b==b'.'||b==b'-'||b==b'_'",
+        ),
+        (
+            "the tombstone code hash",
+            "pubconstTOMBSTONE_CODE_HASH:[u8;CODE_HASH_LEN]=[0u8;CODE_HASH_LEN];",
+        ),
+        (
+            "the signed-message field order",
+            "m.extend_from_slice(SIGNING_DOMAIN);m.extend_from_slice(params);\
+             m.extend_from_slice(&version.to_be_bytes());m.extend_from_slice(code_hash);",
+        ),
+        (
+            "strict signature verification",
+            ".verify_strict(&msg,&Signature::from_bytes(&self.signature))",
+        ),
+        (
+            "the canonical-encoding check on the author key",
+            "if!is_canonical_field_element(&key){returnErr(PointerError::ParamsKeyNonCanonical);}",
+        ),
+        (
+            "the small-order author-key rejection",
+            "ifauthor_vk.is_weak(){returnErr(PointerError::ParamsKeyWeak);}",
+        ),
+    ] {
+        assert!(
+            src.contains(needle),
+            "{what} changed in contracts/pointer-contract/src/lib.rs. \
+             freenet-migrate's resolver mirrors that format and must be updated \
+             with it (and the contract's WASM freeze reviewed).\nExpected to \
+             find: {needle}"
+        );
+    }
+}
