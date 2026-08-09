@@ -271,7 +271,9 @@ let outcome = match resolve_app_pointer(&mut io, &AUTHOR_VK, b"river.room-contra
 // withdrawal (a tombstone is a signed record at a version like any other, so
 // its version has to become your floor or a pre-withdrawal record replays).
 if let Some(next) = outcome.next_floor() {
-    store_floor(&AUTHOR_VK, b"river.room-contract", next.version(), next.code_hash());
+    // `next_floor()` always carries a hash, so the `expect` cannot fire.
+    let code_hash = next.code_hash().expect("a floor that advances carries a code hash");
+    store_floor(&AUTHOR_VK, b"river.room-contract", next.version(), code_hash);
 }
 
 match outcome {
@@ -290,6 +292,9 @@ match outcome {
     PointerOutcome::NeverPublished => use_baked_in_key(),
     // Timed out, unreachable, or an empty body. Never downgrade on this.
     PointerOutcome::Unavailable => keep_last_resolved_and_retry(),
+    // `PointerOutcome` is #[non_exhaustive]: a future variant must not silently
+    // take a fallback path, so treat anything unrecognised as "learned nothing".
+    _ => keep_last_resolved_and_retry(),
 }
 ```
 

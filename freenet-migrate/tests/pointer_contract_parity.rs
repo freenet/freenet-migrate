@@ -75,6 +75,26 @@ const CONSUMER_INSTANCE_ID_B58: &str = "k2Nt3AT6K7L9obj1GwogHN2dpzY1MVaz9AAhXbLB
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// The part of a Rust source file before its test module.
+///
+/// A source-scrape needle satisfied by a string literal inside `#[cfg(test)]`
+/// pins nothing, so every scrape in this file is scoped through here. Panics if
+/// no marker is found rather than returning the whole file: failing open would
+/// discard the protection silently.
+fn production_prefix<'a>(source: &'a str, what: &str) -> &'a str {
+    // Both spellings in this repo: plain, and the contract's target-gated form.
+    for marker in ["#[cfg(test)]", "#[cfg(all(test"] {
+        if let Some((before, _)) = source.split_once(marker) {
+            return before;
+        }
+    }
+    panic!(
+        "{what} has no recognised #[cfg(test)] marker, so this scrape cannot be \
+         scoped to production code. Add the new spelling to `production_prefix` \
+         rather than letting the scrape silently cover the test module."
+    )
+}
+
 fn contract_file(relative: &str) -> String {
     let path = format!(
         "{}/../contracts/pointer-contract/{relative}",
@@ -253,6 +273,20 @@ fn the_resolvers_mirrored_constants_match_their_expected_literals() {
     assert_eq!(MAX_POINTER_PARAMS_LEN, 96);
 }
 
+/// Strip `//` line comments from already-whitespace-free source.
+///
+/// Without this, commenting the old call out and writing a new one below it
+/// satisfies a `contains` needle, which is ordinary developer behaviour rather
+/// than a contrived attack. The thing that silently un-pins here is the
+/// resolver becoming MORE permissive than the frozen network.
+fn strip_line_comments(source: &str) -> String {
+    source
+        .lines()
+        .map(|line| line.split_once("//").map_or(line, |(code, _)| code))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// The resolver must verify **exactly as strictly** as the contract.
 ///
 /// A silent `verify_strict` -> `verify` regression would make this resolver
@@ -264,15 +298,20 @@ fn the_resolvers_mirrored_constants_match_their_expected_literals() {
 /// source instead. Reads `src/pointer.rs`; the needles live in this file, so
 /// there is no self-match.
 #[test]
-fn the_resolver_still_verifies_the_way_the_contract_does() {
+fn the_resolver_source_still_pins_strict_verification() {
     let raw = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/pointer.rs"))
         .expect("the resolver's own source must be readable");
     // Scope to production code: a needle satisfied by a string literal inside
-    // `mod tests` would pin nothing.
-    let production = raw
-        .split_once("#[cfg(test)]")
-        .map_or(raw.as_str(), |(before, _)| before);
-    let src: String = production.chars().filter(|c| !c.is_whitespace()).collect();
+    // `mod tests` would pin nothing. `expect` rather than a fallback, because a
+    // fallback would silently revert to scanning the whole file if the marker
+    // ever changed, losing the protection with no signal. (The sibling contract
+    // crate already spells its marker differently, which is how a fallback here
+    // would rot unnoticed.)
+    let production = production_prefix(&raw, "src/pointer.rs");
+    let src: String = strip_line_comments(production)
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
 
     for (what, needle) in [
         (
@@ -312,16 +351,34 @@ fn the_resolver_still_verifies_the_way_the_contract_does() {
         );
     }
 
-    // `pointer_params` and `parse_pointer_params` must BOTH reject a
-    // small-order author key, and those two sites are textually identical. A
-    // `contains` needle matching N sites pins only N-1 deletions, because
-    // deleting one leaves the needle satisfied by its sibling. Count instead.
+    assert_weak_key_guard_at_both_sites(&src, "freenet-migrate/src/pointer.rs");
+
+    // Presence of the strict call is not enough on its own: assert the
+    // permissive one is ABSENT too, so a second verification path cannot be
+    // added alongside the pinned one.
+    assert_eq!(
+        src.matches(".verify(&msg").count(),
+        0,
+        "freenet-migrate/src/pointer.rs calls dalek's non-strict `verify`. The resolver \
+         must be exactly as strict as the frozen contract; `verify` accepts small-order \
+         R, non-canonical A and the cofactored equation, so it would adopt a code hash \
+         the network would never store."
+    );
+}
+
+/// Both of a file's params functions must reject a small-order author key.
+///
+/// The two guards are textually identical, and a `contains` needle matching N
+/// sites pins only N-1 deletions, because deleting one leaves the needle
+/// satisfied by its sibling. Count instead. Applies to the resolver and to the
+/// contract alike, which is why it is shared.
+fn assert_weak_key_guard_at_both_sites(src: &str, what: &str) {
     let weak_guard = "ifauthor_vk.is_weak(){returnErr(PointerError::ParamsKeyWeak);}";
     let found = src.matches(weak_guard).count();
     assert_eq!(
         found, 2,
-        "both pointer_params and parse_pointer_params must reject a small-order author key; \
-         found {found} of the 2 expected is_weak guards"
+        "{what}: both the build and the parse path must reject a small-order author \
+         key; found {found} of the 2 expected is_weak guards"
     );
 }
 
@@ -329,10 +386,14 @@ fn the_resolver_still_verifies_the_way_the_contract_does() {
 /// other side of the repo cannot break the pin, but a semantic change does.
 #[test]
 fn the_contract_source_still_says_what_this_resolver_assumes() {
-    let src: String = contract_file("src/lib.rs")
-        .chars()
-        .filter(|c| !c.is_whitespace())
-        .collect();
+    let raw = contract_file("src/lib.rs");
+    let src: String = strip_line_comments(production_prefix(
+        &raw,
+        "contracts/pointer-contract/src/lib.rs",
+    ))
+    .chars()
+    .filter(|c| !c.is_whitespace())
+    .collect();
 
     for (what, needle) in [
         (

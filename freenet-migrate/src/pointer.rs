@@ -608,6 +608,12 @@ impl PointerFloor {
     /// the maximum can never be superseded by a valid record. Surfacing the
     /// corruption lets the caller decide.
     ///
+    /// **Do not recover with `unwrap_or_else(|_| PointerFloor::never_resolved())`.**
+    /// That is the first thing to reach for and it reinstates exactly the
+    /// fail-open this rejects: it turns a corrupt floor into "first run", which
+    /// is the one state that unlocks a baked-in build-time key. Treat the error
+    /// as "my stored floor is untrustworthy" and surface it.
+    ///
     /// # Seeding from build-time knowledge
     ///
     /// A consumer that ships knowing the app's current version and code hash
@@ -681,8 +687,19 @@ pub enum PointerOutcome {
     Unchanged(ResolvedPointer),
     /// The author has **withdrawn** this app: the current record carries the
     /// all-zero tombstone code hash. Stop resolving. Do not fall back to a
-    /// baked-in key — the author is saying there is no current code, not that
+    /// baked-in key: the author is saying there is no current code, not that
     /// the old code is current again.
+    ///
+    /// `#[non_exhaustive]` on the **variant**, not merely on the enum. Enum-level
+    /// `#[non_exhaustive]` restricts matching and variant addition, but leaves a
+    /// struct-like variant with a public field constructible downstream, and
+    /// [`PointerOutcome::next_floor`] turns this version into a floor without
+    /// re-validating it (it is internal, and internally it always came off a
+    /// verified record). Without this, downstream code could build
+    /// `Withdrawn { version: u32::MAX }`, call `next_floor()`, and obtain
+    /// exactly the wedged-forever floor [`PointerFloor::at`] exists to refuse.
+    /// Matching still works with `Withdrawn { .. }`.
+    #[non_exhaustive]
     Withdrawn {
         /// Version of the withdrawing record.
         version: u32,
@@ -1447,7 +1464,7 @@ mod tests {
         // `verify` and `verify_strict` apply -- so it does NOT pin strictness.
         // The properties unique to `verify_strict` (small-order R, non-canonical
         // A, the cofactorless equation) are pinned by the source scrape
-        // `the_resolver_still_verifies_the_way_the_contract_does` in
+        // `the_resolver_source_still_pins_strict_verification` in
         // tests/pointer_contract_parity.rs. Both are needed; neither replaces
         // the other.
         //
@@ -1847,10 +1864,13 @@ mod tests {
 
     #[test]
     fn a_non_canonical_author_key_is_refused() {
-        // y = p (2^255 - 19) exactly: decodes, but is not the canonical
-        // encoding, so it would be a second address for one author.
+        // p + 3: decodes to the large-order point y = 3, but is not that
+        // point's canonical encoding, so it would be a second address for one
+        // usable author key. (y = p would reduce to the small-order y = 0 and
+        // would be caught by the weak-key guard instead, proving nothing about
+        // this one.)
         let mut bytes = [0xffu8; 32];
-        bytes[0] = 0xed;
+        bytes[0] = 0xf0;
         bytes[31] = 0x7f;
         assert!(!is_canonical_field_element(&bytes));
         assert_eq!(
@@ -1929,6 +1949,49 @@ mod tests {
     }
 
     #[test]
+    fn a_degraded_floor_shape_still_enforces_anti_rollback() {
+        // `(version > 0, code_hash: None)` is unconstructible through the public
+        // API, which is exactly why the arm handling it is easy to delete by
+        // accident: reverting it to a bare `adopt` disables anti-rollback for a
+        // shape no test covers. The unit tests are in-module, so the private
+        // fields are reachable here and the fail-closed claim can be a test
+        // rather than a comment.
+        let broken = PointerFloor {
+            version: 6,
+            code_hash: None,
+        };
+        let vk = signing_key(7).verifying_key();
+
+        let (_v, _p, older) = published(7, 2, [0xaa; 32]);
+        assert_eq!(
+            resolve_with(&vk, broken, state(&older)).unwrap(),
+            PointerOutcome::Stale {
+                served: 2,
+                floor: 6
+            }
+        );
+
+        // Equal version must NOT be adopted: without a floor hash there is no
+        // tiebreak to apply, so the conservative answer is to keep the floor.
+        let (_v2, _p2, same) = published(7, 6, [0x01; 32]);
+        assert_eq!(
+            resolve_with(&vk, broken, state(&same)).unwrap(),
+            PointerOutcome::Stale {
+                served: 6,
+                floor: 6
+            }
+        );
+
+        // Strictly newer is still adopted, so the degradation refuses rollback
+        // without wedging the caller.
+        let (_v3, _p3, newer) = published(7, 9, [0x33; 32]);
+        assert!(matches!(
+            resolve_with(&vk, broken, state(&newer)).unwrap(),
+            PointerOutcome::Resolved(r) if r.version() == 9
+        ));
+    }
+
+    #[test]
     fn a_floor_round_trips_through_a_callers_own_storage() {
         // The documented persist flow is "store version + code_hash, rebuild
         // with at()". If the accessors could not express a floor, that flow
@@ -1958,15 +2021,27 @@ mod tests {
     fn both_params_functions_apply_the_same_rules() {
         let good = signing_key(7).verifying_key();
 
-        // y = p exactly: decodes to a point, but is not the canonical encoding.
+        // A non-canonical encoding of y = 3, i.e. the value p + 3, which is
+        // >= the field prime and so not the canonical encoding of anything.
+        //
+        // Deliberately NOT y = p (the obvious choice): that reduces to y = 0,
+        // which is a small-order point, so it trips `is_weak` too and the case
+        // would still fail with the canonical guard deleted, just with a
+        // different error. y = 3 is on the curve and large-order, so this
+        // witness isolates the canonical check.
         let mut non_canonical = [0xffu8; 32];
-        non_canonical[0] = 0xed;
+        non_canonical[0] = 0xf0;
         non_canonical[31] = 0x7f;
+        assert!(!is_canonical_field_element(&non_canonical));
         // The guard is only meaningful if dalek accepts such a key, so prove it
-        // does rather than assuming the check is reachable.
+        // does rather than assuming the check is reachable at all.
         let non_canonical_vk = VerifyingKey::from_bytes(&non_canonical)
             .expect("dalek accepts a non-canonical y, which is why we check it ourselves");
-        assert!(!is_canonical_field_element(&non_canonical));
+        assert!(
+            !non_canonical_vk.is_weak(),
+            "the witness must not ALSO be small-order, or it cannot isolate the \
+             canonical-encoding guard from the weak-key guard"
+        );
 
         let weak = VerifyingKey::from_bytes(&[
             0xc7, 0x17, 0x6a, 0x70, 0x3d, 0x4d, 0xd8, 0x4f, 0xba, 0x3c, 0x0b, 0x76, 0x0d, 0x10,
@@ -2023,6 +2098,55 @@ mod tests {
                 expected,
                 "parse_pointer_params accepted {what}"
             );
+        }
+
+        // Sweep the WHOLE byte range through both functions, not one sample.
+        // A single `b"River.Room"` case is satisfied by any guard that happens
+        // to reject uppercase, so a mutant checking `is_ascii_uppercase()`
+        // instead of the real charset would pass while accepting spaces, NUL
+        // and non-ASCII. Pinning the predicate in isolation is not enough
+        // either: it proves nothing about which predicate a call site uses.
+        for b in 0u8..=255 {
+            let app_id = [b];
+            if is_valid_app_id_byte(b) {
+                assert!(
+                    pointer_params(&good, &app_id).is_ok(),
+                    "pointer_params rejected permitted app_id byte {b:#04x}"
+                );
+                let blob = [good.as_bytes().as_slice(), &app_id[..]].concat();
+                assert!(
+                    parse_pointer_params(&blob).is_ok(),
+                    "parse_pointer_params rejected permitted app_id byte {b:#04x}"
+                );
+            } else {
+                assert_eq!(
+                    pointer_params(&good, &app_id).unwrap_err(),
+                    PointerError::ParamsAppId(b),
+                    "pointer_params accepted forbidden app_id byte {b:#04x}"
+                );
+                let blob = [good.as_bytes().as_slice(), &app_id[..]].concat();
+                assert_eq!(
+                    parse_pointer_params(&blob).unwrap_err(),
+                    PointerError::ParamsAppId(b),
+                    "parse_pointer_params accepted forbidden app_id byte {b:#04x}"
+                );
+            }
+        }
+
+        // Both ACCEPTING boundaries, through both functions and round-tripped.
+        // Rejection cases alone leave a mutant free to tighten a bound and
+        // refuse legal params, which the contract would have accepted.
+        for (what, app_id) in [
+            ("the shortest legal app_id", vec![b'a'; 1]),
+            ("the longest legal app_id", vec![b'a'; MAX_APP_ID_LEN]),
+        ] {
+            let built = pointer_params(&good, &app_id)
+                .unwrap_or_else(|e| panic!("pointer_params rejected {what}: {e}"));
+            assert_eq!(built.len(), VERIFYING_KEY_LEN + app_id.len());
+            let (back_vk, back_app) = parse_pointer_params(&built)
+                .unwrap_or_else(|e| panic!("parse_pointer_params rejected {what}: {e}"));
+            assert_eq!(back_vk, good);
+            assert_eq!(back_app, &app_id[..]);
         }
     }
 
