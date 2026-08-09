@@ -82,17 +82,23 @@ const CONSUMER_INSTANCE_ID_B58: &str = "k2Nt3AT6K7L9obj1GwogHN2dpzY1MVaz9AAhXbLB
 /// no marker is found rather than returning the whole file: failing open would
 /// discard the protection silently.
 fn production_prefix<'a>(source: &'a str, what: &str) -> &'a str {
-    // Both spellings in this repo: plain, and the contract's target-gated form.
-    for marker in ["#[cfg(test)]", "#[cfg(all(test"] {
-        if let Some((before, _)) = source.split_once(marker) {
-            return before;
-        }
+    // EARLIEST occurrence across both spellings, not the first spelling that
+    // happens to match. Taking them in list order re-opens the fail-open this
+    // exists to close: the contract's module marker is the target-gated form,
+    // so a nested plain `#[cfg(test)]` INSIDE that module would match later in
+    // the file and hand back a prefix containing the whole test module.
+    let cut = ["#[cfg(test)]", "#[cfg(all(test"]
+        .iter()
+        .filter_map(|m| source.find(m))
+        .min();
+    match cut {
+        Some(i) => &source[..i],
+        None => panic!(
+            "{what} has no recognised #[cfg(test)] marker, so this scrape cannot be \
+             scoped to production code. Add the new spelling to `production_prefix` \
+             rather than letting the scrape silently cover the test module."
+        ),
     }
-    panic!(
-        "{what} has no recognised #[cfg(test)] marker, so this scrape cannot be \
-         scoped to production code. Add the new spelling to `production_prefix` \
-         rather than letting the scrape silently cover the test module."
-    )
 }
 
 fn contract_file(relative: &str) -> String {
@@ -250,6 +256,36 @@ fn derived_addresses_match_the_published_vectors() {
     assert_published(&doc, "the frozen pointer code hash", POINTER_CODE_HASH_B58);
 }
 
+/// `production_prefix` must cut at the EARLIEST test marker, whichever spelling
+/// it is.
+///
+/// Taking the markers in list order instead re-opens the fail-open the helper
+/// exists to close: the contract's module marker is the target-gated spelling,
+/// so a nested plain `#[cfg(test)]` inside that module sits LATER in the file,
+/// and a list-order search would return the later offset and hand back a prefix
+/// containing the whole test module. Any needle could then be satisfied by a
+/// string literal in a test.
+#[test]
+fn the_scrape_cuts_at_the_earliest_test_marker() {
+    let gated_first = "pub const REAL: u8 = 1;\n\
+                       #[cfg(all(test, not(target_arch = \"wasm32\")))]\n\
+                       mod tests {\n\
+                       #[cfg(test)]\n\
+                       fn nested() {}\n\
+                       const DECOY: u8 = 2;\n\
+                       }\n";
+    let prefix = production_prefix(gated_first, "synthetic");
+    assert!(prefix.contains("pub const REAL"));
+    assert!(
+        !prefix.contains("DECOY") && !prefix.contains("mod tests"),
+        "the scrape must not reach into the test module: {prefix:?}"
+    );
+
+    // The plain spelling first is the ordinary case and must still work.
+    let plain_first = "pub const REAL: u8 = 1;\n#[cfg(test)]\nmod tests { const D: u8 = 2; }\n";
+    assert!(!production_prefix(plain_first, "synthetic").contains("mod tests"));
+}
+
 /// The resolver's own mirrored constants, asserted against **literals**.
 ///
 /// Every unit test in `pointer.rs` refers to these symbolically, so it checks
@@ -273,12 +309,19 @@ fn the_resolvers_mirrored_constants_match_their_expected_literals() {
     assert_eq!(MAX_POINTER_PARAMS_LEN, 96);
 }
 
-/// Strip `//` line comments from already-whitespace-free source.
+/// Strip `//` line comments from source.
 ///
 /// Without this, commenting the old call out and writing a new one below it
 /// satisfies a `contains` needle, which is ordinary developer behaviour rather
 /// than a contrived attack. The thing that silently un-pins here is the
 /// resolver becoming MORE permissive than the frozen network.
+///
+/// Scope, so the next reader does not over-trust it: this handles `//` only.
+/// A needle inside a `/* */` block or a string literal still satisfies a
+/// `contains` check. Neither production prefix contains a block comment today.
+/// It is applied BEFORE [`production_prefix`], so a `#[cfg(test)]` mentioned in
+/// a comment cannot truncate the scrape early and report every needle as
+/// missing.
 fn strip_line_comments(source: &str) -> String {
     source
         .lines()
@@ -307,8 +350,8 @@ fn the_resolver_source_still_pins_strict_verification() {
     // ever changed, losing the protection with no signal. (The sibling contract
     // crate already spells its marker differently, which is how a fallback here
     // would rot unnoticed.)
-    let production = production_prefix(&raw, "src/pointer.rs");
-    let src: String = strip_line_comments(production)
+    let stripped = strip_line_comments(&raw);
+    let src: String = production_prefix(&stripped, "src/pointer.rs")
         .chars()
         .filter(|c| !c.is_whitespace())
         .collect();
@@ -353,16 +396,26 @@ fn the_resolver_source_still_pins_strict_verification() {
 
     assert_weak_key_guard_at_both_sites(&src, "freenet-migrate/src/pointer.rs");
 
-    // Presence of the strict call is not enough on its own: assert the
-    // permissive one is ABSENT too, so a second verification path cannot be
-    // added alongside the pinned one.
+    // Presence of the strict call is not enough on its own. Count the
+    // verification sites instead of hunting for the permissive spelling: an
+    // absence needle like `.verify(&msg` is evaded by UFCS or by renaming the
+    // local, and false-fires when an unrelated `verify` happens to take a
+    // binding called `msg`. Exactly one signature check must exist, and it must
+    // be the strict one.
     assert_eq!(
-        src.matches(".verify(&msg").count(),
-        0,
-        "freenet-migrate/src/pointer.rs calls dalek's non-strict `verify`. The resolver \
-         must be exactly as strict as the frozen contract; `verify` accepts small-order \
-         R, non-canonical A and the cofactored equation, so it would adopt a code hash \
-         the network would never store."
+        src.matches(".verify_strict(").count(),
+        1,
+        "freenet-migrate/src/pointer.rs must contain exactly one strict signature \
+         check; found {}. A second verification path is how a permissive one gets \
+         added beside the pinned one.",
+        src.matches(".verify_strict(").count()
+    );
+    assert_eq!(
+        src.matches("Signature::from_bytes(").count(),
+        1,
+        "freenet-migrate/src/pointer.rs must construct exactly one Signature; found {}. \
+         More than one means a verification path this pin does not cover.",
+        src.matches("Signature::from_bytes(").count()
     );
 }
 
@@ -387,13 +440,11 @@ fn assert_weak_key_guard_at_both_sites(src: &str, what: &str) {
 #[test]
 fn the_contract_source_still_says_what_this_resolver_assumes() {
     let raw = contract_file("src/lib.rs");
-    let src: String = strip_line_comments(production_prefix(
-        &raw,
-        "contracts/pointer-contract/src/lib.rs",
-    ))
-    .chars()
-    .filter(|c| !c.is_whitespace())
-    .collect();
+    let stripped = strip_line_comments(&raw);
+    let src: String = production_prefix(&stripped, "contracts/pointer-contract/src/lib.rs")
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
 
     for (what, needle) in [
         (
@@ -445,10 +496,6 @@ fn the_contract_source_still_says_what_this_resolver_assumes() {
             "the canonical-encoding check on the author key",
             "if!is_canonical_field_element(&key){returnErr(PointerError::ParamsKeyNonCanonical);}",
         ),
-        (
-            "the small-order author-key rejection",
-            "ifauthor_vk.is_weak(){returnErr(PointerError::ParamsKeyWeak);}",
-        ),
     ] {
         assert!(
             src.contains(needle),
@@ -458,4 +505,10 @@ fn the_contract_source_still_says_what_this_resolver_assumes() {
              find: {needle}"
         );
     }
+
+    // Same counting pin as the resolver side. The contract also has TWO
+    // identical small-order guards (its params `parse` and `encode`), so a
+    // plain `contains` here would pin only one of the two deletions -- the
+    // exact weakness the shared helper was extracted to remove.
+    assert_weak_key_guard_at_both_sites(&src, "contracts/pointer-contract/src/lib.rs");
 }

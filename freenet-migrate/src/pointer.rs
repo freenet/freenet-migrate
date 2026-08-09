@@ -626,17 +626,10 @@ impl PointerFloor {
         if version == 0 || version > MAX_POINTER_VERSION {
             return Err(PointerError::FloorVersion(version));
         }
-        Ok(Self::trusted(version, code_hash))
-    }
-
-    /// Internal constructor for a version this module has already verified to
-    /// be in range, because it came off a record that passed
-    /// [`PointerRecord::verify`].
-    fn trusted(version: u32, code_hash: [u8; CODE_HASH_LEN]) -> Self {
-        Self {
+        Ok(Self {
             version,
             code_hash: Some(code_hash),
-        }
+        })
     }
 
     /// The code hash accepted at [`Self::version`], or `None` when nothing has
@@ -690,15 +683,18 @@ pub enum PointerOutcome {
     /// baked-in key: the author is saying there is no current code, not that
     /// the old code is current again.
     ///
-    /// `#[non_exhaustive]` on the **variant**, not merely on the enum. Enum-level
-    /// `#[non_exhaustive]` restricts matching and variant addition, but leaves a
-    /// struct-like variant with a public field constructible downstream, and
-    /// [`PointerOutcome::next_floor`] turns this version into a floor without
-    /// re-validating it (it is internal, and internally it always came off a
-    /// verified record). Without this, downstream code could build
-    /// `Withdrawn { version: u32::MAX }`, call `next_floor()`, and obtain
-    /// exactly the wedged-forever floor [`PointerFloor::at`] exists to refuse.
-    /// Matching still works with `Withdrawn { .. }`.
+    /// `#[non_exhaustive]` on the **variant**, not merely on the enum, because
+    /// enum-level `#[non_exhaustive]` restricts matching and variant addition
+    /// while leaving a struct-like variant with a public field constructible
+    /// downstream. Matching still works with `Withdrawn { .. }`.
+    ///
+    /// On its own that is not sufficient, and the guarantee does not rest on
+    /// it: the attribute blocks *construction*, not *mutation*, and
+    /// `PointerOutcome` is `Clone`, so downstream can still take a genuine
+    /// `Withdrawn` and overwrite `version`. What actually closes the hole is
+    /// [`PointerOutcome::next_floor`] re-validating through
+    /// [`PointerFloor::at`], so a tampered version yields `None` rather than a
+    /// floor that no valid record could ever supersede.
     #[non_exhaustive]
     Withdrawn {
         /// Version of the withdrawing record.
@@ -719,6 +715,14 @@ pub enum PointerOutcome {
     ///
     /// **Keep using whatever you last resolved, and retry.** The rollback is
     /// already refused by the time you see this.
+    ///
+    /// One corner reports `served == floor` rather than something strictly
+    /// older: a floor carrying a version but no code hash (unconstructible
+    /// through the public API, handled defensively in `order`) has no tiebreak
+    /// available, so an equal-version record is refused rather than guessed at.
+    /// That is tie-refusal rather than rollback, and it is deliberately
+    /// fail-closed: `next_floor()` is `None`, so such a floor is only ever
+    /// repaired by a strictly newer version.
     Stale {
         /// Version the peer served.
         served: u32,
@@ -780,13 +784,19 @@ impl PointerOutcome {
     /// `(author_vk, app_id)`.
     #[must_use]
     pub fn next_floor(&self) -> Option<PointerFloor> {
+        // Every arm re-validates through `at` rather than a private
+        // skip-validation constructor. For an outcome this crate produced the
+        // version came off a record that passed `PointerRecord::verify`, so
+        // `at` cannot fail and this is behaviour-preserving. It matters because
+        // `Withdrawn`'s `version` is a public field of an obtainable value and
+        // `PointerOutcome` is `Clone`: `#[non_exhaustive]` stops downstream
+        // *constructing* the variant, but not mutating a genuine one to
+        // `u32::MAX` and calling this. Routing through `at` turns that into
+        // `None` ("learned nothing") instead of the wedged-forever floor `at`
+        // exists to refuse.
         match self {
-            Self::Resolved(r) | Self::Unchanged(r) => {
-                Some(PointerFloor::trusted(r.version, r.code_hash))
-            }
-            Self::Withdrawn { version } => {
-                Some(PointerFloor::trusted(*version, TOMBSTONE_CODE_HASH))
-            }
+            Self::Resolved(r) | Self::Unchanged(r) => PointerFloor::at(r.version, r.code_hash).ok(),
+            Self::Withdrawn { version } => PointerFloor::at(*version, TOMBSTONE_CODE_HASH).ok(),
             Self::NeverPublished | Self::Stale { .. } | Self::Unavailable => None,
         }
     }
@@ -1949,6 +1959,33 @@ mod tests {
     }
 
     #[test]
+    fn a_tampered_outcome_version_cannot_produce_a_wedged_floor() {
+        // `#[non_exhaustive]` stops downstream CONSTRUCTING `Withdrawn`, but
+        // not mutating a genuine one, and `PointerOutcome` is `Clone`. So the
+        // guarantee has to come from `next_floor` re-validating rather than
+        // from the attribute. A version outside 1..=MAX_POINTER_VERSION must
+        // yield `None` ("learned nothing"), never a floor that no valid record
+        // could ever supersede.
+        let (vk, _p, tomb) = published(7, 8, TOMBSTONE_CODE_HASH);
+        let mut outcome = resolve_with(&vk, PointerFloor::never_resolved(), state(&tomb)).unwrap();
+        assert_eq!(outcome.next_floor(), Some(floor(8, TOMBSTONE_CODE_HASH)));
+
+        if let PointerOutcome::Withdrawn { version, .. } = &mut outcome {
+            *version = u32::MAX;
+        }
+        assert_eq!(
+            outcome.next_floor(),
+            None,
+            "a tampered version must not become a floor no record can supersede"
+        );
+
+        if let PointerOutcome::Withdrawn { version, .. } = &mut outcome {
+            *version = 0;
+        }
+        assert_eq!(outcome.next_floor(), None);
+    }
+
+    #[test]
     fn a_degraded_floor_shape_still_enforces_anti_rollback() {
         // `(version > 0, code_hash: None)` is unconstructible through the public
         // API, which is exactly why the arm handling it is easy to delete by
@@ -2136,9 +2173,14 @@ mod tests {
         // Both ACCEPTING boundaries, through both functions and round-tripped.
         // Rejection cases alone leave a mutant free to tighten a bound and
         // refuse legal params, which the contract would have accepted.
+        // Cycled rather than a repeated byte: `[b'a'; N]` round-trips through
+        // a reordering or truncate-and-pad bug undetected.
+        const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789.-_";
+        let cycled =
+            |n: usize| -> Vec<u8> { (0..n).map(|i| ALPHABET[i % ALPHABET.len()]).collect() };
         for (what, app_id) in [
-            ("the shortest legal app_id", vec![b'a'; 1]),
-            ("the longest legal app_id", vec![b'a'; MAX_APP_ID_LEN]),
+            ("the shortest legal app_id", cycled(1)),
+            ("the longest legal app_id", cycled(MAX_APP_ID_LEN)),
         ] {
             let built = pointer_params(&good, &app_id)
                 .unwrap_or_else(|e| panic!("pointer_params rejected {what}: {e}"));
