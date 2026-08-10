@@ -498,6 +498,16 @@ pub enum RetryAdvice {
     /// withheld (the crate does not decide on the app's behalf to give up on data),
     /// and the key is **not** withheld from older predecessors: an older
     /// generation's copy of the same key may well be acceptable.
+    ///
+    /// **The verdict must hold across future versions of your app.** Because the key
+    /// is not withheld, an older generation's copy can land and seal that predecessor
+    /// clean — after which a never-clobber writer declines the newer value forever,
+    /// even if a later app version would have accepted it. Return `Permanent` only
+    /// for a refusal that is stable over time (a malformed value, a signature that
+    /// can never verify), not for one that is merely "this version cannot handle it".
+    /// If the refusal might not be stable, either keep the item `Retryable` or make
+    /// the writer generation-aware via [`RecoveredSecret::generation`] so it can
+    /// prefer the newer generation's value when it later becomes acceptable.
     Permanent,
 }
 
@@ -1622,6 +1632,12 @@ mod tests {
         fetched: HashSet<Vec<u8>>,
         /// registration calls, for the wrapper test.
         registered: usize,
+        /// The generations `register_successor` was handed, in the order it got
+        /// them. The ordering is a documented guarantee of
+        /// `RegisterAndMigrateIo::register_successor`, so it needs an assertion of
+        /// its own — the internal walk re-sorts independently, so nothing else here
+        /// would notice if the guarantee were dropped.
+        registered_generations: Vec<u32>,
         /// force a transport error from probe_executable for these keys.
         error_on_probe: HashSet<Vec<u8>>,
     }
@@ -1674,11 +1690,13 @@ mod tests {
     impl RegisterAndMigrateIo for MockIo {
         async fn register_successor(
             &mut self,
-            _predecessors: &[DelegateLineageEntry],
+            predecessors: &[DelegateLineageEntry],
             _authorization: &MigrationAuthorization,
             _policy: &SecretSelectionPolicy,
         ) -> Result<(), IoAbort> {
             self.registered += 1;
+            self.registered_generations
+                .extend(predecessors.iter().map(|e| e.generation));
             Ok(())
         }
     }
@@ -2725,6 +2743,39 @@ mod tests {
             PredecessorMigration::Imported { .. }
         ));
         assert_eq!(store.get_secret(b"k").unwrap(), b"v");
+    }
+
+    #[test]
+    fn register_successor_is_handed_predecessors_newest_generation_first() {
+        // `RegisterAndMigrateIo::register_successor` documents newest-first ordering
+        // as a GUARANTEE, because a copy-forward node copies in the supplied order
+        // with first-writer-wins — so newest-first is what makes the node copy
+        // newest-precedence. Nothing else in this suite would notice if the sort were
+        // dropped: the internal walk sorts again on its own, and the outcome is
+        // identical. The guarantee is inert today (no node copy-forward exists), which
+        // is exactly why it needs its own assertion rather than an incidental one.
+        let a = entry(1, 1);
+        let b = entry(2, 2);
+        let c = entry(3, 3);
+        let mut writer = ScriptedWriter::default();
+        let mut io = MockIo::default()
+            .executable_with(&key_of(&a), &[])
+            .executable_with(&key_of(&b), &[])
+            .executable_with(&key_of(&c), &[]);
+        // Deliberately NOT already sorted, and not merely reversed.
+        block_on(register_delegate_with_migration(
+            &mut writer,
+            &mut io,
+            &[b, a, c],
+            ack(),
+            union(),
+        ))
+        .unwrap();
+        assert_eq!(
+            io.registered_generations,
+            vec![3, 2, 1],
+            "register_successor must receive predecessors newest-generation-first"
+        );
     }
 
     // ---- consent shape (P1#5) ------------------------------------------------
