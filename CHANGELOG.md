@@ -52,9 +52,26 @@ them, routing the write through the app's own import path fixes all four.
   `DelegateMigrationReport::retry_may_help` is `false` for a report whose only
   blemish is permanent rejections, so an app surfaces them instead of spinning a
   retry loop. `rejected_total` / `failed_total` are new.
-* `ItemWrite::AlreadyAuthoritative` covers both "already held" and "not mine to copy verbatim"
-  (ghostkeys declines a predecessor's permission grants and records its own) and is
-  a complete, correct outcome.
+* `ItemWrite::AlreadyAuthoritative` covers both "already held" and "not mine to copy
+  verbatim" (ghostkeys refuses a predecessor's permission grants and records its own)
+  and is a complete, correct outcome. It is named for the assertion it makes about
+  the *successor's* state because it is **not an error channel**: an
+  `Err(_) => ItemWrite::…` arm mapped onto it counts as `skipped`, which
+  `is_clean()` treats as success, so the predecessor earns its `Done` marker and is
+  never walked again — silent, unrecoverable loss from a one-token mistake.
+* A **failed `flush_predecessor`** withholds every key that predecessor resolved and
+  re-counts its optimistic `written` as `failed`. The flush is the durability
+  boundary: a buffering writer answers `Written` for items it has only buffered and
+  loses the batch on failure, so without this a run withheld *nothing*, an older
+  generation wrote its value into the hole and sealed itself clean, and the newest
+  generation's value was permanently shadowed by a report reading `is_complete()`.
+  `AlreadyAuthoritative` keys are withheld too, since that claim can itself be
+  unflushed buffer state. `ImportTally::written` therefore means "applied *and*
+  flushed", which is what makes `imported_total()` safe to show a user.
+* `SecretStoreIo` can never emit `RetryAdvice::Permanent` — `SecretStore::set_secret`
+  reports only `bool`, so a deterministic refusal is indistinguishable from a
+  transient one and `retry_may_help()` stays `true` forever against such a store.
+  Documented, with the instruction to bound retry counts.
 
 ### Termination is a policy question, not a failure question
 
@@ -78,7 +95,9 @@ The `NewestSnapshotWins` column is unchanged. What the old halt genuinely bought
 kept by a narrower mechanism: a key whose write failed **retryably** is withheld
 from older predecessors for the rest of the run (`ImportTally::withheld`), so an
 older generation cannot shadow a newer value awaiting a retry. A **permanently
-rejected** key is not withheld.
+rejected** key is not withheld. A **failed flush** withholds everything it lost (see
+"Partial failure is expressible"), which is what makes the walk-on safe for a
+buffering writer.
 
 ### Unchanged
 

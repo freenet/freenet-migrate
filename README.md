@@ -335,9 +335,13 @@ the new version). Only the app knows which of its secrets are aggregates.
 
 #### Partial failure, and what a retry is worth
 
-`write_secret` returns `ItemWrite::Written`, `Declined` (already held, or not the
-app's to copy verbatim), or `Failed { error, retry }` — where `retry` is
-`Retryable` or `Permanent`. Per predecessor the report carries an `ImportTally`
+`write_secret` returns `ItemWrite::Written`, `AlreadyAuthoritative` (the successor's
+own value stands — already held, or not the app's to copy verbatim), or
+`Failed { error, retry }` — where `retry` is `Retryable` or `Permanent`.
+`AlreadyAuthoritative` is **not an error channel**: an `Err(_) => …` arm mapped onto
+it counts as `skipped`, which reads as success, so the predecessor is sealed and
+never walked again. A failed write is `retryable` or `permanent`; when in doubt,
+`retryable`. Per predecessor the report carries an `ImportTally`
 (`written` / `skipped` / `failed` / `rejected` / `withheld`) plus the first
 successor-side failure and the stage it happened at, so an app learns what landed,
 what did not, and whether retrying can change anything
@@ -354,6 +358,13 @@ walks on. The one thing the old halt bought is kept by a narrower mechanism: a k
 whose write failed *retryably* is **withheld** from older predecessors for the rest
 of the run, so an older generation cannot shadow a newer value awaiting a retry. A
 *permanently rejected* key is not withheld — an older copy of it may be acceptable.
+
+The same withholding covers a **failed flush**, which is the durability boundary for
+a buffering writer: such a writer answers `Written` optimistically and loses the
+batch, so a flush failure withholds every key that predecessor resolved (`Written`
+and `AlreadyAuthoritative` alike — "already authoritative" can itself be unflushed
+buffer state) and re-counts its optimistic `written` as `failed`, so
+`imported_total()` never reports data a discarded buffer took with it.
 
 Predecessors are a **list**, processed newest-generation-first. `SecretSelectionPolicy`
 decides the cross-generation behavior (the delegate-side analogue of the contract
