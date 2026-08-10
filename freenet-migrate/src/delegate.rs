@@ -693,6 +693,10 @@ pub(crate) fn predecessor_already_migrated<S: SecretStore + ?Sized>(
 /// *data-bearing* predecessor it did the first time (an empty AlreadyMigrated
 /// predecessor is fallen through, a data-bearing one is authoritative). An
 /// unrecognized value is treated conservatively as data-bearing.
+///
+/// Public so an implementer of the marker contract — a node-side copy-forward, or
+/// an app implementing [`crate::SuccessorSecretsIo`] over its own storage — can read
+/// back the same data/empty flag [`predecessor_done_marker`] writes.
 pub fn predecessor_migration_had_data<S: SecretStore + ?Sized>(
     store: &S,
     predecessor: &DelegateKey,

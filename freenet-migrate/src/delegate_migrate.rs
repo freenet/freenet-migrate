@@ -1479,7 +1479,17 @@ where
             // Give a buffering writer its chance to fail honestly before the
             // completion marker claims the data landed.
             if let Err(e) = successor.flush_predecessor(&key).await {
-                if failure.is_none() {
+                // A flush failure OUTRANKS an item failure for the reported
+                // `failure`. Item failures are already fully described by the tally
+                // (`failed` = retryable, `rejected` = permanent), but a stage
+                // failure is not described anywhere else — and it is what
+                // `retry_may_help` reads. Keeping the first-seen item failure here
+                // would hide a retryable flush fault behind a permanent rejection
+                // and tell the app not to bother retrying.
+                if failure
+                    .as_ref()
+                    .is_none_or(|f| matches!(f.stage, WriterStage::Item))
+                {
                     failure = Some(WriterFailure {
                         stage: WriterStage::Flush,
                         error: format!("{e:?}"),
@@ -3128,6 +3138,51 @@ mod tests {
                 Some(MigrationMarker::Done { .. })
             ),
             "a failed flush must not be sealed"
+        );
+    }
+
+    #[test]
+    fn a_flush_failure_is_reported_even_when_an_item_was_permanently_rejected() {
+        // Item failures are described by the tally; a stage failure is not, and it
+        // is what `retry_may_help` reads. If the first-seen item failure won the
+        // `failure` slot, a retryable flush fault would hide behind a permanent
+        // rejection and the app would be told not to bother retrying.
+        let e = entry(1, 1);
+        let mut writer = ScriptedWriter::default()
+            .permanently_reject(b"bad")
+            .fail_flush(&key_of(&e));
+        let mut io =
+            MockIo::default().executable_with(&key_of(&e), &[(b"bad", b"1"), (b"good", b"2")]);
+        let report = block_on(migrate_delegate_secrets(
+            &mut writer,
+            &mut io,
+            &[e],
+            ack(),
+            newest(),
+        ));
+        assert!(
+            matches!(
+                &report.predecessors[0],
+                PredecessorMigration::Incomplete {
+                    tally: ImportTally {
+                        written: 1,
+                        rejected: 1,
+                        failed: 0,
+                        ..
+                    },
+                    failure: Some(WriterFailure {
+                        stage: WriterStage::Flush,
+                        ..
+                    }),
+                    ..
+                }
+            ),
+            "the flush failure must outrank the item rejection: {:?}",
+            report.predecessors[0]
+        );
+        assert!(
+            report.retry_may_help(),
+            "the flush fault is retryable even though the rejected item is not"
         );
     }
 
