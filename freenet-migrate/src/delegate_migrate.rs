@@ -35,7 +35,7 @@
 //! writes the **successor**. The crate owns only the decisions in between.
 //!
 //! Before 0.5.0 the successor end was a raw `(key, value)` copy into a
-//! [`SecretStore`](crate::SecretStore), one pair at a time, never-clobber. That is
+//! [`SecretStore`], one pair at a time, never-clobber. That is
 //! wrong for any app whose stored items carry **cross-entry invariants**, and it
 //! fails *silently*:
 //!
@@ -74,7 +74,7 @@
 //!
 //! Apps whose secrets genuinely have no cross-entry invariants keep the old
 //! behaviour in one line with [`SecretStoreIo`], which is the raw-pair,
-//! never-clobber writer over a [`SecretStore`](crate::SecretStore) — gated behind
+//! never-clobber writer over a [`SecretStore`] — gated behind
 //! the loud [`NoCrossEntryInvariantsAck`] so the choice is visible at the call site.
 //!
 //! # sans-IO decomposition
