@@ -680,6 +680,26 @@ impl PointerFloor {
     /// against, so it adopts any validly-signed record, including a genuine but
     /// superseded one that a peer chooses to serve. A build-time floor bounds
     /// that.
+    ///
+    /// One consequence to handle. If the author published two records at the
+    /// seeded version (a retried or threshold-signed publish) and the seed is
+    /// the lower-hashed of the pair, every resolve returns
+    /// [`PointerOutcome::CompetingRecord`] until *v+1* is published: no record,
+    /// no fallback, no advancing floor. A seeded caller is not stuck there —
+    /// its floor holds a constant compiled into its own binary, so it may
+    /// derive its key from that constant, which is the same value it would have
+    /// used on [`PointerOutcome::NeverPublished`] and is also the side of the
+    /// tiebreak the network converges on. See
+    /// [`PointerOutcome::CompetingRecord`] for why that is the caller's call to
+    /// make and not this crate's, and check [`Self::is_withdrawn`] first.
+    ///
+    /// This is why there is no separate `seeded_at` constructor. Splitting one
+    /// would only record the caller's *claim* about provenance — the bytes
+    /// arriving here are identical either way — so the resolver would end up
+    /// trusting an assertion it cannot check, and any caller that loaded a
+    /// stored floor through the seeded constructor by mistake would get the
+    /// fail-open back. Provenance is knowledge the caller has and this crate
+    /// does not, so it stays on the caller's side of the boundary.
     pub fn at(version: u32, code_hash: [u8; CODE_HASH_LEN]) -> Result<Self, PointerError> {
         if version == 0 || version > MAX_POINTER_VERSION {
             return Err(PointerError::FloorVersion(version));
@@ -802,6 +822,42 @@ pub enum PointerOutcome {
     /// using whatever key you last derived, and do not derive one from
     /// anything here.** [`Self::next_floor`] is `None`, because nothing was
     /// learned that moves the floor.
+    ///
+    /// # Check [`PointerFloor::is_withdrawn`] before keeping your key
+    ///
+    /// A withdrawal floor reaches this variant too, and it is the one case
+    /// where "keep the key you last derived" is wrong. A tombstone sorts below
+    /// every real code hash, so once a caller holds a withdrawal floor at
+    /// version *v*, any genuine pre-withdrawal record replayed at *v* loses the
+    /// tiebreak and lands here. Resuming with the key that floor superseded
+    /// resurrects, out of the caller's own memory, exactly the code the author
+    /// retired — the same outcome the withdrawal floor exists to prevent, just
+    /// reached from the other side. If `floor.is_withdrawn()`, stop resolving
+    /// as you would for [`Self::Withdrawn`]; otherwise keep your key and retry.
+    ///
+    /// # A build-time-seeded caller may use its own constant
+    ///
+    /// [`PointerFloor::at`] recommends seeding the first floor from build-time
+    /// constants, and such a caller can reach this variant on its very first
+    /// resolve, with nothing last-derived to keep: no key, no fallback
+    /// ([`Self::may_use_baked_in_fallback`] is false), and no advancing floor,
+    /// until the author publishes *v+1*.
+    ///
+    /// That caller may derive its key from **its own build-time constant** —
+    /// which is what its floor holds. This is not the laundering this variant
+    /// refuses. This crate will not touch the floor's bytes because it cannot
+    /// tell a genuine seed from a tampered store; the caller can, because it
+    /// knows where its own floor came from. And the answer is not a downgrade
+    /// in the first place: both records at a contested version are
+    /// author-signed, the network's `merge` converges on the lower code hash,
+    /// and reaching this variant *means* the caller's floor is that lower hash.
+    /// Using it is agreeing with the tiebreak, not overriding it.
+    ///
+    /// The condition is provenance, not this variant: derive from your floor
+    /// only where you know it came from your own binary or your own prior
+    /// verified resolution, and only after the `is_withdrawn` check above. A
+    /// caller that reads its floor from somewhere writable has learned nothing
+    /// here and should keep its last key and retry.
     ///
     /// `#[non_exhaustive]` on the variant for the same reason as
     /// [`Self::Withdrawn`]: it has a public field, and enum-level
@@ -1211,8 +1267,15 @@ impl PointerResolver {
                 // would launder whatever hash the caller's floor store happened
                 // to hold into a type whose entire promise is "this was
                 // verified". See `PointerOutcome::CompetingRecord`.
+                //
+                // The version comes off the RECORD even though this branch has
+                // already established the two are equal. Reading it from the
+                // floor would be correct today and would also make this the one
+                // place an outcome field is sourced from unverified caller
+                // state, which is the invariant the rest of this function is
+                // built to state without exception.
                 Ordering::Greater => PointerOutcome::CompetingRecord {
-                    version: self.floor.version,
+                    version: record.version,
                 },
             },
         }
@@ -1775,23 +1838,62 @@ mod tests {
         // corrupt read that produced it.
         assert_eq!(outcome.next_floor(), None);
 
-        // The same must hold for every reachable floor/record pairing: no
-        // outcome may ever carry a code hash that was not signature-verified
-        // in THIS resolution. (`forged` here just plays "some hash the
-        // resolver was not served".)
+        // The same must hold for every reachable floor/record pairing, on both
+        // channels by which floor bytes could survive a resolve: the outcome's
+        // own record AND `next_floor`, which the caller persists and re-reads.
+        //
+        // Both axes carry the tombstone. A withdrawal floor and a withdrawal
+        // record are ordinary values in the ordering, not special cases handled
+        // elsewhere, and that quadrant is where the sibling of the laundering
+        // bug lives: the tombstone sorts below every real hash, so a withdrawal
+        // floor meets a replayed pre-withdrawal record on the tiebreak path.
+        // (`forged` and `other` here just play "some hash the resolver was not
+        // served".)
+        let other = [0x55u8; 32];
         let key = signing_key(7);
         let params = pointer_params(&key.verifying_key(), APP_ID).unwrap();
+
+        let mut floors = vec![PointerFloor::never_resolved()];
         for floor_version in [4u32, 5, 6] {
-            for floor_hash in [forged, genuine, [0x55u8; 32]] {
-                let served = sign(&key, &params, 5, genuine).encode().to_vec();
-                let outcome =
-                    resolve_with(&vk, floor(floor_version, floor_hash), state(&served)).unwrap();
-                if let Some(r) = outcome.resolved() {
-                    assert_eq!(
-                        r.code_hash(),
-                        genuine,
-                        "outcome {outcome:?} carries a hash this resolve never verified"
-                    );
+            for floor_hash in [forged, genuine, other] {
+                floors.push(floor(floor_version, floor_hash));
+            }
+            floors.push(PointerFloor::withdrawn_at(floor_version).unwrap());
+        }
+
+        for served_version in [4u32, 5, 6] {
+            for served_hash in [genuine, forged, TOMBSTONE_CODE_HASH] {
+                let served = sign(&key, &params, served_version, served_hash)
+                    .encode()
+                    .to_vec();
+                for &f in &floors {
+                    let outcome = resolve_with(&vk, f, state(&served)).unwrap();
+
+                    if let Some(r) = outcome.resolved() {
+                        assert_eq!(
+                            (r.version(), r.code_hash()),
+                            (served_version, served_hash),
+                            "outcome {outcome:?} carries a record this resolve never verified \
+                             (floor {f:?})"
+                        );
+                        assert_ne!(
+                            served_hash, TOMBSTONE_CODE_HASH,
+                            "a tombstone record must never surface as a ResolvedPointer, \
+                             or the caller derives a key from 32 zero bytes: {outcome:?}"
+                        );
+                    }
+
+                    // A floor handed back is a floor the caller persists, so it
+                    // is a laundering channel of its own: it must describe the
+                    // record just verified, never the floor that went in.
+                    if let Some(next) = outcome.next_floor() {
+                        assert_eq!(
+                            (next.version(), next.code_hash()),
+                            (served_version, Some(served_hash)),
+                            "next_floor {next:?} does not describe the verified record \
+                             (outcome {outcome:?}, floor {f:?})"
+                        );
+                    }
                 }
             }
         }

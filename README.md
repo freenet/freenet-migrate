@@ -307,6 +307,13 @@ match outcome {
     // stands. No record is handed back on purpose: the winner is your floor,
     // which this crate never treats as verified. Keep your key; do not derive
     // one from anything here.
+    //
+    // Two caveats, both about what "your key" means. If your floor is itself a
+    // withdrawal, resuming with your last pre-withdrawal key resurrects the
+    // code the author retired, out of your own memory — so check first. And on
+    // a FIRST resolve from a build-time seed there is nothing last-resolved to
+    // keep; see "A seeded floor can reach CompetingRecord" below.
+    PointerOutcome::CompetingRecord { .. } if floor.is_withdrawn() => stop_resolving(),
     PointerOutcome::CompetingRecord { .. } => keep_last_resolved_and_retry(),
     // The ONLY case where falling back to your build-time key is safe.
     PointerOutcome::NeverPublished => use_baked_in_key(),
@@ -325,6 +332,40 @@ from the floor's `code_hash` bytes, because whatever can write your floor store
 would otherwise be choosing your key. `may_use_baked_in_fallback()` exists on
 both the outcome and the error so no caller has to re-derive when a fallback is
 legitimate: only `NeverPublished`, ever.
+
+### A seeded floor can reach `CompetingRecord` on its first resolve
+
+Seeding from build-time constants is the recommendation above, and it has one
+consequence to handle. If the author published two records at the seeded version
+— a retried or threshold-signed publish, the only way two valid records exist at
+one version — and your seed is the lower-hashed of the pair, then every resolve
+returns `CompetingRecord` until the author publishes *v+1*. On a first run that
+leaves you with nothing: no record, `may_use_baked_in_fallback()` false, and no
+advancing floor.
+
+A seeded consumer is not stuck there. Its floor holds a constant compiled into
+its own binary, so it may derive its key from **that constant** — the same value
+it would have used on `NeverPublished`. That is not the laundering this crate
+refuses. This crate will not read the floor's bytes because it cannot tell a
+genuine seed from a tampered store; you can, because you know where your own
+floor came from. Nor is it a downgrade: both records at a contested version are
+author-signed, the network's `merge` converges on the lower code hash, and
+reaching `CompetingRecord` *means* your floor is that lower hash, so using it
+agrees with the tiebreak rather than overriding it.
+
+The condition is provenance, not the variant. Derive from your floor only where
+you know it came from your own binary or your own prior verified resolution, and
+only after the `is_withdrawn()` check — a withdrawal floor reaches this variant
+too, and there "keep your key" would resurrect what the author retired. A
+consumer whose floor lives somewhere writable has learned nothing here and should
+keep its last key and retry.
+
+There is deliberately no separate `PointerFloor::seeded_at`. Splitting the
+constructor would only record your *claim* about provenance, since the bytes
+arriving are identical either way, so the resolver would be trusting an assertion
+it cannot check — and any caller that loaded a stored floor through the seeded
+constructor by mistake would get the fail-open back. Provenance stays on the side
+of the boundary that actually holds it.
 
 Reaching `NeverPublished` needs a `PointerIo` that can report a real
 `PointerFetch::Absent`. Implementing `PointerIo` directly is the recommended

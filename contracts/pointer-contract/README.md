@@ -69,15 +69,31 @@ This contract is the missing forward reference. See
 > ```rust
 > use freenet_migrate::pointer::{resolve_app_pointer, PointerFloor, PointerOutcome};
 >
-> // floor starts at `PointerFloor::never_resolved()`; persist
-> // `outcome.next_floor()` and pass it back on the next call, keyed by
-> // (author_vk, app_id).
+> // The floor starts at `PointerFloor::never_resolved()`, or better, seeded
+> // from your build-time constants. Persist `outcome.next_floor()` — including
+> // for a withdrawal — and pass it back next call, keyed by (author_vk, app_id).
 > let outcome = resolve_app_pointer(&mut io, &author_vk, b"river.room-contract", floor).await?;
 >
-> if let Some(record) = outcome.resolved() {
->     let key = record.contract_id(&my_own_params); // your own instance's params
+> match &outcome {
+>     // Your own instance's params, never the pointer's.
+>     PointerOutcome::Resolved(r) | PointerOutcome::Unchanged(r) => {
+>         use_key(r.contract_id(&my_own_params))
+>     }
+>     // The author retired the app. There is no current code; do not fall back.
+>     PointerOutcome::Withdrawn { .. } => stop_resolving(),
+>     // The only case where your build-time key is safe.
+>     PointerOutcome::NeverPublished => use_baked_in_key(),
+>     // Stale, CompetingRecord, Unavailable, and any future variant: nothing was
+>     // learned, so keep the key you last derived and retry. Never downgrade.
+>     // Two of these need care when your floor is a withdrawal or a first-run
+>     // build-time seed — see the crate README's full match.
+>     _ => keep_last_resolved_and_retry(),
 > }
 > ```
+>
+> Handle every arm. A bare `if let Some(record) = outcome.resolved()` silently
+> does nothing on the five outcomes that carry no record, which is how a
+> withdrawal, a downgrade attempt, and a plain timeout all become "no output".
 >
 > `io` implements the `PointerIo` trait (an async `PointerFetch` GET); wrap an
 > existing `ProbeIo` with `ConservativeProbeIo` if you have one already. See the
@@ -270,8 +286,30 @@ is an ordinary signed record at a version like any other. A consumer that stops
 resolving without recording that version leaves its floor at the pre-withdrawal
 value, and any peer can then serve a real, validly signed pre-withdrawal record,
 which supersedes that stale floor and resurrects code the author explicitly
-withdrew. Store the tombstone's version with an all-zero `code_hash` and treat
-it exactly like any other floor.
+withdrew.
+
+Persist the **fact** of the withdrawal — a flag, or a distinct row state —
+alongside the version, and rebuild the floor from that fact. Do **not** store it
+as a zeroed `code_hash` column and treat it like any other floor: a defaulted or
+half-written hash column has the same bytes, so a consumer that infers withdrawal
+from those bytes lets one bad row retire a healthy app permanently. Rust
+integrators have a constructor per case — `PointerFloor::withdrawn_at(version)`
+for a withdrawal, `PointerFloor::at(version, code_hash)` otherwise — and `at`
+**rejects** an all-zero hash for exactly that reason.
+
+If `at` does reject your stored floor, the floor store is untrustworthy: surface
+it. Never recover with `unwrap_or_else(|_| PointerFloor::never_resolved())`. That
+is the first thing to reach for and it reinstates the fail-open the rejection
+exists to close — it turns a corrupt floor into "first run", the one state that
+unlocks the baked-in build-time key, which is the same resurrection this
+paragraph is about, reached by a different route.
+
+Also note that the tombstone sorts below every real code hash. Once your floor is
+a withdrawal at version *v*, a replayed pre-withdrawal record at *v* loses the
+equal-version tiebreak rather than being reported as a withdrawal, so a consumer
+that treats "the tiebreak went my way, keep my last key" as its recovery path
+resurrects the app from its own memory. Check whether your floor is a withdrawal
+before resuming with any key (`PointerFloor::is_withdrawn`).
 
 ### Step 4 — persist the right thing
 
