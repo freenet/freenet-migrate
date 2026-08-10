@@ -152,6 +152,15 @@
 //! acceptable. A predecessor with withheld items does not get a completion marker,
 //! so the retry re-walks it.
 //!
+//! The same withholding covers a **failed flush**, which is the durability
+//! boundary for the buffering writer [`SuccessorSecretsIo::flush_predecessor`]
+//! exists for. Such a writer answers `Written` optimistically and loses the batch
+//! at flush time, so a flush failure withholds *every* key that predecessor
+//! resolved — `Written` and `AlreadyAuthoritative` alike, since "the successor's
+//! value is authoritative" can itself be unflushed buffer state — and re-counts
+//! its optimistic [`ImportTally::written`] as [`ImportTally::failed`], so the
+//! report never claims data the discarded buffer took with it.
+//!
 //! Honest limits — what stays app code the crate cannot verify: both I/O adapters
 //! (send / correlate / time out; and what the app's import path does with an item);
 //! what a "cheap no-op probe" is in the app's own delegate protocol; and
@@ -518,14 +527,29 @@ pub enum ItemWrite<E> {
     /// The app applied the item (however it chooses to: merged into an index,
     /// re-derived, re-signed, granted).
     Written,
-    /// The app deliberately did not apply the item, and that is a **complete,
-    /// correct** outcome — not a failure. Two reasons, both real:
+    /// The successor's own value stands, so the item was deliberately not applied
+    /// — a **complete, correct** outcome, not a failure. Two reasons, both real:
     ///
     /// * the successor already holds an authoritative value for it (never-clobber,
     ///   which is what [`SecretStoreIo`] does); or
-    /// * it is not the app's to copy verbatim — ghostkeys' import handler declines
+    /// * it is not the app's to copy verbatim — ghostkeys' import handler refuses
     ///   a predecessor's `gk:perms:` permission grants and records its own.
-    Declined,
+    ///
+    /// # This is NOT an error channel — never map a write error here
+    ///
+    /// Returning this for a write that *failed* is silent, unrecoverable data
+    /// loss, and it is a one-token mistake: an `Err(_) => …` arm in a writer's
+    /// `match` is exactly where it happens. This variant is counted in
+    /// [`ImportTally::skipped`], which [`ImportTally::is_clean`] treats as
+    /// success, so the predecessor earns its `Done` marker and is **never walked
+    /// again** — the data is gone with no failure anywhere in the report. The
+    /// variant is named for the assertion it makes about the *successor's* state
+    /// (its value is authoritative) precisely so that mapping an error onto it
+    /// reads as the false claim it is.
+    ///
+    /// A failed write is [`ItemWrite::retryable`] or [`ItemWrite::permanent`].
+    /// When in doubt, `retryable`: it costs a re-walk, not the data.
+    AlreadyAuthoritative,
     /// The app could not apply the item.
     Failed {
         /// The app's error.
@@ -540,9 +564,10 @@ impl<E> ItemWrite<E> {
     pub fn written() -> Self {
         ItemWrite::Written
     }
-    /// The app deliberately did not apply the item; not a failure.
-    pub fn declined() -> Self {
-        ItemWrite::Declined
+    /// The successor's own value stands; the item was deliberately not applied.
+    /// **Not an error channel** — see [`ItemWrite::AlreadyAuthoritative`].
+    pub fn already_authoritative() -> Self {
+        ItemWrite::AlreadyAuthoritative
     }
     /// The write failed transiently; a retry may succeed.
     pub fn retryable(error: E) -> Self {
@@ -580,7 +605,7 @@ impl<E> ItemWrite<E> {
 ///   writer that appends to a list must insert into a set. [`RecoveredSecret::retry`]
 ///   says when a re-attempt is in progress.
 /// * **Never-clobber is the implementer's choice.** The crate does not check whether
-///   the successor already holds an item; return [`ItemWrite::Declined`] to skip it,
+///   the successor already holds an item; return [`ItemWrite::AlreadyAuthoritative`] to skip it,
 ///   which is what [`SecretStoreIo`] does for a key it already has.
 /// * **Aggregate secrets are read-merge-write, and that is yours to get right.** An
 ///   item whose value is a *collection* — an index, a list, a set, a count, a
@@ -692,6 +717,21 @@ impl NoCrossEntryInvariantsAck {
 ///
 /// **Only sound when no stored entry is derived from the others** — hence the
 /// [`NoCrossEntryInvariantsAck`] in the constructor. See the module docs.
+///
+/// # Unbounded-retry limit
+///
+/// [`SecretStore::set_secret`] reports only `bool`, so this writer cannot tell a
+/// transient storage refusal from a permanent one and reports **every** refusal as
+/// [`RetryAdvice::Retryable`] — it can never produce
+/// [`ImportTally::rejected`](ImportTally::rejected). Against a store that refuses
+/// some key deterministically (a size cap, a reserved prefix, a quota), the report's
+/// [`retry_may_help`](DelegateMigrationReport::retry_may_help) stays `true` forever,
+/// so a caller that retries while it is `true` never terminates. **Bound the retry
+/// count** and surface the residue; the `rejected`-is-not-retryable path only saves
+/// a caller from that loop for a writer that can actually say `Permanent`. A writer
+/// implementing [`SuccessorSecretsIo`] over the app's own import path can, via
+/// [`ItemWrite::permanent`] — but note its shelf-life contract on
+/// [`RetryAdvice::Permanent`] before reaching for it.
 #[derive(Debug)]
 pub struct SecretStoreIo<'a, S: ?Sized> {
     store: &'a mut S,
@@ -776,11 +816,16 @@ impl<S: SecretStore + ?Sized> SuccessorSecretsIo for SecretStoreIo<'_, S> {
     ) -> impl Future<Output = ItemWrite<Self::Error>> {
         let outcome = if self.store.has_secret(item.key) {
             // Successor already has data under this key — do not clobber it.
-            ItemWrite::Declined
+            ItemWrite::AlreadyAuthoritative
         } else if self.store.set_secret(item.key, item.value) {
             ItemWrite::Written
         } else {
-            // A storage refusal is transient as far as this crate can tell.
+            // `SecretStore::set_secret` reports only a bool, so a refusal that will
+            // never succeed is indistinguishable from one that will. This writer
+            // therefore NEVER emits `RetryAdvice::Permanent` — see the
+            // "unbounded-retry limit" section on `SecretStoreIo`. Reporting a
+            // deterministic refusal as `Permanent` would be worse: `Permanent` does
+            // not withhold the key, so an older generation could shadow it.
             ItemWrite::retryable(SecretStoreWriteFailed {
                 key: item.key.to_vec(),
             })
@@ -795,20 +840,35 @@ impl<S: SecretStore + ?Sized> SuccessorSecretsIo for SecretStoreIo<'_, S> {
 /// bookkeeping markers are filtered before counting).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ImportTally {
-    /// Items the app's writer applied.
+    /// Items the app's writer applied **and whose durability
+    /// [`SuccessorSecretsIo::flush_predecessor`] confirmed**.
+    ///
+    /// A buffering writer legitimately answers [`ItemWrite::Written`] for an item
+    /// it has only buffered, so this count is not final until the flush returns.
+    /// If the flush fails, every such item is re-counted in [`failed`](Self::failed)
+    /// instead — this field never claims data that a discarded buffer took with it,
+    /// which is what makes [`DelegateMigrationReport::imported_total`] safe to show
+    /// a user as "recovered N secrets".
     pub written: usize,
-    /// Items the app deliberately did not apply ([`ItemWrite::Declined`]) — already
-    /// held, or not the app's to copy verbatim. Not a failure.
+    /// Items the app deliberately did not apply ([`ItemWrite::AlreadyAuthoritative`])
+    /// — the successor's own value stands, or the item is not the app's to copy
+    /// verbatim. Not a failure.
     pub skipped: usize,
-    /// Items whose write failed **retryably** ([`RetryAdvice::Retryable`]).
+    /// Items whose write failed **retryably** ([`RetryAdvice::Retryable`]), plus —
+    /// when [`SuccessorSecretsIo::flush_predecessor`] fails — every item that
+    /// predecessor's writer had accepted, since a buffering writer's failed flush
+    /// discards them.
     pub failed: usize,
     /// Items the successor's import path **permanently refused**
     /// ([`RetryAdvice::Permanent`]). Re-running will not change this.
     pub rejected: usize,
-    /// Items never offered to the writer because a **newer** predecessor holds a
-    /// retryable failure on the same key: importing an older generation's value
-    /// there would shadow the newer one under never-clobber. A retry re-attempts
-    /// the newer predecessor first (see the module docs).
+    /// Items never offered to the writer because a **newer** predecessor left the
+    /// same key unresolved: it failed retryably there, or that predecessor's flush
+    /// failed after resolving it (so the successor-side outcome — written, or
+    /// "already authoritative" — went down with the discarded buffer). Importing
+    /// an older generation's value into that hole would shadow the newer one under
+    /// never-clobber. A retry re-attempts the newer predecessor first (see the
+    /// module docs).
     pub withheld: usize,
 }
 
@@ -1076,6 +1136,11 @@ impl DelegateMigrationReport {
     /// report whose only blemish is permanently-rejected items: those will be
     /// refused identically forever, so a retry loop would spin. Surface them to the
     /// user instead.
+    ///
+    /// **Bound your retries anyway.** This says a retry *could* help, not that it
+    /// *will*: a deterministic successor-side fault reported as retryable keeps it
+    /// `true` indefinitely, and [`SecretStoreIo`] cannot report anything else (see
+    /// its "unbounded-retry limit"). Retry a few times, then surface what is left.
     pub fn retry_may_help(&self) -> bool {
         self.predecessors.iter().any(|p| match p {
             PredecessorMigration::Unresponsive { .. }
@@ -1454,6 +1519,11 @@ where
             let mut tally = ImportTally::default();
             let mut failure: Option<WriterFailure> = None;
             let mut newly_withheld: Vec<Vec<u8>> = Vec::new();
+            // Keys this predecessor resolved without an error, whose durability the
+            // flush has not confirmed yet. A buffering writer answers per item
+            // optimistically and only finds out at flush time, so if the flush
+            // fails these are exactly the keys whose successor-side state is a lie.
+            let mut unflushed: Vec<Vec<u8>> = Vec::new();
             for (item_key, item_value) in items {
                 if withheld_keys.iter().any(|w| w == item_key) {
                     tally.withheld += 1;
@@ -1471,8 +1541,19 @@ where
                 // permission grants, certificate verification, fingerprint
                 // derivation) is preserved for free.
                 match successor.write_secret(&item).await {
-                    ItemWrite::Written => tally.written += 1,
-                    ItemWrite::Declined => tally.skipped += 1,
+                    ItemWrite::Written => {
+                        tally.written += 1;
+                        unflushed.push(item_key.clone());
+                    }
+                    ItemWrite::AlreadyAuthoritative => {
+                        tally.skipped += 1;
+                        // "The successor's value is authoritative" can itself be
+                        // unflushed buffer state — including a value THIS run wrote
+                        // for an earlier duplicate key. If the flush discards it,
+                        // the claim evaporates with it, so this key is as unproven
+                        // as a written one.
+                        unflushed.push(item_key.clone());
+                    }
                     ItemWrite::Failed {
                         error,
                         retry: advice,
@@ -1518,6 +1599,34 @@ where
                         error: format!("{e:?}"),
                     });
                 }
+
+                // The flush is the DURABILITY BOUNDARY, and this is the arm that
+                // makes the withholding rule sound for the writer shape
+                // `flush_predecessor` exists for. A buffering writer answers
+                // `Written` optimistically and loses the whole batch here, so
+                // without this the run would have withheld NOTHING: an older
+                // generation would then be offered the same key, write its value
+                // into the hole, flush clean, earn its `Done` marker — and on the
+                // next run the newer value would be declined under never-clobber
+                // and the older generation would shadow it permanently, with the
+                // report reading `is_complete()`.
+                //
+                // So a failed flush un-does the optimism two ways:
+                //   * every optimistically-`Written` item is re-counted as a
+                //     retryable failure, so `imported_total()` never reports data
+                //     that a discarded buffer took with it; and
+                //   * every key this predecessor resolved (written OR
+                //     already-authoritative) is withheld from older generations for
+                //     the rest of the run.
+                //
+                // Withholding rather than halting the walk is deliberate: halting
+                // is the pre-0.5.0 behaviour this release removed, where one
+                // storage fault on the newest generation abandoned every older one
+                // even under `UnionAllGenerations`. Withholding keeps the walk and
+                // protects only the affected keys.
+                tally.failed += tally.written;
+                tally.written = 0;
+                withheld_keys.extend(unflushed);
             }
 
             // Phase 2: upgrade to the completion marker ONLY if everything landed.
@@ -1640,6 +1749,8 @@ mod tests {
         registered_generations: Vec<u32>,
         /// force a transport error from probe_executable for these keys.
         error_on_probe: HashSet<Vec<u8>>,
+        /// force `register_successor` to fail, for the wrapper's error path.
+        fail_register: bool,
     }
 
     #[derive(Debug, PartialEq, Eq)]
@@ -1663,6 +1774,10 @@ mod tests {
         }
         fn error_probe(mut self, key: &DelegateKey) -> Self {
             self.error_on_probe.insert(key.bytes().to_vec());
+            self
+        }
+        fn failing_registration(mut self) -> Self {
+            self.fail_register = true;
             self
         }
     }
@@ -1697,6 +1812,9 @@ mod tests {
             self.registered += 1;
             self.registered_generations
                 .extend(predecessors.iter().map(|e| e.generation));
+            if self.fail_register {
+                return Err(IoAbort);
+            }
             Ok(())
         }
     }
@@ -2778,6 +2896,45 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_failed_registration_returns_err_and_moves_no_secrets() {
+        // `register_delegate_with_migration` documents "no secrets have moved at
+        // that point" for a failed registration. That rests on one `?`, and nothing
+        // else in the suite exercises the error path — swallowing it (running the
+        // migration against a successor the node never registered) left all tests
+        // green. Assert both halves: the error propagates, and no predecessor was
+        // round-tripped and no successor state touched.
+        let a = entry(1, 1);
+        let b = entry(2, 2);
+        let mut writer = ScriptedWriter::default();
+        let mut io = MockIo::default()
+            .executable_with(&key_of(&a), &[(b"k1", b"v1")])
+            .executable_with(&key_of(&b), &[(b"k2", b"v2")])
+            .failing_registration();
+
+        let result = block_on(register_delegate_with_migration(
+            &mut writer,
+            &mut io,
+            &[a, b],
+            ack(),
+            union(),
+        ));
+
+        assert!(
+            result.is_err(),
+            "a failed register_successor must propagate, not be swallowed"
+        );
+        assert_eq!(io.registered, 1, "registration was in fact attempted");
+        assert!(
+            io.probed.is_empty() && io.fetched.is_empty(),
+            "no predecessor may be round-tripped once registration failed"
+        );
+        assert!(
+            writer.applied.is_empty() && writer.markers.is_empty(),
+            "no successor state may be written once registration failed"
+        );
+    }
+
     // ---- consent shape (P1#5) ------------------------------------------------
 
     #[test]
@@ -2987,7 +3144,7 @@ mod tests {
                 return ItemWrite::retryable(WriterErr("storage"));
             }
             if self.applied.contains_key(item.key) {
-                return ItemWrite::declined();
+                return ItemWrite::already_authoritative();
             }
             self.applied.insert(item.key.to_vec(), item.value.to_vec());
             ItemWrite::written()
@@ -3000,6 +3157,332 @@ mod tests {
             }
             Ok(())
         }
+    }
+
+    // ---- a BUFFERING successor writer ----------------------------------------
+
+    /// A writer whose per-item `Written` is **optimistic**: items land in a pending
+    /// batch and only become durable when `flush_predecessor` succeeds. A failing
+    /// flush **discards** the batch.
+    ///
+    /// This is the writer shape `flush_predecessor` exists for — a UI-side adopter
+    /// whose only route to the successor store is an awaited round-trip, which is
+    /// what Delta will be. `ScriptedWriter` cannot model it: it applies to
+    /// `applied` inside `write_secret`, so its flush failure loses nothing and every
+    /// flush test written against it is blind to what a real buffering writer does.
+    #[derive(Default)]
+    struct BufferingWriter {
+        /// Durable state (post-flush).
+        applied: BTreeMap<Vec<u8>, Vec<u8>>,
+        /// Accepted but not yet durable. Dropped by a failed flush.
+        pending: BTreeMap<Vec<u8>, Vec<u8>>,
+        markers: HashMap<Vec<u8>, MigrationMarker>,
+        fail_flush: BTreeSet<Vec<u8>>,
+    }
+
+    impl BufferingWriter {
+        fn fail_flush(mut self, predecessor: &DelegateKey) -> Self {
+            self.fail_flush.insert(predecessor.bytes().to_vec());
+            self
+        }
+        /// Seed unflushed app-side state, so a never-clobber `AlreadyAuthoritative`
+        /// can be a claim about buffer contents rather than durable storage.
+        fn pending_before_migration(mut self, key: &[u8], value: &[u8]) -> Self {
+            self.pending.insert(key.to_vec(), value.to_vec());
+            self
+        }
+        fn stop_failing_flush(&mut self) {
+            self.fail_flush.clear();
+        }
+        fn durable(&self, key: &[u8]) -> Option<&Vec<u8>> {
+            self.applied.get(key)
+        }
+    }
+
+    impl SuccessorSecretsIo for BufferingWriter {
+        type Error = WriterErr;
+
+        async fn migration_marker(
+            &mut self,
+            query: &MarkerQuery<'_>,
+        ) -> Result<Option<MigrationMarker>, WriterErr> {
+            Ok(self.markers.get(query.predecessor.bytes()).copied())
+        }
+
+        async fn record_marker(
+            &mut self,
+            predecessor: &DelegateKey,
+            marker: MigrationMarker,
+        ) -> Result<(), WriterErr> {
+            self.markers.insert(predecessor.bytes().to_vec(), marker);
+            Ok(())
+        }
+
+        async fn write_secret(&mut self, item: &RecoveredSecret<'_>) -> ItemWrite<WriterErr> {
+            // Never-clobber over BOTH durable and pending state — the honest thing
+            // for a batching writer, and the reason a failed flush can invalidate
+            // an `AlreadyAuthoritative` answer as well as a `Written` one.
+            if self.applied.contains_key(item.key) || self.pending.contains_key(item.key) {
+                return ItemWrite::already_authoritative();
+            }
+            self.pending.insert(item.key.to_vec(), item.value.to_vec());
+            // Optimistic: nothing is durable until the flush.
+            ItemWrite::written()
+        }
+
+        async fn flush_predecessor(&mut self, predecessor: &DelegateKey) -> Result<(), WriterErr> {
+            if self.fail_flush.contains(predecessor.bytes()) {
+                self.pending.clear();
+                return Err(WriterErr("flush"));
+            }
+            self.applied.append(&mut self.pending);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_failed_flush_withholds_its_keys_so_an_older_generation_cannot_shadow_the_newer_value() {
+        // THE bug this fix exists for. Under Union the walk continues past a failed
+        // flush, so unless the flush withholds what it lost, the older generation
+        // writes its value into the hole, flushes clean, and earns a `Done` marker
+        // — after which never-clobber declines the newer value forever and the
+        // report reads clean. `written` is only ever incremented in the item loop,
+        // so before this fix NOTHING was withheld for a buffering writer.
+        let older = entry(1, 1);
+        let newer = entry(2, 2);
+        let mut writer = BufferingWriter::default().fail_flush(&key_of(&newer));
+        let mut io = MockIo::default()
+            .executable_with(&key_of(&older), &[(b"k", b"v1")])
+            .executable_with(&key_of(&newer), &[(b"k", b"v2")]);
+
+        let report = block_on(migrate_delegate_secrets(
+            &mut writer,
+            &mut io,
+            &[older, newer],
+            ack(),
+            union(),
+        ));
+
+        // The older generation's value must NOT have landed.
+        assert_eq!(
+            writer.durable(b"k"),
+            None,
+            "the older generation must not fill the hole a failed flush left"
+        );
+        // ... and the older predecessor must NOT be sealed, or the retry would skip it.
+        assert!(
+            !matches!(
+                writer.markers.get(key_of(&older).bytes()),
+                Some(MigrationMarker::Done { .. })
+            ),
+            "a predecessor with withheld items must not earn a completion marker"
+        );
+
+        let newer_tally = report
+            .predecessors
+            .iter()
+            .find_map(|p| match p {
+                PredecessorMigration::Incomplete {
+                    key,
+                    tally,
+                    failure,
+                    ..
+                } if *key == key_of(&newer) => Some((*tally, failure.clone())),
+                _ => None,
+            })
+            .expect("the flush-failing predecessor is Incomplete");
+        assert_eq!(newer_tally.0.written, 0, "a discarded batch is not written");
+        assert_eq!(newer_tally.0.failed, 1);
+        assert_eq!(
+            newer_tally.1.map(|f| f.stage),
+            Some(WriterStage::Flush),
+            "the flush is the reported failure stage"
+        );
+
+        let older_tally = report
+            .predecessors
+            .iter()
+            .find_map(|p| match p {
+                PredecessorMigration::Incomplete { key, tally, .. } if *key == key_of(&older) => {
+                    Some(*tally)
+                }
+                _ => None,
+            })
+            .expect("the older predecessor is Incomplete (its key was withheld)");
+        assert_eq!(older_tally.withheld, 1, "the newer key is withheld");
+        assert_eq!(older_tally.written, 0);
+
+        assert!(!report.is_complete());
+        assert!(report.retry_may_help());
+        assert_eq!(report.imported_total(), 0);
+    }
+
+    #[test]
+    fn the_retry_after_a_failed_flush_lands_the_newer_value_not_the_older_one() {
+        // End-to-end consequence of the withholding: run 1 loses the batch, run 2
+        // recovers the NEWER generation's value. Without the withholding, run 1
+        // durably lands `v1` from the older generation and seals it, so run 2
+        // declines `v2` under never-clobber and the user is left on the older value
+        // with a report that says the migration completed.
+        let older = entry(1, 1);
+        let newer = entry(2, 2);
+        let preds = [older, newer];
+        let mut writer = BufferingWriter::default().fail_flush(&key_of(&newer));
+        let secrets = |io: MockIo| {
+            io.executable_with(&key_of(&older), &[(b"k", b"v1")])
+                .executable_with(&key_of(&newer), &[(b"k", b"v2")])
+        };
+
+        let first = block_on(migrate_delegate_secrets(
+            &mut writer,
+            &mut secrets(MockIo::default()),
+            &preds,
+            ack(),
+            union(),
+        ));
+        assert!(first.retry_may_help());
+
+        writer.stop_failing_flush();
+        let second = block_on(migrate_delegate_secrets(
+            &mut writer,
+            &mut secrets(MockIo::default()),
+            &preds,
+            ack(),
+            union(),
+        ));
+
+        assert_eq!(
+            writer.durable(b"k").map(Vec::as_slice),
+            Some(b"v2".as_slice()),
+            "the retry must land the NEWER generation's value"
+        );
+        assert!(second.is_complete(), "the retry completes cleanly");
+        assert!(!second.retry_may_help());
+    }
+
+    #[test]
+    fn a_failed_flush_withholds_already_authoritative_keys_too() {
+        // `AlreadyAuthoritative` can be a claim about UNFLUSHED buffer state: this
+        // writer never-clobbers over its pending batch, so the successor's own
+        // not-yet-durable `v0` is what declines the newer generation's `v2`. When
+        // the flush then discards that batch, the claim evaporates — and if the key
+        // were not withheld, the OLDER generation's `v1` would land durably and
+        // shadow a value the successor itself considered authoritative.
+        let older = entry(1, 1);
+        let newer = entry(2, 2);
+        let mut writer = BufferingWriter::default()
+            .pending_before_migration(b"k", b"v0")
+            .fail_flush(&key_of(&newer));
+        let mut io = MockIo::default()
+            .executable_with(&key_of(&older), &[(b"k", b"v1")])
+            .executable_with(&key_of(&newer), &[(b"k", b"v2")]);
+
+        let report = block_on(migrate_delegate_secrets(
+            &mut writer,
+            &mut io,
+            &[older, newer],
+            ack(),
+            union(),
+        ));
+
+        assert_eq!(writer.durable(b"k"), None);
+        let newer_tally = report
+            .predecessors
+            .iter()
+            .find_map(|p| match p {
+                PredecessorMigration::Incomplete { key, tally, .. } if *key == key_of(&newer) => {
+                    Some(*tally)
+                }
+                _ => None,
+            })
+            .expect("Incomplete");
+        assert_eq!(
+            newer_tally.skipped, 1,
+            "the item was declined, not written — so nothing is re-counted as failed"
+        );
+        assert_eq!(newer_tally.written, 0);
+        assert_eq!(newer_tally.failed, 0);
+
+        let older_tally = report
+            .predecessors
+            .iter()
+            .find_map(|p| match p {
+                PredecessorMigration::Incomplete { key, tally, .. } if *key == key_of(&older) => {
+                    Some(*tally)
+                }
+                _ => None,
+            })
+            .expect("the older predecessor is Incomplete");
+        assert_eq!(
+            older_tally.withheld, 1,
+            "a declined-against-unflushed key must be withheld too"
+        );
+        assert!(report.retry_may_help());
+    }
+
+    #[test]
+    fn a_failed_flush_never_reports_buffered_items_as_imported() {
+        // `imported_total()` is what an adopter surfaces as "recovered N secrets".
+        // A buffering writer answers `Written` for items it has only buffered, so
+        // counting those after a failed flush tells the user data landed precisely
+        // when it did not.
+        let only = entry(1, 1);
+        let mut writer = BufferingWriter::default().fail_flush(&key_of(&only));
+        let mut io = MockIo::default()
+            .executable_with(&key_of(&only), &[(b"a", b"1"), (b"b", b"2"), (b"c", b"3")]);
+
+        let report = block_on(migrate_delegate_secrets(
+            &mut writer,
+            &mut io,
+            core::slice::from_ref(&only),
+            ack(),
+            union(),
+        ));
+
+        assert_eq!(
+            report.imported_total(),
+            0,
+            "nothing was flushed, so nothing was imported"
+        );
+        assert_eq!(report.failed_total(), 3);
+        let tally = report
+            .predecessors
+            .iter()
+            .find_map(|p| match p {
+                PredecessorMigration::Incomplete { tally, .. } => Some(*tally),
+                _ => None,
+            })
+            .expect("Incomplete");
+        assert_eq!(tally.offered(), 3, "the bucket sum is preserved");
+        assert!(!tally.is_clean());
+        assert!(tally.retry_may_help());
+    }
+
+    #[test]
+    fn a_clean_flush_still_reports_its_buffered_items_as_imported() {
+        // The counterweight: the re-classification must fire ONLY on a failed
+        // flush. A mutation that always moved `written` into `failed` would pass
+        // every test above.
+        let only = entry(1, 1);
+        let mut writer = BufferingWriter::default();
+        let mut io =
+            MockIo::default().executable_with(&key_of(&only), &[(b"a", b"1"), (b"b", b"2")]);
+
+        let report = block_on(migrate_delegate_secrets(
+            &mut writer,
+            &mut io,
+            core::slice::from_ref(&only),
+            ack(),
+            union(),
+        ));
+
+        assert_eq!(report.imported_total(), 2);
+        assert_eq!(report.failed_total(), 0);
+        assert!(report.is_complete());
+        assert_eq!(
+            writer.durable(b"a").map(Vec::as_slice),
+            Some(b"1".as_slice())
+        );
     }
 
     // ---- the successor writer is actually what writes ------------------------
@@ -3183,7 +3666,14 @@ mod tests {
             matches!(
                 &report.predecessors[0],
                 PredecessorMigration::Incomplete {
-                    tally: ImportTally { written: 1, .. },
+                    // The item was accepted by the writer, but the flush is the
+                    // durability boundary: an unflushed item is a retryable
+                    // failure, never a `written`.
+                    tally: ImportTally {
+                        written: 0,
+                        failed: 1,
+                        ..
+                    },
                     failure: Some(WriterFailure {
                         stage: WriterStage::Flush,
                         ..
@@ -3229,9 +3719,12 @@ mod tests {
                 &report.predecessors[0],
                 PredecessorMigration::Incomplete {
                     tally: ImportTally {
-                        written: 1,
+                        // `good` was accepted but never flushed, so it is a
+                        // retryable failure rather than a `written`; `bad` stays
+                        // permanently rejected.
+                        written: 0,
                         rejected: 1,
-                        failed: 0,
+                        failed: 1,
                         ..
                     },
                     failure: Some(WriterFailure {
@@ -3666,7 +4159,7 @@ mod tests {
             if key.starts_with(b"gk:perms:") {
                 // Never copy a predecessor's grants verbatim; this app records its
                 // own below.
-                return ItemWrite::declined();
+                return ItemWrite::already_authoritative();
             }
             if key == GK_INDEX {
                 // MERGE, never replace — the whole point. The successor's own
@@ -3685,7 +4178,7 @@ mod tests {
                 _ => return ItemWrite::permanent(WriterErr("not a ghostkeys secret")),
             };
             if self.store.has_secret(key) {
-                return ItemWrite::declined();
+                return ItemWrite::already_authoritative();
             }
             self.store.set_secret(key, item.value);
             // The invariants a raw pair copy cannot know about:

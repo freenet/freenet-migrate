@@ -52,7 +52,7 @@ them, routing the write through the app's own import path fixes all four.
   `DelegateMigrationReport::retry_may_help` is `false` for a report whose only
   blemish is permanent rejections, so an app surfaces them instead of spinning a
   retry loop. `rejected_total` / `failed_total` are new.
-* `ItemWrite::Declined` covers both "already held" and "not mine to copy verbatim"
+* `ItemWrite::AlreadyAuthoritative` covers both "already held" and "not mine to copy verbatim"
   (ghostkeys declines a predecessor's permission grants and records its own) and is
   a complete, correct outcome.
 
