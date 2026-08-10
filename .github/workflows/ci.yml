@@ -48,8 +48,9 @@ jobs:
   docs:
     # `pointer`'s safety story is carried substantially by its doc comments, and
     # a link to a type a redesign deleted is how that rots. `cargo test` never
-    # runs rustdoc, so the `deny(rustdoc::broken_intra_doc_links)` in lib.rs
-    # needs this job to fire at all.
+    # runs rustdoc, so this job IS the enforcement: `RUSTDOCFLAGS: -D warnings`
+    # below turns a broken intra-doc link into a build failure. Deliberately not
+    # a `deny` attribute in lib.rs, which downstream doc builds would inherit.
     name: rustdoc (no broken links)
     runs-on: ubuntu-latest
     steps:

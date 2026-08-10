@@ -57,9 +57,11 @@
 #![forbid(unsafe_code)]
 // The safety story of `pointer` is carried substantially by its prose, and a
 // link to a type that no longer exists is how that prose rots. Two such links
-// survived a redesign here and CI did not notice, so the lint is on and the
-// `docs` CI job runs rustdoc.
-#![deny(rustdoc::broken_intra_doc_links)]
+// survived a redesign here and CI did not notice. That is enforced by the
+// `docs` CI job (`cargo doc` under `RUSTDOCFLAGS: -D warnings`) rather than by
+// a `deny` here: an in-source `deny` on a rustdoc lint is inherited by
+// downstream doc builds, so a future rustc that flags something new would break
+// consumers of this crate rather than this crate's own CI.
 
 pub mod contract;
 pub mod delegate;

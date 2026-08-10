@@ -89,8 +89,8 @@ pub enum MigrateError {
     UserScopeNotAtRest,
     /// A serialized payload could not be encoded/decoded.
     Codec(String),
-    /// Forward discovery through an author's successor-pointer contract failed:
-    /// bad params, a record that did not verify, or a corrupt caller-supplied
+    /// Forward discovery through an author's **pointer contract** failed: bad
+    /// params, a record that did not verify, or a corrupt caller-supplied
     /// floor. See [`crate::pointer::PointerError`].
     ///
     /// Note this does **not** cover ordering. A record that loses to the
@@ -152,7 +152,11 @@ impl fmt::Display for MigrateError {
                 "hosted per-user secrets cannot be migrated at rest (only while the user is online)"
             ),
             MigrateError::Codec(e) => write!(f, "payload codec error: {e}"),
-            MigrateError::Pointer(e) => write!(f, "successor-pointer resolution failed: {e}"),
+            // "pointer-contract", never "successor pointer": `BadSignature` and
+            // `StaleGeneration` above belong to the older, unrelated
+            // `SuccessorPointer` primitive and render with that name. A caller
+            // reading logs must be able to tell the two mechanisms apart.
+            MigrateError::Pointer(e) => write!(f, "pointer-contract resolution failed: {e}"),
         }
     }
 }

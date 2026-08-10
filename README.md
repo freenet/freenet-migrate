@@ -255,8 +255,15 @@ use freenet_migrate::{resolve_app_pointer, PointerFloor, PointerOutcome};
 // the anti-rollback anchor. A consumer that knows the app's version and hash at
 // build time should seed from those constants rather than starting empty: a
 // first resolve has nothing to compare against and adopts any signed record.
+//
+// Store the withdrawal as its own fact, and rebuild through the matching
+// constructor. `at` REFUSES an all-zero code hash: that is what a defaulted or
+// half-written column looks like, and it is also the tombstone, so inferring a
+// withdrawal from those bytes would let one bad row retire a healthy app
+// permanently.
 let floor = match load_floor(&AUTHOR_VK, b"river.room-contract") {
-    Some((version, code_hash)) => PointerFloor::at(version, code_hash)?,
+    Some(Stored::Withdrawn { version })      => PointerFloor::withdrawn_at(version)?,
+    Some(Stored::Live { version, code_hash}) => PointerFloor::at(version, code_hash)?,
     None => PointerFloor::never_resolved(),
 };
 
@@ -264,16 +271,24 @@ let outcome = match resolve_app_pointer(&mut io, &AUTHOR_VK, b"river.room-contra
     Ok(outcome) => outcome,
     // A rejected record says nothing about whether a pointer exists, so this
     // must never fall back. `err.may_use_baked_in_fallback()` is always false.
-    Err(err) => return keep_last_resolved(err),
+    // It is equally not a reason to STOP: this peer's answer was refused, not
+    // the pointer. Answering one GET with 99 bytes is the cheapest hostile move
+    // there is, and on a first run there is nothing last-resolved to keep, so
+    // treating it as terminal would leave you with no key at all. Retry.
+    Err(err) => return keep_last_resolved_and_retry(err),
 };
 
 // Persist first: this is what stops a later replay, including after a
 // withdrawal (a tombstone is a signed record at a version like any other, so
 // its version has to become your floor or a pre-withdrawal record replays).
 if let Some(next) = outcome.next_floor() {
-    // `next_floor()` always carries a hash, so the `expect` cannot fire.
-    let code_hash = next.code_hash().expect("a floor that advances carries a code hash");
-    store_floor(&AUTHOR_VK, b"river.room-contract", next.version(), code_hash);
+    if next.is_withdrawn() {
+        store_withdrawn(&AUTHOR_VK, b"river.room-contract", next.version());
+    } else {
+        // A non-withdrawn advancing floor always carries a hash.
+        let code_hash = next.code_hash().expect("a floor that advances carries a code hash");
+        store_floor(&AUTHOR_VK, b"river.room-contract", next.version(), code_hash);
+    }
 }
 
 match outcome {
@@ -288,6 +303,11 @@ match outcome {
     // and not an attack signal. Already refused; keep whatever your floor says
     // (which may itself be a withdrawal) and retry.
     PointerOutcome::Stale { .. } => keep_last_resolved_and_retry(),
+    // A DIFFERENT record at your own version lost the tiebreak, so your floor
+    // stands. No record is handed back on purpose: the winner is your floor,
+    // which this crate never treats as verified. Keep your key; do not derive
+    // one from anything here.
+    PointerOutcome::CompetingRecord { .. } => keep_last_resolved_and_retry(),
     // The ONLY case where falling back to your build-time key is safe.
     PointerOutcome::NeverPublished => use_baked_in_key(),
     // Timed out, unreachable, or an empty body. Never downgrade on this.
@@ -300,9 +320,11 @@ match outcome {
 
 Signature verification is local and never trusts the responding node, and
 `ResolvedPointer` has no public constructor, so the only way to hold one is to
-have resolved it. `may_use_baked_in_fallback()` exists on both the outcome and
-the error so no caller has to re-derive when a fallback is legitimate: only
-`NeverPublished`, ever.
+have resolved it — including in the tiebreak cases: no outcome is ever built
+from the floor's `code_hash` bytes, because whatever can write your floor store
+would otherwise be choosing your key. `may_use_baked_in_fallback()` exists on
+both the outcome and the error so no caller has to re-derive when a fallback is
+legitimate: only `NeverPublished`, ever.
 
 Reaching `NeverPublished` needs a `PointerIo` that can report a real
 `PointerFetch::Absent`. Implementing `PointerIo` directly is the recommended
@@ -322,6 +344,18 @@ freenet-core#5194's settled decisions there is no delegated signing and no
 in-protocol rotation; rotation is by convention, so publishers should use a
 dedicated long-lived pointer key kept offline. A stolen author key is
 unmitigated at this layer.
+
+Two limits on recency, in opposite directions. **Backward replay is bounded** by
+the floor: nothing that loses to what you already verified is adopted.
+**Forward suppression is not bounded, and cannot be at this layer**: a peer that
+answers every GET with a genuine, correctly-signed but superseded record holds
+you on old code indefinitely, and you cannot detect it — the 100-byte state
+carries no timestamp or freshness proof, and the contract's WASM is frozen, so
+adding one would re-key every published pointer. What stays bounded is *what*
+you can be held on: every record adopted is one the author signed for this exact
+app, so suppression can stall an upgrade but never substitute code. The
+mitigation is operational: resolve repeatedly over time, since a single honest
+response advances the floor for good.
 
 ### 3. Delegate secret carry-forward (runtime)
 
