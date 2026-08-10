@@ -322,6 +322,15 @@ let mut successor = SecretStoreIo::new(
 );
 ```
 
+**Aggregate secrets are read-merge-write.** The seam makes correct behaviour
+possible; it does not make it automatic. An item whose value is a collection — an
+index, a list, a count — must be merged into what the successor already holds. The
+two ways to get it wrong are mirror images: *skipping* the write hides entries
+(ghostkeys' `gk:index` under never-clobber), while *overwriting* deletes them
+(Delta's `StoreKnownSites { sites }` replaces the whole list, so forwarding a
+predecessor's `known_sites` straight into it destroys every site the user added on
+the new version). Only the app knows which of its secrets are aggregates.
+
 [freenet/ghostkeys#32]: https://github.com/freenet/ghostkeys/pull/32
 
 #### Partial failure, and what a retry is worth

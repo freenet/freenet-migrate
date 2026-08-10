@@ -572,6 +572,19 @@ impl<E> ItemWrite<E> {
 /// * **Never-clobber is the implementer's choice.** The crate does not check whether
 ///   the successor already holds an item; return [`ItemWrite::Declined`] to skip it,
 ///   which is what [`SecretStoreIo`] does for a key it already has.
+/// * **Aggregate secrets are read-merge-write, and that is yours to get right.** An
+///   item whose value is a *collection* — an index, a list, a set, a count, a
+///   signature over the set — must be merged into what the successor already holds,
+///   never written over it. This seam makes that possible; it does not make it
+///   automatic, and the crate cannot tell an aggregate from a standalone secret.
+///
+///   Both ways of getting it wrong are real, and they are mirror images. Skipping
+///   the write hides entries: ghostkeys' `gk:index` under never-clobber leaves
+///   recovered credentials in the store with nothing listing them. Overwriting
+///   deletes them: Delta's `StoreKnownSites { sites }` replaces the entire list, so
+///   an adapter that forwards a predecessor's `known_sites` straight into it
+///   destroys every site the user added on the new version. Read the successor's
+///   current value, merge, then write.
 /// * **Marker fidelity.** Record `Done` only once the item writes are durable. The
 ///   crate calls [`flush_predecessor`](Self::flush_predecessor) before asking for
 ///   the `Done` marker, so a buffering writer has a place to fail honestly instead
