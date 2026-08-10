@@ -110,4 +110,39 @@ reserved-namespace filter all behave as before.
 `predecessor_migration_had_data` is now public, so an implementer of the marker
 contract can read back the same flag `predecessor_done_marker` writes.
 
+### Known limitations
+
+Read these before writing a `SuccessorSecretsIo` adapter. Each is documented at the
+API it affects; the first two are tracked for a later release.
+
+* **Withholding is scoped to one call** ([#15]). The withheld-key set is never
+  persisted, so it protects only within the run that built it. Under
+  `UnionAllGenerations` a failed flush followed by a retry while the predecessor is
+  transiently unreachable lets an older generation install its value and seal it,
+  after which never-clobber declines the newest generation's value permanently — and
+  the report reads complete. See `UnionAck`.
+* **`imported_total()` under-reports, sometimes to zero** ([#16]). A failed flush
+  re-counts optimistic writes as `failed`, which is right for a buffering writer but
+  wrong for a write-through one whose flush failed *after* the items were durable.
+  The retry then counts them `skipped`, so a fully successful migration can report 0
+  recovered secrets. Do not render it to a user unqualified. See `ImportTally::written`.
+* **`NewestSnapshotWins` falls through an unsealed empty predecessor** ([#17]).
+  Emptiness that was never sealed by a completion marker still authorises importing
+  and sealing older generations, so a predecessor that reports data on the retry has
+  already had its delete-by-absence overridden.
+* **Union's newest-wins guarantee is the writer's to keep.** It holds *only* because
+  a never-clobber writer declines a key the successor already has. An overwriting
+  writer, which the trait contract permits, ends with the **oldest** generation's
+  value installed and a clean report. See the never-clobber bullet on
+  `SuccessorSecretsIo`.
+* **Markers must be durable on return, not batched.** `flush_predecessor` flushes the
+  *items*; a writer that batches markers alongside them can lose the `InProgress`
+  marker and with it the sticky-data flag. See `SuccessorSecretsIo::record_marker`.
+* **`ImportTally::is_clean` / `retry_may_help` are per-item, not per-predecessor.** A
+  flush or completion-marker failure leaves a clean-looking tally on an `Incomplete`
+  row. Drive retries from `DelegateMigrationReport::retry_may_help`.
+
 [freenet/ghostkeys#32]: https://github.com/freenet/ghostkeys/pull/32
+[#15]: https://github.com/freenet/freenet-migrate/issues/15
+[#16]: https://github.com/freenet/freenet-migrate/issues/16
+[#17]: https://github.com/freenet/freenet-migrate/issues/17

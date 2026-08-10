@@ -161,6 +161,12 @@
 //! its optimistic [`ImportTally::written`] as [`ImportTally::failed`], so the
 //! report never claims data the discarded buffer took with it.
 //!
+//! **Withholding is scoped to a single call.** The withheld-key set is built fresh
+//! each run and never persisted, so it protects only within the run that created
+//! it. Under `UnionAllGenerations` that boundary can permanently shadow the newest
+//! generation's value across a retry, with a clean report — the sequence is on
+//! [`UnionAck`], and closing it is freenet/freenet-migrate#15.
+//!
 //! Honest limits — what stays app code the crate cannot verify: both I/O adapters
 //! (send / correlate / time out; and what the app's import path does with an item);
 //! what a "cheap no-op probe" is in the app's own delegate protocol; and
@@ -172,6 +178,7 @@
 //! [`PredecessorSecretsIo::probe_executable`]).
 
 use core::future::Future;
+use std::collections::BTreeSet;
 
 use freenet_stdlib::prelude::{CodeHash, DelegateKey};
 
@@ -250,8 +257,11 @@ pub enum SecretSelectionPolicy {
     /// the v1 wire carries no generations/policy — see `SecretTransport`.
     NewestSnapshotWins,
     /// **Opt-in recovery.** Import *every* predecessor newest-first, with the
-    /// newest generation's value still winning any key conflict (the app's writer
-    /// declines a key it already holds; [`SecretStoreIo`] does so never-clobber).
+    /// newest generation's value winning any key conflict **only because the app's
+    /// writer declines a key it already holds** ([`SecretStoreIo`] does so
+    /// never-clobber). An overwriting writer inverts that guarantee silently and
+    /// installs the *oldest* generation's value — see the never-clobber bullet on
+    /// [`SuccessorSecretsIo`] before choosing this policy.
     /// This is the freenet/river#204 stranded-older-generation recovery mode.
     ///
     /// It **resurrects delete-by-absence data**: a key deleted in a newer
@@ -263,8 +273,49 @@ pub enum SecretSelectionPolicy {
 /// Opt-in token for [`SecretSelectionPolicy::UnionAllGenerations`]. Deliberately
 /// not `Default`: holding one acknowledges that union import can resurrect
 /// secrets a newer generation deleted by absence.
+///
+/// # The second hazard: withholding is run-scoped
+///
+/// The withheld-key set that stops an older generation from shadowing a newer
+/// value lives **only for the duration of one [`migrate_delegate_secrets`] call**.
+/// It is built fresh each call and never persisted, so a retry starts with it
+/// empty. Under Union, where neither an `Unresponsive` newest generation nor a
+/// failed flush halts the walk, that boundary can lose the newest generation's
+/// value for good:
+///
+/// 1. **Run 1.** The newest generation resolves key `k` and its flush fails. `k`
+///    is withheld, so no older generation may supply it. Nothing is sealed.
+/// 2. **Run 2.** The newest generation is *transiently* unreachable. Union does
+///    not terminate on `Unresponsive`, and the withheld set is empty again, so an
+///    older generation writes its own `k = v1`, flushes clean, and earns
+///    `Done { had_data: true }`.
+/// 3. **Run 3.** The newest generation is back and offers `k = v2`. The successor
+///    already holds `v1`, so a never-clobber writer declines it as
+///    [`ItemWrite::AlreadyAuthoritative`]. The tally is clean, the marker seals,
+///    and the report reads
+///    [`is_complete`](DelegateMigrationReport::is_complete)` == true` with
+///    [`retry_may_help`](DelegateMigrationReport::retry_may_help)` == false`.
+///
+/// The durable value is the older `v1`, the newest generation's `v2` is shadowed
+/// permanently, and nothing in the report says so.
+///
+/// This is a **different** loss from the delete-by-absence resurrection above:
+/// there the newer generation's *deletion* is undone, here its *value* is, and
+/// unlike the resurrection case the report afterwards reads clean. The trigger is
+/// mundane rather than adversarial, and its two halves are correlated: a flush
+/// fails because the app is degraded, and the retry lands while the predecessor is
+/// still not answering.
+///
+/// Closing it means persisting withheld keys across runs, a design change tracked
+/// in freenet/freenet-migrate#15. Until then: prefer
+/// [`NewestSnapshotWins`](SecretSelectionPolicy::NewestSnapshotWins) unless
+/// stranded-generation recovery is specifically what you need, and retry a run
+/// that reports [`ImportTally::withheld`] items promptly, before the predecessor
+/// can go unreachable.
 #[must_use = "a UnionAck acknowledges that union import resurrects secrets a newer \
-              generation deleted by absence; construct it only if that is intended"]
+              generation deleted by absence, AND that withholding is run-scoped so a \
+              retry can let an older generation shadow the newest value (see the docs); \
+              construct it only if that is intended"]
 #[derive(Debug)]
 pub struct UnionAck(());
 
@@ -604,9 +655,27 @@ impl<E> ItemWrite<E> {
 ///   a *completed* predecessor, but a retry after a partial run re-offers them. A
 ///   writer that appends to a list must insert into a set. [`RecoveredSecret::retry`]
 ///   says when a re-attempt is in progress.
-/// * **Never-clobber is the implementer's choice.** The crate does not check whether
-///   the successor already holds an item; return [`ItemWrite::AlreadyAuthoritative`] to skip it,
-///   which is what [`SecretStoreIo`] does for a key it already has.
+/// * **Never-clobber is the implementer's choice, and Union's newest-wins guarantee
+///   rests entirely on it.** The crate does not check whether the successor already
+///   holds an item; return [`ItemWrite::AlreadyAuthoritative`] to skip it, which is
+///   what [`SecretStoreIo`] does for a key it already has.
+///
+///   Under [`SecretSelectionPolicy::UnionAllGenerations`] the *only* mechanism
+///   making the newest generation's value win a shared key is that predecessors are
+///   offered newest-first and the writer declines a key it already holds. Nothing
+///   else enforces it: the crate cannot read the successor, so it cannot tell a
+///   decline from an overwrite. A writer with ordinary overwrite semantics — which
+///   this contract permits, and which is the natural shape of an app's own
+///   `import` handler — receives the newest value first and then lets every older
+///   generation overwrite it in turn, ending with the **oldest** generation's value
+///   installed and a completely clean report. That is the exact inversion of what
+///   Union promises, it is silent, and no [`SecretSelectionPolicy`] setting detects
+///   it.
+///
+///   So if your import path overwrites: either read the successor's current value
+///   and return [`ItemWrite::AlreadyAuthoritative`] when it already holds the key,
+///   or do not use `UnionAllGenerations`. (An *aggregate* item is the separate case
+///   below: merge it, do not resolve it either way by key precedence.)
 /// * **Aggregate secrets are read-merge-write, and that is yours to get right.** An
 ///   item whose value is a *collection* — an index, a list, a set, a count, a
 ///   signature over the set — must be merged into what the successor already holds,
@@ -644,6 +713,28 @@ pub trait SuccessorSecretsIo {
     /// Called twice per imported predecessor: [`MigrationMarker::InProgress`]
     /// before the first item, [`MigrationMarker::Done`] only after every item and
     /// the flush succeeded.
+    ///
+    /// **Markers must be durable when this returns, not batched.**
+    /// [`flush_predecessor`](Self::flush_predecessor) is specified as flushing what
+    /// the *items* were buffered into, and the crate never flushes a marker on its
+    /// own path. A writer that routes markers through the same batch as its items
+    /// therefore breaks in two ways:
+    ///
+    /// * The [`InProgress`](MigrationMarker::InProgress) marker is lost exactly when
+    ///   that batch's flush fails, which silently drops the **sticky-data flag**. The
+    ///   retry then finds no in-progress marker and computes `saw_data` from that
+    ///   run's items alone, so a predecessor that answers empty on the retry can seal
+    ///   `Done { had_data: false }`. Under
+    ///   [`SecretSelectionPolicy::NewestSnapshotWins`] that misclassifies a
+    ///   data-bearing generation as `NoData` and falls through to older generations,
+    ///   resurrecting keys it had deleted — the exact failure the sticky-data rule
+    ///   exists to prevent.
+    /// * The [`Done`](MigrationMarker::Done) marker is recorded *after* the only
+    ///   flush the crate performs, so a batched one is never flushed by the crate at
+    ///   all. It would need the app's next unrelated flush to land, and until then
+    ///   the predecessor is re-walked and re-imported on every run.
+    ///
+    /// Persist the marker synchronously, on its own path if necessary.
     fn record_marker(
         &mut self,
         predecessor: &DelegateKey,
@@ -846,9 +937,27 @@ pub struct ImportTally {
     /// A buffering writer legitimately answers [`ItemWrite::Written`] for an item
     /// it has only buffered, so this count is not final until the flush returns.
     /// If the flush fails, every such item is re-counted in [`failed`](Self::failed)
-    /// instead — this field never claims data that a discarded buffer took with it,
-    /// which is what makes [`DelegateMigrationReport::imported_total`] safe to show
-    /// a user as "recovered N secrets".
+    /// instead, so this field never claims data that a discarded buffer took with
+    /// it.
+    ///
+    /// **It under-reports in the other direction, and can read zero for a migration
+    /// that fully succeeded.** The reclassification cannot tell a buffering writer
+    /// (whose items really are gone) from a **write-through** writer whose
+    /// [`SuccessorSecretsIo::flush_predecessor`] failed at something *after* the
+    /// items were already durable: committing an index, closing a transaction,
+    /// fsyncing a manifest. For that writer the items are counted `failed` even
+    /// though they landed, and the retry that succeeds finds them already present
+    /// and counts them [`skipped`](Self::skipped). `written` is then `0` on both
+    /// runs, so [`DelegateMigrationReport::imported_total`] reads **0 across the
+    /// whole migration**. [`SecretStoreIo`] is exactly this shape, so it is the
+    /// default writer's behaviour, not an exotic one.
+    ///
+    /// The direction is the safe one (it never overstates), but do **not** render
+    /// this to a user as an unqualified "recovered N secrets": a successful
+    /// recovery can report zero. Gate the message on
+    /// [`DelegateMigrationReport::is_complete`], and read [`offered`](Self::offered)
+    /// for how many items the predecessor actually had. Tracked in
+    /// freenet/freenet-migrate#16.
     pub written: usize,
     /// Items the app deliberately did not apply ([`ItemWrite::AlreadyAuthoritative`])
     /// — the successor's own value stands, or the item is not the app's to copy
@@ -878,8 +987,23 @@ impl ImportTally {
         self.written + self.skipped + self.failed + self.rejected + self.withheld
     }
 
-    /// Whether every offered item resolved: nothing failed, was rejected, or was
-    /// withheld. Only a clean tally earns a completion marker.
+    /// Whether every offered **item** resolved: nothing failed, was rejected, or
+    /// was withheld. A clean tally is necessary for a completion marker.
+    ///
+    /// **It is not sufficient, and a clean tally does not mean the predecessor
+    /// completed.** Completion also requires that no *stage* failed, and a stage
+    /// failure can leave every item clean. If
+    /// [`SuccessorSecretsIo::flush_predecessor`] fails for a predecessor whose items
+    /// were all [`ItemWrite::AlreadyAuthoritative`], nothing was written, so nothing
+    /// is re-counted: the tally is `{ skipped: n }`, this returns `true`, and
+    /// [`retry_may_help`](Self::retry_may_help) returns `false`, while the
+    /// predecessor is still reported
+    /// [`Incomplete`](PredecessorMigration::Incomplete) and did not earn its marker.
+    /// The same holds when the `Done` marker write itself fails.
+    ///
+    /// Judge completion from [`DelegateMigrationReport::is_complete`] and
+    /// retryability from [`DelegateMigrationReport::retry_may_help`], both of which
+    /// fold in the stage failure. Never from this alone.
     pub fn is_clean(&self) -> bool {
         self.failed == 0 && self.rejected == 0 && self.withheld == 0
     }
@@ -888,6 +1012,13 @@ impl ImportTally {
     /// was withheld pending a newer predecessor's retry. A tally whose only
     /// blemish is [`rejected`](Self::rejected) is **not** retryable — the successor
     /// refuses those items and always will.
+    ///
+    /// **This is per-item, not per-predecessor.** A predecessor whose items were all
+    /// clean but whose flush or completion marker failed has a tally that answers
+    /// `false` here while a retry genuinely would help (see
+    /// [`is_clean`](Self::is_clean)).
+    /// [`DelegateMigrationReport::retry_may_help`] folds the stage failure in and is
+    /// the one to drive a retry loop from.
     pub fn retry_may_help(&self) -> bool {
         self.failed > 0 || self.withheld > 0
     }
@@ -971,9 +1102,13 @@ pub enum PredecessorMigration {
     /// marker itself could not be recorded. **The completion marker is withheld**, so
     /// a retry re-runs this predecessor. A failed write is never counted as written.
     ///
-    /// `tally` says what was written and what was not; `failure` carries the first
-    /// successor-side failure and where it happened;
-    /// [`ImportTally::retry_may_help`] says whether retrying can change anything.
+    /// `tally` says what was written and what was not, and `failure` carries the
+    /// first successor-side failure and where it happened. For whether retrying can
+    /// change anything, read [`DelegateMigrationReport::retry_may_help`] and not
+    /// [`ImportTally::retry_may_help`]: the tally is per-item, so a row that failed
+    /// only at the flush or completion-marker stage has a clean, non-retryable-looking
+    /// tally (see [`ImportTally::is_clean`]) while the report correctly says a retry
+    /// may help.
     Incomplete {
         /// The predecessor delegate key.
         key: DelegateKey,
@@ -1084,6 +1219,11 @@ impl DelegateMigrationReport {
     }
 
     /// Total secrets written across all predecessors.
+    ///
+    /// **Under-reports after a recovered flush failure, sometimes all the way to
+    /// zero for a migration that recovered everything** — see [`ImportTally::written`]
+    /// for why, and freenet/freenet-migrate#16. Never present this as "recovered N
+    /// secrets" without checking [`is_complete`](Self::is_complete) first.
     pub fn imported_total(&self) -> usize {
         self.predecessors
             .iter()
@@ -1402,7 +1542,11 @@ where
         // must not supply them: under never-clobber its value would shadow the newer
         // one that is merely awaiting a retry. Permanently-rejected keys are NOT in
         // here — an older copy of such a key may be acceptable.
-        let mut withheld_keys: Vec<Vec<u8>> = Vec::new();
+        //
+        // A set, not a Vec: this is membership-tested once per offered item of every
+        // older generation, and it can hold every key of several generations at the
+        // enumeration cap. Scoped to this call only — see `UnionAck` and #15.
+        let mut withheld_keys: BTreeSet<Vec<u8>> = BTreeSet::new();
 
         for (key, generation) in ordered {
             if terminated {
@@ -1525,7 +1669,7 @@ where
             // fails these are exactly the keys whose successor-side state is a lie.
             let mut unflushed: Vec<Vec<u8>> = Vec::new();
             for (item_key, item_value) in items {
-                if withheld_keys.iter().any(|w| w == item_key) {
+                if withheld_keys.contains(item_key) {
                     tally.withheld += 1;
                     continue;
                 }
