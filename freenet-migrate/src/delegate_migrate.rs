@@ -2363,6 +2363,76 @@ mod tests {
     }
 
     #[test]
+    fn data_then_empty_retry_keeps_the_data_flag_and_still_supersedes_older() {
+        // The OTHER sticky-data direction, and the dangerous one. B (newest) is
+        // data-bearing on attempt 1 but a write fails, so it stays unsealed. On the
+        // retry B answers EMPTY. If the flag were recomputed from this attempt alone,
+        // B would seal as NoData, NewestSnapshotWins would fall through, and the
+        // older A's keys — which B's generation may have deliberately deleted —
+        // would be resurrected. The in-progress marker's flag is what prevents it.
+        let a = entry(1, 1);
+        let b = entry(2, 2);
+        let mut store = MemStore::default();
+        store.fail_writes_to(b"x");
+
+        // Run 1: B has data, its write fails → Incomplete, in-progress flag = data.
+        let mut io1 = MockIo::default()
+            .executable_with(&key_of(&b), &[(b"x", b"NEW")])
+            .executable_with(&key_of(&a), &[(b"a_only", b"va")]);
+        let r1 = block_on(migrate_delegate_secrets(
+            &mut store_io(&mut store),
+            &mut io1,
+            &[a, b],
+            ack(),
+            newest(),
+        ));
+        assert!(matches!(
+            r1.predecessors[0],
+            PredecessorMigration::Incomplete { .. }
+        ));
+        assert_eq!(
+            store.get_secret(&pred_wip_marker(&key_of(&b))).unwrap(),
+            PRED_DONE_MARKER_VALUE_DATA,
+            "the in-progress marker records that this attempt saw data"
+        );
+
+        // Run 2: B now answers EMPTY. The flag is sticky, so B is still the
+        // authoritative data-bearing snapshot and A is never imported.
+        store.stop_failing();
+        let mut io2 = MockIo::default()
+            .executable_with(&key_of(&b), &[])
+            .executable_with(&key_of(&a), &[(b"a_only", b"va")]);
+        let r2 = block_on(migrate_delegate_secrets(
+            &mut store_io(&mut store),
+            &mut io2,
+            &[a, b],
+            ack(),
+            newest(),
+        ));
+        assert!(
+            matches!(r2.predecessors[0], PredecessorMigration::Imported { .. }),
+            "a data-then-empty retry stays Imported, never NoData; got {:?}",
+            r2.predecessors[0]
+        );
+        assert_eq!(
+            store
+                .get_secret(&predecessor_done_marker(&key_of(&b), true).0)
+                .unwrap(),
+            PRED_DONE_MARKER_VALUE_DATA,
+            "the sealed marker must keep the data flag"
+        );
+        assert!(
+            matches!(r2.predecessors[1], PredecessorMigration::Superseded { .. }),
+            "the older A must stay Superseded; got {:?}",
+            r2.predecessors[1]
+        );
+        assert!(
+            store.get_secret(b"a_only").is_none(),
+            "a data-then-empty retry must not resurrect the older generation's keys"
+        );
+    }
+
+    #[test]
     fn empty_incomplete_then_data_retry_seals_the_marker_data_bearing() {
         // P1 sticky-data: the newer predecessor B is EMPTY on attempt 1 and its DONE
         // marker write fails (Incomplete); on the retry B brings DATA. The marker
