@@ -693,7 +693,7 @@ pub(crate) fn predecessor_already_migrated<S: SecretStore + ?Sized>(
 /// *data-bearing* predecessor it did the first time (an empty AlreadyMigrated
 /// predecessor is fallen through, a data-bearing one is authoritative). An
 /// unrecognized value is treated conservatively as data-bearing.
-pub(crate) fn predecessor_migration_had_data<S: SecretStore + ?Sized>(
+pub fn predecessor_migration_had_data<S: SecretStore + ?Sized>(
     store: &S,
     predecessor: &DelegateKey,
 ) -> Option<bool> {
@@ -731,7 +731,7 @@ pub(crate) fn legacy_generation_migrated_exact<S: SecretStore + ?Sized>(
 }
 
 /// The predecessor-key in-progress marker: `PRED_WIP_PREFIX ++ key bytes`.
-fn pred_wip_marker(predecessor: &DelegateKey) -> Vec<u8> {
+pub(crate) fn pred_wip_marker(predecessor: &DelegateKey) -> Vec<u8> {
     let mut k = PRED_WIP_PREFIX.to_vec();
     k.extend_from_slice(predecessor.bytes());
     k
@@ -786,7 +786,7 @@ pub fn predecessor_done_marker(predecessor: &DelegateKey, had_data: bool) -> (Ve
 }
 
 /// Whether `key` is in this crate's reserved marker namespace.
-fn is_marker(key: &[u8]) -> bool {
+pub(crate) fn is_marker(key: &[u8]) -> bool {
     key.starts_with(MARKER_NS)
 }
 

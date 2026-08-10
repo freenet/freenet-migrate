@@ -235,10 +235,14 @@ copy tomorrow) is an internal detail apps do not program against — that altitu
 is the whole point, so a future node copy-forward is a drop-in with no app
 re-adoption.
 
+Both ends are thin app-supplied adapters: **`PredecessorSecretsIo`** reads the
+predecessors, and **`SuccessorSecretsIo` — the app's own import path — writes the
+successor**. The crate decides *what* to migrate; the app does the *writing*.
+
 ```rust,ignore
 use freenet_migrate::{
-    migrate_delegate_secrets, MigrationAuthorization, PredecessorSecretsIo,
-    SecretSelectionPolicy,
+    migrate_delegate_secrets, ItemWrite, MigrationAuthorization, PredecessorSecretsIo,
+    RecoveredSecret, SecretSelectionPolicy, SuccessorSecretsIo,
 };
 
 // `io` implements PredecessorSecretsIo: `probe_executable` sends a cheap no-op to
@@ -246,10 +250,14 @@ use freenet_migrate::{
 // both in the app's own delegate protocol (DelegateRequest::ApplicationMessages),
 // with the app's own response correlation (a browser has no request/response
 // correlation, so the app supplies it — e.g. a per-request oneshot side-table).
+//
+// `successor` implements SuccessorSecretsIo: `write_secret` applies ONE recovered
+// item through the app's own import path, so every invariant the app maintains at
+// import time survives the migration (see "Why the app does the writing" below).
 // The report is the source of truth: transport errors become report rows, never a
 // bare error that would discard the predecessors already migrated.
 let report = migrate_delegate_secrets(
-    &mut ctx,                                    // successor SecretStore
+    &mut successor,                              // the app's own import path
     &mut io,                                     // reaches the predecessors
     DELEGATE_LINEAGE,                            // predecessor LIST (codegen'd)
     MigrationAuthorization::app_author_ack(),    // consent — required, no default
@@ -262,13 +270,81 @@ if !report.is_complete() {
         // A predecessor could not be reached — its data MAY exist but can't be
         // auto-migrated. Surface "your data may exist but can't auto-migrate";
         // NEVER silently fresh-install.
+    } else if report.retry_may_help() {
+        // Something failed transiently. Safe to retry: re-run
+        // migrate_delegate_secrets (completed predecessors are no-ops).
     } else {
-        // Only Incomplete rows remain — a storage write failed mid-import. Safe
-        // to retry: re-run migrate_delegate_secrets (already-migrated predecessors
-        // are no-ops, the incomplete one re-runs).
+        // Only permanently-rejected items remain (`report.rejected_total()`).
+        // Retrying will refuse them identically forever — surface them.
     }
 }
 ```
+
+#### Why the app does the writing
+
+Before 0.5.0 the successor end was a raw `(key, value)` copy into a `SecretStore`,
+one pair at a time, never-clobber. That is wrong for any app whose stored items
+carry **cross-entry invariants**, and it fails *silently*.
+
+The measured case is ghostkeys ([freenet/ghostkeys#32]), which stores each
+credential as several entries plus one `gk:index` entry listing which credentials
+exist, and one permission grant per credential. A raw pair copy skips exactly four
+things ghostkeys' own `ImportGhostKey` handler does:
+
+1. records a **permission grant** — without it the item is unusable even if listed;
+2. adds to the **index** the UI reads — without it the item is invisible;
+3. **verifies the certificate chain** against the compiled-in master key;
+4. **derives the fingerprint** delegate-side.
+
+So the recovered credential's bytes land in the store while nothing lists them and
+nothing may read them: permanently invisible, no error. **No `SecretSelectionPolicy`
+fixes this** — `UnionAllGenerations` recovers both generations' bytes and the older
+index write is still clobber-skipped — because the mover cannot know that entry
+needs *merging* rather than *replacing*. Re-run under review, 13 of 14 differential
+scenarios disagree between a raw-pair copy and the app's own import path; the single
+agreement is the case where nothing is recovered.
+
+An index-merge hook would have fixed one of the four. Routing the write through the
+app's own handler fixes all four. That is the argument for the seam: **the mover can
+never know an app's invariants and should not try.**
+
+Apps whose secrets genuinely stand alone keep the old behaviour in one line with
+`SecretStoreIo`, the raw-pair never-clobber writer over a `SecretStore` (the natural
+choice for a delegate-side import over `DelegateCtx`) — gated behind the loud
+`NoCrossEntryInvariantsAck` so the choice is visible at the call site:
+
+```rust,ignore
+use freenet_migrate::{NoCrossEntryInvariantsAck, SecretStoreIo};
+
+let mut successor = SecretStoreIo::new(
+    &mut ctx,
+    NoCrossEntryInvariantsAck::i_certify_these_secrets_have_no_cross_entry_invariants(),
+);
+```
+
+[freenet/ghostkeys#32]: https://github.com/freenet/ghostkeys/pull/32
+
+#### Partial failure, and what a retry is worth
+
+`write_secret` returns `ItemWrite::Written`, `Declined` (already held, or not the
+app's to copy verbatim), or `Failed { error, retry }` — where `retry` is
+`Retryable` or `Permanent`. Per predecessor the report carries an `ImportTally`
+(`written` / `skipped` / `failed` / `rejected` / `withheld`) plus the first
+successor-side failure and the stage it happened at, so an app learns what landed,
+what did not, and whether retrying can change anything
+(`DelegateMigrationReport::retry_may_help`). A predecessor with anything unresolved
+does not get a completion marker, so a retry re-runs it.
+
+**Termination is a policy question, not a failure question.** Before 0.5.0 a partial
+write halted the walk under *both* policies, so one storage failure on one key of the
+newest predecessor marked every older generation `Superseded` and recovered nothing
+from them — even under `UnionAllGenerations`, whose purpose is to walk every
+generation. Now a data-bearing predecessor is authoritative under
+`NewestSnapshotWins` whether or not its writes all landed (unchanged), and Union
+walks on. The one thing the old halt bought is kept by a narrower mechanism: a key
+whose write failed *retryably* is **withheld** from older predecessors for the rest
+of the run, so an older generation cannot shadow a newer value awaiting a retry. A
+*permanently rejected* key is not withheld — an older copy of it may be acceptable.
 
 Predecessors are a **list**, processed newest-generation-first. `SecretSelectionPolicy`
 decides the cross-generation behavior (the delegate-side analogue of the contract

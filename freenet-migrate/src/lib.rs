@@ -19,8 +19,12 @@
 //! * **Author-signed successor pointer** — [`SuccessorPointer`] / [`ReleaseSigner`].
 //! * **Delegate carry-forward** — the app-facing [`migrate_delegate_secrets`] /
 //!   [`register_delegate_with_migration`] entry points (consent-parameterized via
-//!   [`MigrationAuthorization`]) over the [`PredecessorSecretsIo`] adapter, plus
-//!   the delegate-side [`handle_export_request`] / [`import_predecessor_secrets_once`]
+//!   [`MigrationAuthorization`]) over two thin adapters: [`PredecessorSecretsIo`]
+//!   reads the predecessors, and [`SuccessorSecretsIo`] — **the app's own import
+//!   path** — writes the successor, so app-level invariants (a derived index,
+//!   permission grants, certificate verification) survive the migration. Apps whose
+//!   secrets stand alone wrap a [`SecretStore`] in [`SecretStoreIo`]. Plus the
+//!   delegate-side [`handle_export_request`] / [`import_predecessor_secrets_once`]
 //!   / [`import_secrets_once`] primitives over the [`SecretStore`] trait. The
 //!   transport the entry points drive is an internal, redesigned sans-IO seam
 //!   ([`delegate_migrate`]) a future node copy-forward swaps under.
@@ -64,15 +68,17 @@ pub use contract::{
 pub use delegate::{
     handle_export_request, import_predecessor_secrets_once, import_secrets_once,
     predecessor_delegate_keys, predecessor_delegate_keys_checked, predecessor_done_marker,
-    ExportRequest, ExportScope, ExportedSecrets, ImportOutcome, OriginPolicy,
-    PredecessorImportOutcome, SecretPair, SecretStore, SingleAppDelegateAck, HOST_ENUMERATION_CAP,
-    PRED_DONE_MARKER_KEY_PREFIX, PRED_DONE_MARKER_VALUE_DATA, PRED_DONE_MARKER_VALUE_EMPTY,
-    PRED_DONE_MARKER_VERSION,
+    predecessor_migration_had_data, ExportRequest, ExportScope, ExportedSecrets, ImportOutcome,
+    OriginPolicy, PredecessorImportOutcome, SecretPair, SecretStore, SingleAppDelegateAck,
+    HOST_ENUMERATION_CAP, PRED_DONE_MARKER_KEY_PREFIX, PRED_DONE_MARKER_VALUE_DATA,
+    PRED_DONE_MARKER_VALUE_EMPTY, PRED_DONE_MARKER_VERSION,
 };
 pub use delegate_migrate::{
     migrate_delegate_secrets, register_delegate_with_migration, DelegateMigrationReport,
-    MigrationAuthorization, PredecessorMigration, PredecessorSecretsIo, RegisterAndMigrateIo,
-    SecretSelectionPolicy, UnionAck,
+    ImportTally, ItemWrite, LegacyBridge, MarkerQuery, MigrationAuthorization, MigrationMarker,
+    NoCrossEntryInvariantsAck, PredecessorMigration, PredecessorSecretsIo, RecoveredSecret,
+    RegisterAndMigrateIo, RetryAdvice, SecretSelectionPolicy, SecretStoreIo,
+    SecretStoreWriteFailed, SuccessorSecretsIo, UnionAck, WriterFailure, WriterStage,
 };
 pub use driver::{
     contract_probe, migrate_contract, FoldAllAck, NewestFirst, Outcome, ProbeDriver, ProbeIo,
