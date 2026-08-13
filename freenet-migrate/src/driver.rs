@@ -1636,6 +1636,68 @@ mod tests {
         );
     }
 
+    /// The same guarantee on the **other** site that builds `Indeterminate`.
+    ///
+    /// `Outcome::Indeterminate` is constructed in two places — `finish_indeterminate`
+    /// (the policy halted at an unknown) and `finish_exhausted` (the walk ran
+    /// out of candidates without recovering anything). The test above only
+    /// reaches the first, so deleting `prepare_forward` from the second failed
+    /// nothing.
+    ///
+    /// That gap was on the branch an adopter actually executes: Delta drives
+    /// `FoldAll`, which never halts on an unknown, so **every** indeterminate
+    /// outcome it sees comes from the exhaustion path. An unarmed fix on the
+    /// live path is the failure mode this whole PR is about.
+    #[test]
+    fn prepare_forward_runs_on_the_exhausted_indeterminate_path() {
+        struct StripOps;
+        impl ProbeStateOps for StripOps {
+            type State = MiniState;
+            fn decode(&self, bytes: &[u8]) -> Option<MiniState> {
+                MiniOps.decode(bytes)
+            }
+            fn is_real(&self, s: &MiniState) -> bool {
+                MiniOps.is_real(s)
+            }
+            fn merge_with_local(&self, r: MiniState, l: &MiniState) -> MiniState {
+                MiniOps.merge_with_local(r, l)
+            }
+            fn prepare_forward(&self, mut s: MiniState) -> MiniState {
+                // Message 0 models the #427 upgrade pointer.
+                s.messages.retain(|m| *m != 0);
+                s
+            }
+        }
+        // FoldAll walks past the unknown to exhaustion, so this lands in
+        // `finish_exhausted` rather than `finish_indeterminate`.
+        let mut d = ProbeDriver::new(
+            StripOps,
+            MiniState::real(&[0, 5]),
+            NewestFirst::assume_ordered(vec![id(2), id(1)]),
+            SelectionPolicy::FoldAll(
+                FoldAllAck::i_understand_fold_all_resurrects_without_tombstones(),
+            ),
+        );
+        let Step::Get(a) = d.next_action() else {
+            panic!()
+        };
+        d.on_unknown(a);
+        let Step::Get(b) = d.next_action() else {
+            panic!("fold-all must keep walking past silence")
+        };
+        d.on_absent(b);
+        assert_eq!(d.next_action(), Step::Done);
+        let Some(Outcome::Indeterminate { local, unresolved }) = d.take_outcome() else {
+            panic!("one unanswered candidate and no hits is indeterminate")
+        };
+        assert_eq!(unresolved, vec![id(2)]);
+        assert_eq!(
+            local.messages,
+            vec![5],
+            "the stale pointer must be stripped on the EXHAUSTED indeterminate path too"
+        );
+    }
+
     /// Two lineage entries can share a `code_hash` (an identical rebuild
     /// re-published), which derives the same contract id twice. It must be
     /// recorded once, or an app deduplicating retries by this list double-counts

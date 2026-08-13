@@ -179,12 +179,20 @@ fn the_absent_and_seed_local_doc_blocks_each_carry_the_caveat() {
     );
 
     let seed_local = doc_block_before(&src, "    SeedLocal {");
+    // Deliberately NOT `contains(CAVEAT) || contains("ProbeAnswer::Absent")`.
+    // A cross-reference link is not a caveat, and accepting one as a substitute
+    // reopens the only drift that realistically happens here: rewrite the block
+    // to re-assert that sealing is safe, delete the caveat, and leave the
+    // `See [ProbeAnswer::Absent]` link untouched — nobody deletes a rustdoc link
+    // that still resolves. The `||` form stays green through exactly that edit;
+    // this form does not. Measured both ways.
     assert!(
-        seed_local.contains("ProbeAnswer::Absent") || seed_local.contains(CAVEAT),
-        "`Outcome::SeedLocal`'s doc block neither states the caveat nor points at \
-         `ProbeAnswer::Absent`. This is the doc an adopter reads while writing the \
-         match arm that stops the migration asking — the one place the conclusion is \
-         actually acted on."
+        seed_local.contains(CAVEAT),
+        "`Outcome::SeedLocal`'s doc block does not itself say the finding is {CAVEAT:?}. \
+         A link to `ProbeAnswer::Absent` does not count: this is the doc an adopter reads \
+         while writing the match arm that stops the migration asking, and someone writing \
+         that arm has no reason to follow the link. The caveat has to be where the \
+         conclusion is acted on, not only where the answer is defined."
     );
     assert!(
         seed_local.contains("freenet-migrate#8"),
