@@ -6,8 +6,9 @@
 `SelectionPolicy`, `ProbeIo`, `migrate_contract`, `contract_probe`, `CarryForward`,
 `SuccessorPointer`, `ReleaseSigner`, the lineage types) is **untouched**, so apps
 pinned at 0.3.x/0.4.x for the contract half are unaffected by this change. The
-delegate half has no adopters, so it is changed for the right shape rather than for
-compatibility.
+delegate half had no adopters when 0.5.0 shipped, so it is changed for the right
+shape rather than for compatibility. (River, Delta and ghostkeys have adopted the
+delegate half since; see the Adopters table in `README.md`.)
 
 ### The crate decides what to migrate; the app does the writing
 

@@ -670,10 +670,41 @@ entry point. 0.4.0 adds the delegate-side app-facing entry points
 preflight (so a broken old delegate surfaces rather than silently
 fresh-installing — freenet/river#204), and the redesigned sans-IO transport seam
 a future node-side copy-forward (freenet-core#2776) swaps under with no app
-re-adoption. Integrating River/Delta (pointing their `build.rs` at the codegen,
-then swapping their migration internals for crate calls) is the current adoption
-step ([freenet/river#398](https://github.com/freenet/river/issues/398)). Targets
-current stdlib **0.8.x**.
+re-adoption. 0.5.0 reshapes the delegate half so the crate decides what to
+migrate and the app does the writing; it is breaking on the delegate half only,
+leaving the contract-side surface untouched.
+
+**Published:** `freenet-migrate` **0.5.0**, `freenet-migrate-build` **0.2.0**.
+The two halves version independently, so an app can take one without the other.
+Targets current stdlib **0.8.x**.
+
+### Adopters
+
+The adoption tracked by
+[freenet/river#398](https://github.com/freenet/river/issues/398) has landed.
+Five apps now use the crate, and both halves have adopters.
+
+| App | `freenet-migrate` | `freenet-migrate-build` | Migrates |
+|-----|-------------------|-------------------------|----------|
+| [River](https://github.com/freenet/river) | 0.5 | 0.2 | delegate + contract |
+| [Delta](https://github.com/freenet/delta) | 0.5.0 | none | delegate + contract |
+| [ghostkeys](https://github.com/freenet/ghostkeys) | 0.5.0 | none | delegate |
+| [Atlas](https://github.com/freenet/atlas) | 0.5.0 | 0.2.0 | contract |
+| [freenet-git](https://github.com/freenet/freenet-git) | none | 0.2.0 | contract (registry codegen) |
+
+River and Delta each run the crate alongside the hand-rolled sweep they
+already had, a deliberate dual-running period that ends when the walk is
+field-validated and the sweep is retired. Delta takes the runtime half only
+and still hand-rolls its build-time registry codegen.
+
+freenet-git takes the build half only, and the reason is a hard constraint
+rather than a scheduling one. The runtime half is built against
+freenet-stdlib 0.8.x while that workspace is on 0.6.0, and stdlib exports
+`__frnt_set_id` as an unconditional `#[no_mangle] extern "C"` symbol
+(`rust/src/global.rs:4-5`), so linking two stdlib versions into one binary is
+a hard duplicate-symbol error under rust-lld. Adopting the runtime driver
+there is blocked on that workspace moving to stdlib 0.8, which re-keys every
+repo and is its own migration event.
 
 ## License
 

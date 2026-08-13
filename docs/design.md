@@ -209,6 +209,9 @@ KEK), so the crate returns `MigrateError::UserScopeNotAtRest` and documents the
 
 ## 5. Incremental adoption (no flag-day)
 
+> Written as a plan. Most of it has since landed; see Status below for what
+> actually happened, including where Delta diverged from this.
+
 **River:**
 
 1. point `ui/build.rs` + `common/build.rs` at `freenet_migrate_build::codegen()`:
@@ -240,7 +243,22 @@ predecessor rule is manual-only today — a real hardening). Its "cover every
 
 ## Status
 
-Draft: the reusable core machinery + tests, published as 0.1.0 and
-**field-validated by River's 0.6 → 0.8 re-key** (above). Integrating River and
-Delta (pointing their `build.rs` at the codegen, swapping their migration
-internals for crate calls) is a later step. Targets current stdlib **0.8.x**.
+Published: `freenet-migrate` **0.5.0** and `freenet-migrate-build` **0.2.0**.
+The two halves version independently. The reusable core machinery + tests,
+**field-validated by River's 0.6 → 0.8 re-key** (above).
+
+Section 5's adoption has largely landed, with deviations worth recording.
+River took both halves: `ui/build.rs` and `common/build.rs` call
+`freenet_migrate_build::codegen()`, and the delegate walk calls
+`migrate_delegate_secrets`. Delta took the runtime half on both its contract
+and delegate paths, and still hand-rolls its own build-time registry codegen
+with a local serde struct, so the codegen swap described above has not
+happened there; neither has its two-TOML merge nor the
+`add-migration.sh` / `add-contract-migration.sh` / `check-migration.sh`
+retirement. Both apps run the crate alongside their pre-existing hand-rolled
+sweeps during a deliberate dual-running period rather than replacing them
+outright.
+
+There are five adopters in total. `README.md`'s Status section carries the
+per-app breakdown of which half each one takes. Targets current stdlib
+**0.8.x**.
