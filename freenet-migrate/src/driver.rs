@@ -129,19 +129,29 @@ pub enum ProbeAnswer {
     /// Only return this for an answer you actually received. A deadline that
     /// expired is [`Unknown`](Self::Unknown).
     ///
-    /// **`Absent` is the strongest negative Freenet can give, which is not the
-    /// same as proof.** Absence is unauthenticated — any responding node can
-    /// claim "not found" — and a contract that genuinely exists can answer this
-    /// way while it is momentarily unfindable, which the network's documented
-    /// near-miss floor makes an ordinary event rather than a rare one. So
-    /// `Absent` means "asked, and told no", which is what makes it safe to
-    /// *advance past*; it does not license an irreversible conclusion. Where
-    /// the consequence of being wrong is permanent — sealing a generation as
-    /// empty forever, or overwriting on the strength of it — prefer an
-    /// idempotent operation that a later run can redo, and say so to the
-    /// operator. Atlas does exactly this: it reports a not-found generation
-    /// loudly and notes that re-running recovers it, because its merge is
-    /// idempotent.
+    /// # `Absent` is the strongest negative Freenet can give. It is not proof.
+    ///
+    /// Absence is unauthenticated — any responding node can claim "not found" —
+    /// and a contract that genuinely exists answers this way while it is
+    /// momentarily unfindable. **On the current network that is the common
+    /// case, not the corner case:** with the placement migration disabled
+    /// (freenet-core#4440), present-but-unfindable dead-ends measured ~99.6% of
+    /// all `get_not_found` traffic in production telemetry. A live-network
+    /// check independently found 20 of 25 apparent failures had a `NotFound`
+    /// logged for a key that exists.
+    ///
+    /// So `Absent` means **"asked, and told no"** — enough to advance the probe
+    /// past a candidate, which is all this crate does with it. It does not
+    /// license an irreversible conclusion. Where being wrong is permanent —
+    /// sealing a generation as empty forever, or overwriting on the strength of
+    /// it — make the operation idempotent so a later run recovers, require the
+    /// same answer across separate attempts, or check you have a healthy
+    /// connection first. Atlas is the worked example: it reports a not-found
+    /// generation loudly, tells the operator to re-run, and keeps its merge
+    /// idempotent so re-running works.
+    ///
+    /// This is a real limit of the network, not of this crate, and it is why
+    /// [`Outcome::SeedLocal`] deliberately does not claim to be sealable.
     Absent,
     /// Nothing was established: the request timed out, the send failed, the
     /// transport dropped, the response was unparseable at the transport layer,
@@ -329,7 +339,13 @@ pub enum Step {
 }
 
 /// Terminal result of a probe, taken once via [`ProbeDriver::take_outcome`].
+///
+/// `#[non_exhaustive]`: a future variant must not silently join an existing
+/// arm. Note the limit of that — it forces a wildcard arm on a `match`, but a
+/// `matches!(outcome, Outcome::Recovered { .. })` still absorbs a new variant
+/// without complaint, so it protects exhaustive matches only.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum Outcome<S> {
     /// A predecessor generation had real state. `merged` is
     /// `merge_with_local(recovered, local)` passed through `prepare_forward`
@@ -364,14 +380,42 @@ pub enum Outcome<S> {
         /// for a retry rather than recording it as finished.
         unresolved: Vec<ContractInstanceId>,
     },
-    /// Every candidate **answered**, and none had real state: seed the local
-    /// snapshot forward (passed through `prepare_forward`), so local-only
-    /// data survives. `local` is the snapshot handed to the driver.
+    /// Every candidate was **asked and answered**, and none of the answers
+    /// carried real state: seed the local snapshot forward (passed through
+    /// `prepare_forward`), so local-only data survives. `local` is the snapshot
+    /// handed to the driver.
     ///
-    /// This is a positive result — the predecessors were reached and had
-    /// nothing — so it is safe to record the migration as finished. A probe
-    /// that merely failed to reach its candidates is
-    /// [`Indeterminate`](Self::Indeterminate), never this.
+    /// A probe that failed to reach a candidate, or never got to one because
+    /// the hop cap fired, is [`Indeterminate`](Self::Indeterminate), never
+    /// this.
+    ///
+    /// # This is evidence of nothing-to-recover, not proof of it
+    ///
+    /// **The crate does not tell you it is safe to record the migration as
+    /// finished, because it cannot know that.** Sealing is the app's decision,
+    /// and this outcome is the input to it, not the answer. Two reasons the
+    /// evidence is weaker than it looks, both live today:
+    ///
+    /// * **A `NotFound` on Freenet is routinely wrong.** Absence is
+    ///   unauthenticated, and a contract that exists answers `NotFound` while
+    ///   it is momentarily unfindable. That is not a corner case at the time of
+    ///   writing: with the placement migration disabled (freenet-core#4440),
+    ///   present-but-unfindable dead-ends were measured at ~99.6% of all
+    ///   `get_not_found` traffic. So an all-`Absent` walk is, on the current
+    ///   network, more likely to be reporting a routing failure than an empty
+    ///   lineage. See [`ProbeAnswer::Absent`].
+    /// * **An undecodable answer also lands here.** [`ProbeStateOps::decode`]
+    ///   returning `None`, and [`ProbeStateOps::is_real`] returning `false`,
+    ///   are both misses — so a schema break across an entire lineage produces
+    ///   this outcome with every generation intact underneath it. Making a
+    ///   schema break distinguishable is freenet/freenet-migrate#8.
+    ///
+    /// So read this as **"asked everyone, found nothing this time"**. Seeding
+    /// `local` forward is fine — it is your own data and the PUT is
+    /// recoverable. Recording the predecessors as permanently empty on the
+    /// strength of one such walk is not. See the README's "Upgrading to 0.6.0"
+    /// for hardening that actually holds (idempotent re-runs, agreement across
+    /// separate attempts, a connectivity witness).
     SeedLocal {
         /// The prepared local snapshot to PUT forward.
         local: S,
@@ -380,21 +424,29 @@ pub enum Outcome<S> {
     /// state was recovered, so **whether there is anything to recover is still
     /// unknown** (freenet/freenet-migrate#19).
     ///
-    /// Do NOT treat this as [`SeedLocal`](Self::SeedLocal): seeding the local
-    /// snapshot forward and recording the migration as done would seal a
-    /// predecessor that was merely slow or temporarily unreachable as
-    /// permanently empty. Retry the probe on the next run instead. `local` is
-    /// handed back untouched (no `prepare_forward` — it is not going forward on
-    /// the strength of this outcome).
+    /// Do NOT treat this as [`SeedLocal`](Self::SeedLocal): recording the
+    /// migration as done here would seal a predecessor that was merely slow or
+    /// temporarily unreachable as permanently empty. Retry the probe on the
+    /// next run instead.
     ///
     /// An app that must produce *something* on a first run — no state under the
-    /// current key at all, and a predecessor that has been unreachable for many
-    /// attempts — can still seed `local` itself, but that is a deliberate app
-    /// decision with the uncertainty in hand, not a default it gets for free.
+    /// current key at all, and a predecessor unreachable across many attempts —
+    /// can still PUT `local` forward, and for that reason it **is** passed
+    /// through [`ProbeStateOps::prepare_forward`] like every other outgoing
+    /// snapshot. (It has to be: `prepare_forward` is where an app strips a
+    /// stale upgrade pointer out of state before it goes under the current key
+    /// — freenet/river#427 — so handing back an unprepared snapshot on the one
+    /// path that invites a judgement call would re-plant exactly what the hook
+    /// exists to remove.) Seeding it is a deliberate app decision made with the
+    /// uncertainty in hand, not a default it gets for free.
     Indeterminate {
-        /// The local snapshot passed to the driver, returned unchanged.
+        /// The prepared local snapshot. See the note above on why it is
+        /// prepared even though this outcome does not ask you to PUT it.
         local: S,
-        /// The candidates that never answered. Non-empty by construction.
+        /// The candidates whose state was not established. Non-empty by
+        /// construction. Covers both candidates that were asked and never
+        /// answered, and candidates the walk never reached — because the hop
+        /// cap fired, or because the policy halted at an earlier unknown.
         unresolved: Vec<ContractInstanceId>,
     },
     /// There were no candidates at all (fresh app / empty lineage): nothing
@@ -572,7 +624,11 @@ impl<O: ProbeStateOps> ProbeDriver<O> {
             return;
         }
         self.outstanding = None;
-        self.unresolved.push(id);
+        // Two lineage entries can share a code_hash (a re-published identical
+        // build), so the same id can come round twice; record it once.
+        if !self.unresolved.contains(&id) {
+            self.unresolved.push(id);
+        }
         if self.policy.unknown_terminates() && !self.continue_past_unknown {
             self.finish_indeterminate();
         }
@@ -582,11 +638,27 @@ impl<O: ProbeStateOps> ProbeDriver<O> {
     ///
     /// Renamed to [`on_unknown`](Self::on_unknown) in 0.6.0, which is what this
     /// forwards to: a timeout establishes nothing, and treating it as absence is
-    /// the data-loss default freenet/freenet-migrate#19 removed. Callers that
-    /// used this for a *positive* not-found answer should move to
-    /// [`on_absent`](Self::on_absent) — otherwise a reachable, genuinely-empty
-    /// lineage now reports [`Outcome::Indeterminate`] instead of
-    /// [`Outcome::SeedLocal`].
+    /// the data-loss default freenet/freenet-migrate#19 removed.
+    ///
+    /// # If you route a real not-found here, recovery stops working
+    ///
+    /// The forwarding is safe in the sense that matters most — it can never
+    /// seal a predecessor as empty. It is **not** a drop-in for a call site that
+    /// was also delivering positive absences through this method, and the
+    /// failure is not subtle:
+    ///
+    /// Under [`SelectionPolicy::NewestFirstWins`] an unknown **halts the walk**.
+    /// So an app whose only failure path is a watchdog — one that never handles
+    /// the network's `NotFound` and lets an absent generation fall through to a
+    /// timeout — will, after upgrading, stop at its first empty generation and
+    /// never ask the older ones. If the generation holding the user's data is
+    /// further down the lineage, it is never probed, and every probe ends in
+    /// [`Outcome::Indeterminate`]. That is a recovery **outage**, not a
+    /// conservative degradation: it goes from recovering to never recovering.
+    ///
+    /// River is exactly this shape today, so the upgrade is not optional there.
+    /// Wire the real not-found signal to [`on_absent`](Self::on_absent) — see
+    /// the README's "Upgrading to 0.6.0" — and the walk advances as before.
     #[deprecated(
         since = "0.6.0",
         note = "silence and absence are different facts: use `on_unknown` for a timeout or \
@@ -640,7 +712,16 @@ impl<O: ProbeStateOps> ProbeDriver<O> {
         let local = self.local.take().expect("local consumed once");
         // Candidates left unprobed means the hop cap fired, not exhaustion.
         let truncated_fold = !self.remaining.is_empty();
-        let unresolved = core::mem::take(&mut self.unresolved);
+        let mut unresolved = core::mem::take(&mut self.unresolved);
+        // A candidate the hop cap cut off was never ASKED, which is a stronger
+        // form of "we do not know" than one that failed to answer. Folding the
+        // unprobed remainder in here is what stops `SeedLocal` claiming "every
+        // candidate answered" for candidates the walk never reached.
+        for id in self.remaining.drain(..) {
+            if !unresolved.contains(&id) {
+                unresolved.push(id);
+            }
+        }
         let outcome = match self.fold_acc.take() {
             Some((source, folded)) => {
                 let merged = self.ops.merge_with_local(folded, &local);
@@ -652,12 +733,16 @@ impl<O: ProbeStateOps> ProbeDriver<O> {
                 }
             }
             // Nothing recovered. Whether that means "there was nothing" or
-            // "we never found out" is exactly the #19 distinction: only an
-            // all-answered walk earns the sealable SeedLocal.
+            // "we never found out" is exactly the #19 distinction: only a
+            // walk that asked every candidate AND got an answer from each
+            // reaches SeedLocal.
             None if unresolved.is_empty() => Outcome::SeedLocal {
                 local: self.ops.prepare_forward(local),
             },
-            None => Outcome::Indeterminate { local, unresolved },
+            None => Outcome::Indeterminate {
+                local: self.ops.prepare_forward(local),
+                unresolved,
+            },
         };
         self.phase = Phase::Done(Some(outcome));
     }
@@ -679,8 +764,17 @@ impl<O: ProbeStateOps> ProbeDriver<O> {
             "a policy that stops on silence never accumulates a fold"
         );
         let local = self.local.take().expect("local consumed once");
-        let unresolved = core::mem::take(&mut self.unresolved);
-        self.phase = Phase::Done(Some(Outcome::Indeterminate { local, unresolved }));
+        let mut unresolved = core::mem::take(&mut self.unresolved);
+        // Candidates the halt means we will never ask are unknown too.
+        for id in self.remaining.drain(..) {
+            if !unresolved.contains(&id) {
+                unresolved.push(id);
+            }
+        }
+        self.phase = Phase::Done(Some(Outcome::Indeterminate {
+            local: self.ops.prepare_forward(local),
+            unresolved,
+        }));
     }
 }
 
@@ -1080,8 +1174,16 @@ mod tests {
         assert_eq!(d.next_action(), first, "re-asking must not advance");
     }
 
+    /// The hop cap bounds the walk — and the candidates it cut off are
+    /// reported, not silently dropped.
+    ///
+    /// Before this was fixed the cap produced a clean `SeedLocal`, whose own
+    /// doc promised "every candidate answered", for seven candidates that were
+    /// never asked. That is the #19 shape with the cap as its trigger: an app
+    /// reading `SeedLocal` as "the predecessors had nothing" would seal a
+    /// lineage most of which it never looked at.
     #[test]
-    fn hop_cap_bounds_the_walk() {
+    fn hop_cap_reports_the_candidates_it_never_asked() {
         let candidates: Vec<u8> = (1..=10).rev().collect();
         let mut d = driver(&candidates, MiniState::real(&[1])).with_max_hops(3);
         for _ in 0..3 {
@@ -1091,7 +1193,18 @@ mod tests {
             d.on_absent(g);
         }
         assert_eq!(d.next_action(), Step::Done);
-        assert!(matches!(d.take_outcome(), Some(Outcome::SeedLocal { .. })));
+        let Some(Outcome::Indeterminate { unresolved, .. }) = d.take_outcome() else {
+            panic!("a cap-cut walk has not asked every candidate, so it cannot be SeedLocal")
+        };
+        assert_eq!(
+            unresolved.len(),
+            7,
+            "the 7 candidates the cap cut off must be named"
+        );
+        // The 3 that were asked and answered Absent are NOT unresolved.
+        for probed in [id(10), id(9), id(8)] {
+            assert!(!unresolved.contains(&probed), "{probed} answered");
+        }
     }
 
     #[test]
@@ -1377,8 +1490,9 @@ mod tests {
         };
         assert_eq!(
             unresolved,
-            vec![ids[1]],
-            "the unanswered newest generation must be named, so the app can retry"
+            vec![ids[1], ids[0]],
+            "both must be named: the newest never answered, and the halt means the \
+             older was never asked — neither was ruled out"
         );
         assert_eq!(
             local.messages,
@@ -1465,6 +1579,84 @@ mod tests {
             unresolved.is_empty(),
             "every candidate answered, so nothing is unresolved"
         );
+    }
+
+    /// `prepare_forward` must run on the `Indeterminate` snapshot too.
+    ///
+    /// The docs tell an app it MAY seed `local` forward after enough failed
+    /// attempts. `prepare_forward` is where an app strips a stale upgrade
+    /// pointer out of state before it goes under the current key
+    /// (freenet/river#427). Handing back an unprepared snapshot on the one path
+    /// that invites a judgement call would re-plant exactly what the hook
+    /// exists to remove — on the path where the app is least sure of itself.
+    #[test]
+    fn prepare_forward_runs_on_the_indeterminate_snapshot() {
+        struct StripOps;
+        impl ProbeStateOps for StripOps {
+            type State = MiniState;
+            fn decode(&self, bytes: &[u8]) -> Option<MiniState> {
+                MiniOps.decode(bytes)
+            }
+            fn is_real(&self, s: &MiniState) -> bool {
+                MiniOps.is_real(s)
+            }
+            fn merge_with_local(&self, r: MiniState, l: &MiniState) -> MiniState {
+                MiniOps.merge_with_local(r, l)
+            }
+            fn prepare_forward(&self, mut s: MiniState) -> MiniState {
+                // Message 0 models the #427 upgrade pointer.
+                s.messages.retain(|m| *m != 0);
+                s
+            }
+        }
+        let mut d = ProbeDriver::new(
+            StripOps,
+            MiniState::real(&[0, 5]),
+            NewestFirst::assume_ordered(vec![id(1)]),
+            SelectionPolicy::NewestFirstWins,
+        );
+        let Step::Get(a) = d.next_action() else {
+            panic!()
+        };
+        d.on_unknown(a);
+        assert_eq!(d.next_action(), Step::Done);
+        let Some(Outcome::Indeterminate { local, .. }) = d.take_outcome() else {
+            panic!()
+        };
+        assert_eq!(
+            local.messages,
+            vec![5],
+            "the stale pointer must be stripped on the indeterminate path too"
+        );
+    }
+
+    /// Two lineage entries can share a `code_hash` (an identical rebuild
+    /// re-published), which derives the same contract id twice. It must be
+    /// recorded once, or an app deduplicating retries by this list double-counts
+    /// a single unreachable generation.
+    #[test]
+    fn a_repeated_candidate_id_is_recorded_once() {
+        let mut d = ProbeDriver::new(
+            MiniOps,
+            MiniState::empty(),
+            NewestFirst::assume_ordered(vec![id(7), id(7)]),
+            SelectionPolicy::FoldAll(
+                FoldAllAck::i_understand_fold_all_resurrects_without_tombstones(),
+            ),
+        );
+        let Step::Get(a) = d.next_action() else {
+            panic!()
+        };
+        d.on_unknown(a);
+        let Step::Get(b) = d.next_action() else {
+            panic!()
+        };
+        d.on_unknown(b);
+        assert_eq!(d.next_action(), Step::Done);
+        let Some(Outcome::Indeterminate { unresolved, .. }) = d.take_outcome() else {
+            panic!()
+        };
+        assert_eq!(unresolved, vec![id(7)], "the duplicate id must appear once");
     }
 
     /// The pure-#19 shape, with no older generation to fall back to: a lineage
@@ -1986,13 +2178,15 @@ mod tests {
     }
 
     #[test]
-    fn max_hops_zero_seeds_local_without_probing() {
+    fn max_hops_zero_is_indeterminate_not_a_clean_seed() {
+        // Cap 0 asks nobody, so it establishes nothing about the lineage.
         let mut d = driver(&[3, 2], MiniState::real(&[4])).with_max_hops(0);
         assert_eq!(d.next_action(), Step::Done, "cap 0 = no probing at all");
-        let Some(Outcome::SeedLocal { local }) = d.take_outcome() else {
-            panic!()
+        let Some(Outcome::Indeterminate { local, unresolved }) = d.take_outcome() else {
+            panic!("a walk that asked nobody cannot report a clean SeedLocal")
         };
-        assert_eq!(local.messages, vec![4]);
+        assert_eq!(local.messages, vec![4], "the snapshot still comes back");
+        assert_eq!(unresolved, vec![id(3), id(2)], "both candidates unasked");
     }
 
     #[test]

@@ -33,16 +33,35 @@ Absence now requires a positive answer.
   and everything else non-answering to `Unknown`.
 * **New: `ProbeDriver::on_absent`** (answered "nothing here") and
   **`ProbeDriver::on_unknown`** (timeout, send failure, dropped transport).
-* **Deprecated: `ProbeDriver::on_timeout`**, now forwarding to `on_unknown` — so
-  an adopter that does not touch its call site gets the *safe* reading for free.
-  Call sites that used it for a real not-found should move to `on_absent`;
-  otherwise a reachable, genuinely-empty lineage now reports `Indeterminate`
-  where it used to report `SeedLocal`.
+* **Deprecated: `ProbeDriver::on_timeout`**, now forwarding to `on_unknown`. It
+  can never seal a predecessor as empty, but it is **not a drop-in** for a call
+  site that also routed positive not-founds through it. Because an unknown halts
+  the walk under `NewestFirstWins`, an app whose only failure path is a watchdog
+  — one that never handles `NotFound`, so an absent generation arrives as a
+  timeout — will stop at its first empty generation and never ask the older
+  ones. If the data lives further down the lineage it is never probed. **That is
+  a recovery outage, not a conservative degradation: recovering becomes never
+  recovering.** River is this shape today, so upgrading its call site is
+  mandatory, not advisory.
 * **New: `Outcome::Indeterminate { local, unresolved }`** — nothing was
-  recovered and at least one candidate never answered, so whether there is
-  anything to recover is still unknown. Adopt nothing, seal nothing, retry.
-  `Outcome::SeedLocal` now means what an app already assumed it meant: every
-  candidate answered, and none had state.
+  recovered and at least one candidate's state was not established. Adopt
+  nothing, seal nothing, retry. `unresolved` covers candidates that were asked
+  and never answered **and** candidates the walk never reached, because the hop
+  cap fired or the policy halted earlier. Its `local` is passed through
+  `prepare_forward` like every other outgoing snapshot, since the docs
+  explicitly allow an app to seed it after enough failed attempts and
+  `prepare_forward` is where a stale upgrade pointer gets stripped
+  (freenet/river#427).
+* **Fixed: the hop cap no longer produces a clean `SeedLocal`.** Candidates cut
+  off by the cap were leaving no trace, so a capped walk returned the outcome
+  whose contract is "every candidate answered" for candidates it never asked.
+  They are now folded into `unresolved`, making the result `Indeterminate`.
+* **`Outcome` is now `#[non_exhaustive]`.** Note the limit: it forces a wildcard
+  arm on a `match`, but a `matches!(outcome, Outcome::Recovered { .. })` still
+  absorbs a new variant silently. Delta's only production consumption is exactly
+  that shape (`operations.rs:1355-1362`), so nothing in this crate can make its
+  compiler flag the new variant — Delta needs a deliberate read of the
+  `Indeterminate` path.
 * **New: `Outcome::Recovered::unresolved`** — generations that never answered.
   Under `FoldAll` the fold is missing their contributions; under
   `NewestFirstWins` (only reachable via the new
@@ -72,6 +91,35 @@ Absence now requires a positive answer.
   documented as the positive claim it is, `Err` as the right answer for silence,
   and `probe_executable`'s `Ok(true)` no longer claims to make a *later* empty
   export trustworthy.
+
+### What this release does NOT fix: `NotFound` is not proof of absence
+
+0.6.0 stops a predecessor's *silence* being read as its absence. It does not —
+and this crate cannot — make the network's "not found" trustworthy.
+
+Absence on Freenet is unauthenticated, and a contract that exists answers
+`NotFound` while it is momentarily unfindable. **At the time of writing that is
+the common case, not a corner case:** with the placement migration disabled
+(freenet-core#4440), present-but-unfindable dead-ends measured ~99.6% of all
+`get_not_found` traffic in production telemetry, and a live-network check found
+20 of 25 apparent failures had a `NotFound` logged for a key that exists.
+
+So an all-`Absent` walk is, today, more likely to be reporting a routing failure
+than an empty lineage. `Outcome::SeedLocal` therefore **no longer claims to be
+safe to record as finished** — its previous doc said exactly that, which would
+have moved the #19 shape from a timeout trigger to a dead-end trigger rather
+than removing it. The crate now reports what it established and leaves sealing
+to the app, which is the only place that can weigh it.
+
+`Outcome::SeedLocal` also still absorbs an undecodable answer (`decode -> None`,
+`is_real -> false`), so a schema break across a whole lineage lands there with
+every generation intact underneath — freenet/freenet-migrate#8.
+
+Hardening that actually holds, for an app that must seal something: make the
+operation idempotent so a later run recovers a momentarily-unfindable
+generation, require the same answer across separate attempts spread in time,
+and/or require a connectivity witness before trusting a negative. See
+"Upgrading to 0.6.0" in the README.
 
 ### Blast radius: four of the five adopters need a code change
 

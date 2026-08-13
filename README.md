@@ -208,6 +208,11 @@ unresolved, so a slow predecessor is retried rather than recorded empty
 forever. Wire a real `NotFound` signal through if you have one; a probe whose
 candidates answer properly never reaches `Indeterminate`.
 
+**But `NotFound` is not proof either**, and on this network it is wrong more
+often than it is right — see [Upgrading to 0.6.0](#upgrading-to-060). `SeedLocal`
+means "asked everyone, found nothing this time"; the crate deliberately does not
+tell you it is safe to record the migration as finished.
+
 Decisions are fixed by the driver (probing newest-first; undecodable or
 non-real responses and answered absences advance; an unanswered candidate stops
 the walk under `NewestFirstWins` rather than falling through to an older
@@ -757,15 +762,52 @@ single response type a helper could accept. What is common is the *rule*, which
 is the table above; `ContractResponse::NotFound` is the one stdlib variant that
 earns `Absent`, and everything else that is not state is `Unknown`.
 
-A caution worth carrying into that mapping: `Absent` is the strongest negative
-Freenet can give, not proof. Absence is unauthenticated, and a contract that
-exists can answer "not found" while it is momentarily unfindable. Advancing past
-it is fine; making an irreversible decision on it is not. Prefer an idempotent
-operation a later run can redo, and tell the operator — Atlas's migrate command
-is the worked example.
+### `Absent` is the strongest negative Freenet can give. It is not proof.
+
+Absence is unauthenticated — any responding node can claim "not found" — and a
+contract that genuinely exists answers that way while it is momentarily
+unfindable. **On the current network that is the common case:** with the
+placement migration disabled (freenet-core#4440), present-but-unfindable
+dead-ends measured ~99.6% of all `get_not_found` traffic in production
+telemetry, and a live-network check found 20 of 25 apparent failures had a
+`NotFound` logged for a key that exists.
+
+This is a limit of the network, not of this crate, and it is why `SeedLocal`
+does not claim to be sealable. Advancing the probe past an `Absent` candidate is
+fine — that is all the crate does with it. Concluding the data is gone is not.
+
+If your app must seal something, harden it:
+
+* **Make it idempotent** so a later run recovers a generation that was
+  momentarily unfindable, and tell the operator to re-run. Atlas is the worked
+  example: it prints the not-found generation loudly and says re-running will
+  pick it up.
+* **Require agreement across separate attempts**, spread in time, rather than
+  acting on one walk. One `Absent` is a data point; the same `Absent` on three
+  runs over an hour is evidence.
+* **Require a connectivity witness** — a GET for something you know exists
+  succeeding in the same window — before trusting a negative at all.
+* **Never let a single all-`Absent` walk trigger an irreversible write.**
+
+Note also that an undecodable answer is a miss too, so a schema break across an
+entire lineage produces `SeedLocal` with every generation intact underneath it.
+Making that distinguishable is [#8].
+
+### The `on_timeout` shim is not a drop-in
+
+`on_timeout` forwarding can never seal a predecessor as empty, so it is safe in
+the way that matters most. It is **not** safe for a call site that also routed
+positive not-founds through it. Because an unknown halts the walk under
+`NewestFirstWins`, an app whose only failure path is a watchdog — one that never
+handles `NotFound`, so an absent generation arrives as a timeout — stops at its
+first empty generation and never asks the older ones. If the data lives further
+down the lineage it is never probed, and every probe ends `Indeterminate`. That
+is a recovery **outage**, not a conservative degradation. River is this shape
+today.
 
 ## License
 
 LGPL-3.0-only. See [LICENSE](./LICENSE).
 
 [#19]: https://github.com/freenet/freenet-migrate/issues/19
+[#8]: https://github.com/freenet/freenet-migrate/issues/8
