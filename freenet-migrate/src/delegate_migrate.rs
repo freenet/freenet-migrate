@@ -2471,6 +2471,103 @@ mod tests {
         );
     }
 
+    /// The fetch-level sibling of the test above, and the delegate half's
+    /// counterpart to the contract driver's
+    /// `silence_on_the_newest_generation_does_not_adopt_an_older_one`.
+    ///
+    /// The test above kills the newest generation at the *preflight*
+    /// (`dead`), which is the easy case: the walk never even fetches. Here the
+    /// newest generation **answers the preflight and then goes silent on the
+    /// export** — ghostkeys' `present_but_silent`, and the case an adapter is
+    /// most likely to get wrong. It must halt exactly the same way: the older
+    /// generation's real data must not be adopted past a newer state we could
+    /// not read.
+    ///
+    /// Without a second generation this is unfalsifiable — a single-entry
+    /// lineage can only assert "no marker was written" and never exercises
+    /// fall-through at all.
+    #[test]
+    fn newest_snapshot_wins_halts_on_a_silent_export_no_fall_through() {
+        let old = entry(1, 1);
+        let new = entry(2, 2);
+        let mut store = MemStore::default();
+        let mut io = MockIo::default()
+            .silent_export(&key_of(&new))
+            .executable_with(&key_of(&old), &[(b"data", b"v")]);
+        let report = block_on(migrate_delegate_secrets(
+            &mut store_io(&mut store),
+            &mut io,
+            &[old, new],
+            ack(),
+            newest(),
+        ));
+        assert!(
+            matches!(
+                report.predecessors[0],
+                PredecessorMigration::Unresponsive { error: Some(_), .. }
+            ),
+            "a silent export must be Unresponsive, got {:?}",
+            report.predecessors[0]
+        );
+        // THE fall-through check, asserted before the bookkeeping ones so a
+        // regression names the data loss rather than a classification detail.
+        assert!(
+            store.get_secret(b"data").is_none(),
+            "must not adopt an older snapshot past a newer one whose export we could not read"
+        );
+        assert!(
+            !io.fetched.contains(key_of(&old).bytes()),
+            "the older generation must not even be enumerated"
+        );
+        assert!(matches!(
+            report.predecessors[1],
+            PredecessorMigration::Superseded { .. }
+        ));
+        assert!(report.any_unresponsive());
+        assert!(!report.is_complete());
+        // And nothing is sealed, so the next run re-walks both.
+        assert!(store.get_secret(&pred_done_marker(&key_of(&new))).is_none());
+        assert!(store.get_secret(&pred_wip_marker(&key_of(&new))).is_none());
+    }
+
+    /// The contrast that makes the halt above non-vacuous: under Union the
+    /// SAME script does fall through and import the older generation's data.
+    /// So the halt is the policy deciding, not the walk being incapable of
+    /// reaching an older generation after a silent export.
+    #[test]
+    fn union_recovers_older_data_past_a_silent_export() {
+        let old = entry(1, 1);
+        let new = entry(2, 2);
+        let mut store = MemStore::default();
+        let mut io = MockIo::default()
+            .silent_export(&key_of(&new))
+            .executable_with(&key_of(&old), &[(b"data", b"v")]);
+        let report = block_on(migrate_delegate_secrets(
+            &mut store_io(&mut store),
+            &mut io,
+            &[old, new],
+            ack(),
+            union(),
+        ));
+        assert!(matches!(
+            report.predecessors[0],
+            PredecessorMigration::Unresponsive { error: Some(_), .. }
+        ));
+        assert!(matches!(
+            report.predecessors[1],
+            PredecessorMigration::Imported { .. }
+        ));
+        assert_eq!(
+            store.get_secret(b"data").unwrap(),
+            b"v",
+            "Union wants every generation, so the silent newest does not stop it"
+        );
+        assert!(
+            report.any_unresponsive(),
+            "the unreadable newest generation is still reported"
+        );
+    }
+
     #[test]
     fn union_recovers_older_data_past_an_unresponsive_newest() {
         // Under Union the unreachable newest does not stop the walk; the older

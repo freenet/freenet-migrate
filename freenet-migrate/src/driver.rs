@@ -647,25 +647,24 @@ impl<O: ProbeStateOps> ProbeDriver<O> {
     }
 
     /// End the probe because a candidate never answered and the policy will not
-    /// walk past an unknown. Any generations already folded are surfaced rather
-    /// than discarded — but with the unresolved list attached, so the caller
-    /// cannot mistake a partial fold for a complete one.
+    /// walk past an unknown.
+    ///
+    /// There is never a partial fold to surface here. Only `NewestFirstWins`
+    /// stops on silence ([`SelectionPolicy::unknown_terminates`]), and that
+    /// policy never fills `fold_acc` — its `on_hit` finishes the probe outright.
+    /// A fold-all sweep that meets silence keeps walking and ends in
+    /// [`finish_exhausted`](Self::finish_exhausted), which does surface the
+    /// fold. The `debug_assert` pins that; were it ever wrong, dropping to
+    /// `Indeterminate` is the fail-safe direction anyway, since it tells the
+    /// caller to adopt nothing and retry.
     fn finish_indeterminate(&mut self) {
+        debug_assert!(
+            self.fold_acc.is_none(),
+            "a policy that stops on silence never accumulates a fold"
+        );
         let local = self.local.take().expect("local consumed once");
         let unresolved = core::mem::take(&mut self.unresolved);
-        let outcome = match self.fold_acc.take() {
-            Some((source, folded)) => {
-                let merged = self.ops.merge_with_local(folded, &local);
-                Outcome::Recovered {
-                    merged: self.ops.prepare_forward(merged),
-                    source,
-                    truncated_fold: !self.remaining.is_empty(),
-                    unresolved,
-                }
-            }
-            None => Outcome::Indeterminate { local, unresolved },
-        };
-        self.phase = Phase::Done(Some(outcome));
+        self.phase = Phase::Done(Some(Outcome::Indeterminate { local, unresolved }));
     }
 }
 

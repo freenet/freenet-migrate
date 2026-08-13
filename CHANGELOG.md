@@ -56,14 +56,22 @@ Absence now requires a positive answer.
 * `ConservativeProbeIo` is no longer lossy: with `ProbeAnswer` three-way it
   passes a real negative through, so a pointer resolved through it can now reach
   `PointerOutcome::NeverPublished`. It still keeps silence and absence apart.
-* **Docs, delegate half.** `PredecessorSecretsIo::fetch_secrets` documented
-  `Err` as "aborts the whole migration" — it does not; the driver records
-  `Unresponsive` and the walk continues or stops per policy. That error steered
-  adapter authors away from `Err` and toward `Ok(vec![])`, which seals a
+* **Delegate half: docs corrected, and the silent-export path tested for the
+  first time.** No signature change; the production path was already correct.
+  But `MockIo::fetch_secrets` had no way to return `Err` at all — it could only
+  fail at the *preflight* — so "answered the preflight, then went silent on the
+  export" was a correct-but-entirely-untested path. The double can now express
+  it, and three tests pin it: no marker is written, an older generation is not
+  adopted past it under `NewestSnapshotWins`, and Union still walks on.
+
+  The docs that steered adapters wrong: `fetch_secrets` documented `Err` as
+  "aborts the whole migration" — it does not; the driver records `Unresponsive`
+  and the walk continues or stops per policy. That error pushed adapter authors
+  away from `Err` and toward `Ok(vec![])`, which seals a
   `Done { had_data: false }` marker that is never revisited. `Ok(vec![])` is now
   documented as the positive claim it is, `Err` as the right answer for silence,
   and `probe_executable`'s `Ok(true)` no longer claims to make a *later* empty
-  export trustworthy. No signature change.
+  export trustworthy.
 
 ### Adopters
 
