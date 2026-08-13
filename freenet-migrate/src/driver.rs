@@ -115,7 +115,13 @@ pub const RECOMMENDED_PROBE_TIMEOUT_MS: u64 = 12_000;
 /// predecessor has nothing", which reads as a clean, complete migration while
 /// the user's data sits un-recovered under the old key. Absence must be
 /// *answered*, never inferred from a deadline.
+///
+/// `#[non_exhaustive]`: freenet/freenet-migrate#8 wants to tell an *undecodable*
+/// answer apart from a plain miss, which is a fourth thing this type will
+/// eventually have to carry. Reserving room now costs a wildcard arm in a
+/// downstream `match`; not reserving it costs another breaking release.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ProbeAnswer {
     /// The candidate answered with these raw state bytes. Whether they decode,
     /// and whether the decoded state is *real*, is

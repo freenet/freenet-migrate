@@ -150,10 +150,23 @@ it ships, and a compile error is the only reliable way to make that happen.
 
 **What each contract-half adopter should do:** map the network's real
 "not found" to `ProbeAnswer::Absent` and everything else non-answering to
-`ProbeAnswer::Unknown` — see "Upgrading to 0.6.0" in the README. Atlas already
-classifies the two apart internally (`LegacyProbe::Absent`) and was flattening
-them at the crate boundary because the old return type had nowhere to put the
-distinction; that wiring is now a one-line change rather than a loss.
+`ProbeAnswer::Unknown` — see "Upgrading to 0.6.0" in the README.
+
+**Atlas is the adopter this most helps**, which is worth stating alongside the
+fact that it is also the one the signature change breaks. Its `classify_probe`
+already sorts a legacy GET into `Absent` / `Empty` / `Failed`
+(`cli/src/main.rs:765`) — a finer classification than the crate could accept —
+and then its `ProbeIo::get` has to flatten **four** distinct situations into one
+`Ok(None)`: a real not-found, an empty body, a failed pre-flight under
+`--dry-run`, and a transport failure under `--dry-run`. That last one is a
+latent instance of exactly this bug living in an adopter today: a dry-run
+transport failure currently reads as absence. With `ProbeAnswer` the mapping is
+a per-arm change and the distinction survives.
+
+Note the version pin: Atlas depends on `freenet-migrate = "0.5.0"`
+(`cli/Cargo.toml:27`) with the `ProbeIo` impl on its **`main`** branch, merged as
+`cddb360` (atlas#42) — not on a branch. It stays on 0.5.0 until it chooses to
+bump.
 
 ## freenet-migrate 0.5.0
 
