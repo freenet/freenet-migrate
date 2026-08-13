@@ -96,8 +96,9 @@ pub use delegate_migrate::{
     SecretStoreWriteFailed, SuccessorSecretsIo, UnionAck, WriterFailure, WriterStage,
 };
 pub use driver::{
-    contract_probe, migrate_contract, FoldAllAck, NewestFirst, Outcome, ProbeDriver, ProbeIo,
-    ProbeStateOps, SelectionPolicy, Step, DEFAULT_MAX_PROBE_HOPS, RECOMMENDED_PROBE_TIMEOUT_MS,
+    contract_probe, migrate_contract, FoldAllAck, NewestFirst, Outcome, ProbeAnswer, ProbeDriver,
+    ProbeIo, ProbeStateOps, RollbackRiskAck, SelectionPolicy, Step, DEFAULT_MAX_PROBE_HOPS,
+    RECOMMENDED_PROBE_TIMEOUT_MS,
 };
 pub use error::MigrateError;
 pub use lineage::{ContractLineageEntry, DelegateLineageEntry, Lineage};

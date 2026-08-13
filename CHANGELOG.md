@@ -1,5 +1,78 @@
 # Changelog
 
+## freenet-migrate 0.6.0
+
+**Breaking, contract half only.** Silence is no longer absence
+([#19](https://github.com/freenet/freenet-migrate/issues/19)). The delegate-half
+surface is untouched.
+
+### The mechanism
+
+A backward probe classified a candidate that never answered exactly as it
+classified one that answered "I have nothing". Both were `on_timeout` → a miss →
+the walk advanced. Two consequences, both silent:
+
+* A lineage whose candidates were merely unreachable produced
+  `Outcome::SeedLocal` — the outcome an app reads as "the predecessors were
+  reached and had nothing", at which point it seeds its local snapshot forward
+  and stops asking. A predecessor that was slow, or on a node that had not yet
+  answered, was recorded as permanently empty. No error, no crash: the migration
+  reported success and the data stayed under the old key.
+* One timeout on the newest generation let an older one be adopted — the
+  "generation-blind selection" rollback the driver's own module docs claim is
+  inexpressible. The pre-0.6.0 test suite pinned that as correct behaviour.
+
+Absence now requires a positive answer.
+
+### Changes
+
+* **New: `ProbeAnswer`** (`State` / `Absent` / `Unknown`), the return type of
+  `ProbeIo::get` in place of `Option<Vec<u8>>`. An adapter cannot express "I
+  never heard back" as "the predecessor has nothing" without typing `Absent` and
+  being wrong on purpose. Map stdlib's `ContractResponse::NotFound` to `Absent`
+  and everything else non-answering to `Unknown`.
+* **New: `ProbeDriver::on_absent`** (answered "nothing here") and
+  **`ProbeDriver::on_unknown`** (timeout, send failure, dropped transport).
+* **Deprecated: `ProbeDriver::on_timeout`**, now forwarding to `on_unknown` — so
+  an adopter that does not touch its call site gets the *safe* reading for free.
+  Call sites that used it for a real not-found should move to `on_absent`;
+  otherwise a reachable, genuinely-empty lineage now reports `Indeterminate`
+  where it used to report `SeedLocal`.
+* **New: `Outcome::Indeterminate { local, unresolved }`** — nothing was
+  recovered and at least one candidate never answered, so whether there is
+  anything to recover is still unknown. Adopt nothing, seal nothing, retry.
+  `Outcome::SeedLocal` now means what an app already assumed it meant: every
+  candidate answered, and none had state.
+* **New: `Outcome::Recovered::unresolved`** — generations that never answered.
+  Under `FoldAll` the fold is missing their contributions; under
+  `NewestFirstWins` (only reachable via the new
+  `ProbeDriver::continue_past_unknown`) they are generations *newer* than
+  `source` that were never ruled out, so the adoption may be a rollback.
+* **Behaviour: under `SelectionPolicy::NewestFirstWins` an unanswered candidate
+  stops the probe** rather than falling through to an older generation, matching
+  the delegate half's `SecretSelectionPolicy::unresponsive_terminates`. Opt out
+  with `ProbeDriver::continue_past_unknown(RollbackRiskAck::…)`, which forfeits
+  the anti-rollback guarantee for that probe and says so in the type.
+* `ConservativeProbeIo` is no longer lossy: with `ProbeAnswer` three-way it
+  passes a real negative through, so a pointer resolved through it can now reach
+  `PointerOutcome::NeverPublished`. It still keeps silence and absence apart.
+* **Docs, delegate half.** `PredecessorSecretsIo::fetch_secrets` documented
+  `Err` as "aborts the whole migration" — it does not; the driver records
+  `Unresponsive` and the walk continues or stops per policy. That error steered
+  adapter authors away from `Err` and toward `Ok(vec![])`, which seals a
+  `Done { had_data: false }` marker that is never revisited. `Ok(vec![])` is now
+  documented as the positive claim it is, `Err` as the right answer for silence,
+  and `probe_executable`'s `Ok(true)` no longer claims to make a *later* empty
+  export trustworthy. No signature change.
+
+### Adopters
+
+River and Delta both drive `ProbeDriver` directly and both mapped their GET
+timeout to `on_timeout`; ghostkeys has no contract half. So no adopter
+implements `ProbeIo` today and the trait's signature change breaks no one. The
+`on_timeout` deprecation warning is the intended signal to go and classify the
+two cases at the call site.
+
 ## freenet-migrate 0.5.0
 
 **Breaking, delegate half only.** The contract-side surface (`ProbeDriver`,

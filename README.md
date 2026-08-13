@@ -184,20 +184,35 @@ let mut driver = contract_probe(ops, local_snapshot, &params, CONTRACT_LINEAGE,
 loop {
     match driver.next_action() {
         Step::Get(id) => { /* send GET(id), arm a ~12s timer; deliver via
-                              driver.on_response(id, &bytes) / driver.on_timeout(id) */ }
+                              driver.on_response(id, &bytes)  // answered with state
+                              driver.on_absent(id)            // answered NotFound
+                              driver.on_unknown(id)           // timer fired / send failed */ }
         Step::Done => break,
     }
 }
 match driver.take_outcome().unwrap() {
-    Outcome::Recovered { merged, .. } => { /* adopt + PUT under the CURRENT key */ }
-    Outcome::SeedLocal { local }      => { /* seed the local snapshot forward */ }
-    Outcome::NoLegacy                 => { /* fresh app, normal first-run */ }
+    Outcome::Recovered { merged, .. }  => { /* adopt + PUT under the CURRENT key */ }
+    Outcome::SeedLocal { local }       => { /* predecessors answered, had nothing:
+                                               seed forward and record it done */ }
+    Outcome::Indeterminate { .. }      => { /* a predecessor never answered: adopt
+                                               NOTHING, retry on the next run */ }
+    Outcome::NoLegacy                  => { /* fresh app, normal first-run */ }
 }
 ```
 
+**Silence is not absence** ([#19]). A candidate is a miss only when it
+*answered* — with state that does not decode or is not real, or with a positive
+"nothing here" (`on_absent`, from stdlib's `ContractResponse::NotFound`). A
+timeout or transport failure is `on_unknown`: the candidate is recorded
+unresolved, so a slow predecessor is retried rather than recorded empty
+forever. Wire a real `NotFound` signal through if you have one; a probe whose
+candidates answer properly never reaches `Indeterminate`.
+
 Decisions are fixed by the driver (probing newest-first; undecodable or
-non-real responses and timeouts advance; late responses are single-shot
-ignored; exhaustion seeds the local snapshot; a `prepare_forward` hook strips
+non-real responses and answered absences advance; an unanswered candidate stops
+the walk under `NewestFirstWins` rather than falling through to an older
+generation; late responses are single-shot ignored; an all-answered exhaustion
+seeds the local snapshot; a `prepare_forward` hook strips
 key-relative metadata like upgrade pointers before any forward PUT). The two
 Delta incident decision-bug classes — generation-blind selection and
 scalar-recency selection — are structurally inexpressible in it.
@@ -244,8 +259,7 @@ the app's current `code_hash`.
 > publish is gated on a manual end-to-end run (see the STOP box in
 > [`contracts/pointer-contract/README.md`](./contracts/pointer-contract/README.md)).
 > Until then a resolve returns `NeverPublished` if your transport reports a real
-> "not found", and `Unavailable` if it cannot tell (which is what
-> `ConservativeProbeIo` always reports). So during this period a first-run
+> "not found", and `Unavailable` if it cannot tell. So during this period a first-run
 > consumer legitimately falls back to its baked-in key.
 
 ```rust,ignore
@@ -370,10 +384,11 @@ of the boundary that actually holds it.
 Reaching `NeverPublished` needs a `PointerIo` that can report a real
 `PointerFetch::Absent`. Implementing `PointerIo` directly is the recommended
 path. `ConservativeProbeIo` wraps an existing `ProbeIo` and is useful for
-reusing plumbing you already have, with two inherited costs: its ambiguous
-`Ok(None)` maps to `Unreachable` so it can never unlock the fallback, and
-`ProbeIo`'s GET is specified with `return_contract_code: true`, so it pulls the
-pointer's ~130 KB WASM on every resolve to read a 100-byte record.
+reusing plumbing you already have; since 0.6.0 its mapping is faithful
+(`ProbeAnswer` is three-way too), so it passes a real negative through, with one
+inherited cost: `ProbeIo`'s GET is specified with `return_contract_code: true`,
+so it pulls the pointer's ~130 KB WASM on every resolve to read a 100-byte
+record.
 
 Note also that absence is unauthenticated: Freenet has no proof a contract has
 no state, so a responding node can always claim "not found". That is why the
@@ -709,3 +724,5 @@ repo and is its own migration event.
 ## License
 
 LGPL-3.0-only. See [LICENSE](./LICENSE).
+
+[#19]: https://github.com/freenet/freenet-migrate/issues/19

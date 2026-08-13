@@ -102,6 +102,7 @@
 //!             match io.probe_executable(predecessor).await {    // G1.8 preflight
 //!                 Ok(false) | Err(_) => { record Unresponsive; maybe stop }
 //!                 Ok(true) => {
+//!                     // Err (incl. a silent export) => record Unresponsive; maybe stop
 //!                     let secrets = io.fetch_secrets(predecessor).await?;
 //!                     successor.record_marker(InProgress { saw_data }).await?;
 //!                     for item in secrets minus reserved markers minus withheld {
@@ -378,15 +379,22 @@ pub trait PredecessorSecretsIo {
     /// the app's own delegate protocol (e.g. River's `ListRequest`) and report
     /// whether it *executed and replied*.
     ///
-    /// * `Ok(true)` — the predecessor delegate ran and answered, so a subsequent
-    ///   empty [`fetch_secrets`](Self::fetch_secrets) genuinely means "no data".
+    /// * `Ok(true)` — the predecessor delegate ran and answered. This makes an
+    ///   *answered* empty [`fetch_secrets`](Self::fetch_secrets) trustworthy; it
+    ///   does **not** license `fetch_secrets` to report its own silence as an
+    ///   empty export. A delegate that answers a cheap no-op and then never
+    ///   answers the export is positive evidence of stranded data, and
+    ///   `fetch_secrets` must return `Err` for it (see that method).
     /// * `Ok(false)` — no reply within the app's bound: the old WASM could not
     ///   execute, or the node no longer has it registered, or the request was
     ///   lost. The driver records [`PredecessorMigration::Unresponsive`] so the
     ///   app can surface "your data may exist but can't auto-migrate" instead of
     ///   silently treating the predecessor as empty and fresh-installing (the
     ///   freenet/river#204 UX bug).
-    /// * `Err` — abort the whole migration (the caller sees the error).
+    /// * `Err` — a transport fault. Also [`PredecessorMigration::Unresponsive`]
+    ///   (with the error attached), and the walk continues or stops per
+    ///   [`SecretSelectionPolicy`]. This does **not** abort the whole run:
+    ///   [`migrate_delegate_secrets`] returns a report, not a `Result`.
     ///
     /// **Dependency (document honestly):** this can only distinguish "can't
     /// execute" from "has no data" while the node the request reaches actually has
@@ -406,9 +414,26 @@ pub trait PredecessorSecretsIo {
     /// app's own delegate protocol. Called only after
     /// [`probe_executable`](Self::probe_executable) returned `Ok(true)`.
     ///
-    /// An empty `Vec` means "executed, no data" (a genuine no-data predecessor,
-    /// since the preflight already confirmed executability). `Err` aborts the
-    /// whole migration.
+    /// **`Ok(vec![])` is a positive claim: "I asked, and it has nothing."** It
+    /// seals the predecessor with a `Done { had_data: false }` marker that is
+    /// never revisited, so returning it for a request that merely went
+    /// unanswered records a slow or temporarily unreachable predecessor as
+    /// permanently empty — silently, with the report reading complete. That is
+    /// the data-loss default freenet/freenet-migrate#19 exists to stop.
+    ///
+    /// * `Ok(pairs)` / `Ok(vec![])` — the predecessor **answered**. Only an
+    ///   answer.
+    /// * `Err` — anything that left the export unestablished: a timeout, a
+    ///   transport failure, an unexpected or undecodable reply, an answered
+    ///   error. The driver records [`PredecessorMigration::Unresponsive`], the
+    ///   predecessor earns **no marker**, and the next run re-walks it. `Err`
+    ///   does **not** abort the whole migration — the walk continues or stops
+    ///   per [`SecretSelectionPolicy`], and
+    ///   [`migrate_delegate_secrets`] still returns a report.
+    ///
+    /// So `Err` is the right answer for silence, and it is cheap: the cost of a
+    /// wrong `Err` is one retry, the cost of a wrong `Ok(vec![])` is the user's
+    /// data.
     ///
     /// The pairs are offered to the successor's own writer
     /// ([`SuccessorSecretsIo::write_secret`]) one at a time; the adapter should
@@ -1893,6 +1918,13 @@ mod tests {
         registered_generations: Vec<u32>,
         /// force a transport error from probe_executable for these keys.
         error_on_probe: HashSet<Vec<u8>>,
+        /// force a transport error from fetch_secrets for these keys: the
+        /// predecessor answered the cheap preflight and then went silent on the
+        /// export. Before freenet/freenet-migrate#19 this double could not
+        /// express that at all — it only failed at the PROBE — so the one
+        /// scenario an adapter is most likely to get wrong (`Ok(vec![])` for a
+        /// silent export) had no test that could see it.
+        error_on_fetch: HashSet<Vec<u8>>,
         /// force `register_successor` to fail, for the wrapper's error path.
         fail_register: bool,
     }
@@ -1920,6 +1952,12 @@ mod tests {
             self.error_on_probe.insert(key.bytes().to_vec());
             self
         }
+        /// Answers the preflight, then never answers the export.
+        fn silent_export(mut self, key: &DelegateKey) -> Self {
+            self.executable.insert(key.bytes().to_vec(), true);
+            self.error_on_fetch.insert(key.bytes().to_vec());
+            self
+        }
         fn failing_registration(mut self) -> Self {
             self.fail_register = true;
             self
@@ -1942,6 +1980,9 @@ mod tests {
         ) -> Result<Vec<SecretPair>, IoAbort> {
             let k = predecessor.bytes().to_vec();
             self.fetched.insert(k.clone());
+            if self.error_on_fetch.contains(&k) {
+                return Err(IoAbort);
+            }
             Ok(self.secrets.get(&k).cloned().unwrap_or_default())
         }
     }
@@ -2072,6 +2113,54 @@ mod tests {
         ));
         assert!(report.is_complete(), "no-data is a clean, complete outcome");
         assert!(!report.any_unresponsive());
+    }
+
+    /// freenet/freenet-migrate#19, delegate half: a predecessor that answers the
+    /// cheap preflight and then goes silent on the export must NOT be sealed.
+    ///
+    /// The preflight makes `Ok(vec![])` from `fetch_secrets` trustworthy, which
+    /// is exactly why an adapter is tempted to answer a timed-out export with
+    /// it. The contrast with
+    /// `executable_predecessor_with_no_data_is_nodata_not_unresponsive` above is
+    /// the whole point: same preflight, same empty result, opposite meaning —
+    /// there the predecessor ANSWERED "nothing", here it never answered. Only
+    /// the first earns a completion marker.
+    #[test]
+    fn a_silent_export_is_unresponsive_and_earns_no_done_marker() {
+        let e = entry(1, 1);
+        let k = key_of(&e);
+        let mut store = MemStore::default();
+        let mut io = MockIo::default().silent_export(&k);
+        let report = block_on(migrate_delegate_secrets(
+            &mut store_io(&mut store),
+            &mut io,
+            &[e],
+            ack(),
+            newest(),
+        ));
+        assert!(
+            matches!(
+                report.predecessors[0],
+                PredecessorMigration::Unresponsive { error: Some(_), .. }
+            ),
+            "a silent export must not read as NoData, got {:?}",
+            report.predecessors[0]
+        );
+        assert!(report.any_unresponsive());
+        assert!(
+            !report.is_complete(),
+            "an unestablished export must not report a complete migration"
+        );
+        // THE seal check: no marker of any kind, so the next run re-walks this
+        // predecessor instead of skipping it forever as already-migrated.
+        assert!(
+            store.get_secret(&pred_done_marker(&k)).is_none(),
+            "a predecessor that never answered must not be sealed Done"
+        );
+        assert!(
+            store.get_secret(&pred_wip_marker(&k)).is_none(),
+            "the in-progress marker is only recorded once an export was received"
+        );
     }
 
     #[test]

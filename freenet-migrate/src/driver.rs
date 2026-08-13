@@ -16,8 +16,9 @@
 //!         Step::Done(outcome) => break,                          // adopt it
 //!     }
 //!     // deliver events as they arrive:
-//!     driver.on_response(id, &bytes);   // GET response for id
-//!     driver.on_timeout(id);            // timer fired / send failed for id
+//!     driver.on_response(id, &bytes);   // GET answered with state bytes
+//!     driver.on_absent(id);             // GET answered NotFound
+//!     driver.on_unknown(id);            // timer fired / send failed: state UNKNOWN
 //! }
 //! ```
 //!
@@ -26,7 +27,14 @@
 //!
 //! * **Generation-blind selection** ("rolled back to April"): candidates are
 //!   probed strictly newest-first and the first real state wins, so an older
-//!   generation can never shadow a newer one.
+//!   generation can never shadow a newer one. That guarantee needs the newer
+//!   generation to have been *ruled out*, not merely skipped: a candidate that
+//!   never answered has an **unknown** state, so under
+//!   [`SelectionPolicy::NewestFirstWins`] silence stops the probe
+//!   ([`Outcome::Indeterminate`]) rather than falling through to an older
+//!   generation. Continuing past silence is available, but it forfeits this
+//!   guarantee and must be acknowledged
+//!   ([`ProbeDriver::continue_past_unknown`]).
 //! * **Stale-upgrade-pointer poisoning** (freenet/river#427): the driver
 //!   never follows pointers found inside recovered state (newest-first order
 //!   subsumes them), and a recovered generation's own pointer — which, PUT
@@ -50,15 +58,25 @@
 //!   section for why fold-all is opt-in).
 //! * A response that fails to decode is a **miss** (a corrupt or
 //!   ancient-format generation is skipped, never a panic, never adopted).
-//! * A timeout, send failure, or transport loss is a **miss** for that
-//!   candidate: the probe advances instead of stalling.
+//!   (Making a schema break distinguishable from a plain miss is
+//!   freenet/freenet-migrate#8, not this seam.)
+//! * **Silence is not absence** (freenet/freenet-migrate#19). A candidate is a
+//!   miss only when it *answered* — with state that does not decode or is not
+//!   real ([`ProbeDriver::on_response`]), or with a positive "there is nothing
+//!   here" ([`ProbeAnswer::Absent`] / [`ProbeDriver::on_absent`], e.g. stdlib's
+//!   `ContractResponse::NotFound`). A timeout, send failure, or transport loss
+//!   is [`ProbeAnswer::Unknown`] ([`ProbeDriver::on_unknown`]): the candidate is
+//!   recorded as **unresolved** and the probe never reports a clean result that
+//!   silently means "there was nothing to recover".
 //! * Responses are **single-shot** per candidate: a late response for a
 //!   candidate already advanced past (its timer fired first) is ignored —
 //!   matching the shipped `take_probe` race semantics.
 //! * A hop cap ([`ProbeDriver::with_max_hops`], default 64) bounds the walk.
-//! * On exhaustion the outcome is **seed-local** ([`Outcome::SeedLocal`]): the
-//!   caller's local snapshot goes forward, so recovery failure never silently
-//!   discards device-local data.
+//! * On exhaustion with every candidate *answered*, the outcome is **seed-local**
+//!   ([`Outcome::SeedLocal`]): the caller's local snapshot goes forward, so
+//!   recovery failure never silently discards device-local data. With any
+//!   candidate unresolved it is [`Outcome::Indeterminate`] instead — nothing is
+//!   adopted, nothing is sealed, and the app retries later.
 //! * A hit is merged with the local snapshot via
 //!   [`ProbeStateOps::merge_with_local`] **before** being surfaced, so the
 //!   adopted state can never lose local-only writes.
@@ -88,6 +106,39 @@ pub const DEFAULT_MAX_PROBE_HOPS: usize = 64;
 /// [`Step::Get`] (River's UI ships 12s). The driver is sans-IO and never
 /// sleeps; this is documentation-as-a-constant.
 pub const RECOMMENDED_PROBE_TIMEOUT_MS: u64 = 12_000;
+
+/// What a probe of one candidate actually established.
+///
+/// The three-way split exists because **absence and silence are different
+/// facts, and only one of them is safe to act on** (freenet/freenet-migrate#19).
+/// A two-way `Option` forces an adapter to encode "I never heard back" as "the
+/// predecessor has nothing", which reads as a clean, complete migration while
+/// the user's data sits un-recovered under the old key. Absence must be
+/// *answered*, never inferred from a deadline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProbeAnswer {
+    /// The candidate answered with these raw state bytes. Whether they decode,
+    /// and whether the decoded state is *real*, is
+    /// [`ProbeStateOps`]'s call — an undecodable or placeholder answer is still
+    /// an answer, and is a miss.
+    State(Vec<u8>),
+    /// The candidate answered **positively** that it holds no state — e.g.
+    /// stdlib's `ContractResponse::NotFound`. A miss the probe can trust: it
+    /// advances, and an all-`Absent` walk is a clean [`Outcome::SeedLocal`].
+    ///
+    /// Only return this for an answer you actually received. A deadline that
+    /// expired is [`Unknown`](Self::Unknown).
+    Absent,
+    /// Nothing was established: the request timed out, the send failed, the
+    /// transport dropped, the response was unparseable at the transport layer,
+    /// or the correlation slot was cancelled.
+    ///
+    /// **Never treated as absence.** The candidate is recorded unresolved and
+    /// surfaces in [`Outcome::Indeterminate`] or
+    /// [`Outcome::Recovered::unresolved`], so the app retries instead of
+    /// sealing the predecessor as empty.
+    Unknown,
+}
 
 /// App-supplied state semantics: how to decode, classify, fold, and prepare
 /// probe results. These are the pieces the crate *cannot* know — everything
@@ -191,6 +242,37 @@ pub enum SelectionPolicy {
     FoldAll(FoldAllAck),
 }
 
+impl SelectionPolicy {
+    /// Whether an unresolved candidate ([`ProbeAnswer::Unknown`]) terminates the
+    /// probe. The delegate half's `SecretSelectionPolicy::unresponsive_terminates`
+    /// makes the same call for the same reason: under a newest-wins policy,
+    /// walking past an unknown newer generation risks adopting an older snapshot
+    /// over a newer one that merely failed to answer. A fold-all sweep wants
+    /// every generation anyway and its merge is commutative by precondition, so
+    /// it keeps walking and reports the gap instead.
+    fn unknown_terminates(&self) -> bool {
+        matches!(self, SelectionPolicy::NewestFirstWins)
+    }
+}
+
+/// Opt-in token for [`ProbeDriver::continue_past_unknown`]. Deliberately not
+/// `Default`: holding one acknowledges that a recovered state may be a rollback
+/// past a newer generation that was never ruled out.
+#[must_use = "a RollbackRiskAck acknowledges that continuing past an unanswered candidate can \
+              adopt an OLDER generation over a newer one that merely failed to answer; \
+              construct it only if you have another reason to believe the newer generation is gone"]
+#[derive(Debug)]
+pub struct RollbackRiskAck(());
+
+impl RollbackRiskAck {
+    /// Construct the opt-in. The safe default is to stop at the first
+    /// unanswered candidate and retry the whole probe later, which is what
+    /// [`SelectionPolicy::NewestFirstWins`] does without this token.
+    pub fn i_understand_continuing_past_silence_can_roll_back() -> Self {
+        Self(())
+    }
+}
+
 /// Opt-in token for [`SelectionPolicy::FoldAll`]. Deliberately not `Default`:
 /// holding one acknowledges the resurrection precondition.
 ///
@@ -220,7 +302,8 @@ pub enum Step {
     /// Send a GET for this candidate (with `return_contract_code: true`,
     /// without subscribing — never subscribe to a legacy key), and arm a
     /// timeout (see [`RECOMMENDED_PROBE_TIMEOUT_MS`]). Deliver the result via
-    /// [`ProbeDriver::on_response`] / [`ProbeDriver::on_timeout`].
+    /// [`ProbeDriver::on_response`], [`ProbeDriver::on_absent`] or
+    /// [`ProbeDriver::on_unknown`] — an expired timer is `on_unknown`.
     ///
     /// A [`crate::PointerResolver`] emits the same step for the pointer
     /// contract, where the GET needs neither the code nor a subscription — the
@@ -254,13 +337,51 @@ pub enum Outcome<S> {
         /// should surface or log a truncated fold — it opted into fold-all
         /// precisely because data may be spread across generations.
         truncated_fold: bool,
+        /// Candidates that never answered ([`ProbeAnswer::Unknown`]) during
+        /// this probe. Empty in the ordinary case.
+        ///
+        /// **Non-empty means this result is not the whole story.** Under
+        /// [`SelectionPolicy::FoldAll`] the fold is missing those generations'
+        /// contributions. Under [`SelectionPolicy::NewestFirstWins`] it can
+        /// only be non-empty via [`ProbeDriver::continue_past_unknown`], and
+        /// then it lists generations *newer* than `source` that were never
+        /// ruled out — adopting `merged` may be a rollback past one of them.
+        /// Either way the app should PUT forward but keep the migration open
+        /// for a retry rather than recording it as finished.
+        unresolved: Vec<ContractInstanceId>,
     },
-    /// Every candidate missed (or the hop cap was reached): seed the local
+    /// Every candidate **answered**, and none had real state: seed the local
     /// snapshot forward (passed through `prepare_forward`), so local-only
     /// data survives. `local` is the snapshot handed to the driver.
+    ///
+    /// This is a positive result — the predecessors were reached and had
+    /// nothing — so it is safe to record the migration as finished. A probe
+    /// that merely failed to reach its candidates is
+    /// [`Indeterminate`](Self::Indeterminate), never this.
     SeedLocal {
         /// The prepared local snapshot to PUT forward.
         local: S,
+    },
+    /// At least one candidate never answered ([`ProbeAnswer::Unknown`]) and no
+    /// state was recovered, so **whether there is anything to recover is still
+    /// unknown** (freenet/freenet-migrate#19).
+    ///
+    /// Do NOT treat this as [`SeedLocal`](Self::SeedLocal): seeding the local
+    /// snapshot forward and recording the migration as done would seal a
+    /// predecessor that was merely slow or temporarily unreachable as
+    /// permanently empty. Retry the probe on the next run instead. `local` is
+    /// handed back untouched (no `prepare_forward` — it is not going forward on
+    /// the strength of this outcome).
+    ///
+    /// An app that must produce *something* on a first run — no state under the
+    /// current key at all, and a predecessor that has been unreachable for many
+    /// attempts — can still seed `local` itself, but that is a deliberate app
+    /// decision with the uncertainty in hand, not a default it gets for free.
+    Indeterminate {
+        /// The local snapshot passed to the driver, returned unchanged.
+        local: S,
+        /// The candidates that never answered. Non-empty by construction.
+        unresolved: Vec<ContractInstanceId>,
     },
     /// There were no candidates at all (fresh app / empty lineage): nothing
     /// to recover; proceed with the app's normal first-run path. The unused
@@ -293,6 +414,12 @@ pub struct ProbeDriver<O: ProbeStateOps> {
     max_hops: usize,
     /// FoldAll accumulator: (newest-hit source, folded state so far).
     fold_acc: Option<(ContractInstanceId, O::State)>,
+    /// Candidates that never answered — the #19 record. Never conflated with a
+    /// candidate that answered `Absent`.
+    unresolved: Vec<ContractInstanceId>,
+    /// Whether an unresolved candidate is allowed to be walked past under a
+    /// policy that would otherwise stop (see [`ProbeDriver::continue_past_unknown`]).
+    continue_past_unknown: bool,
     phase: Phase<O::State>,
 }
 
@@ -326,6 +453,8 @@ impl<O: ProbeStateOps> ProbeDriver<O> {
             hops: 0,
             max_hops: DEFAULT_MAX_PROBE_HOPS,
             fold_acc: None,
+            unresolved: Vec::new(),
+            continue_past_unknown: false,
             phase,
         }
     }
@@ -333,6 +462,26 @@ impl<O: ProbeStateOps> ProbeDriver<O> {
     /// Override the hop cap (default [`DEFAULT_MAX_PROBE_HOPS`]).
     pub fn with_max_hops(mut self, max_hops: usize) -> Self {
         self.max_hops = max_hops;
+        self
+    }
+
+    /// Keep probing older candidates past one that never answered, instead of
+    /// stopping with [`Outcome::Indeterminate`].
+    ///
+    /// Only [`SelectionPolicy::NewestFirstWins`] stops by default;
+    /// [`SelectionPolicy::FoldAll`] already continues, so this is a no-op there.
+    ///
+    /// **This forfeits the anti-rollback guarantee for this probe** — hence the
+    /// [`RollbackRiskAck`]. The unanswered candidates are still reported in
+    /// [`Outcome::Recovered::unresolved`], so the result is never silently
+    /// clean; what you give up is the refusal to adopt an older generation
+    /// while a newer one is unaccounted for.
+    ///
+    /// Prefer wiring a real absence signal (stdlib's `ContractResponse::NotFound`
+    /// → [`ProbeAnswer::Absent`]) over reaching for this: a probe whose
+    /// candidates answer properly never stops here in the first place.
+    pub fn continue_past_unknown(mut self, _ack: RollbackRiskAck) -> Self {
+        self.continue_past_unknown = true;
         self
     }
 
@@ -372,16 +521,63 @@ impl<O: ProbeStateOps> ProbeDriver<O> {
         }
     }
 
-    /// Deliver a timeout — or any send/transport failure — for candidate
-    /// `id`: a miss for that candidate. Stale timeouts (for a candidate no
+    /// Deliver a **positive absence** for candidate `id`: the node answered
+    /// that there is no state under that key (stdlib's
+    /// `ContractResponse::NotFound`). A miss the probe can trust — it advances,
+    /// and an all-absent walk ends in a clean [`Outcome::SeedLocal`].
+    ///
+    /// Do not call this for a deadline that expired; that is
+    /// [`on_unknown`](Self::on_unknown). Stale events (for a candidate no
     /// longer outstanding) are ignored.
-    pub fn on_timeout(&mut self, id: ContractInstanceId) {
+    pub fn on_absent(&mut self, id: ContractInstanceId) {
         if matches!(self.phase, Phase::Done(_)) {
             return;
         }
         if self.outstanding == Some(id) {
             self.outstanding = None;
         }
+    }
+
+    /// Deliver a **non-answer** for candidate `id`: a timeout, a send failure,
+    /// a dropped transport, a cancelled correlation slot — anything that leaves
+    /// the candidate's state unknown.
+    ///
+    /// The candidate is recorded as unresolved, never as empty. Under
+    /// [`SelectionPolicy::NewestFirstWins`] this ends the probe with
+    /// [`Outcome::Indeterminate`] (see [`continue_past_unknown`](Self::continue_past_unknown)
+    /// to walk on anyway); under [`SelectionPolicy::FoldAll`] the probe
+    /// continues and the id is reported in the terminal outcome. Stale events
+    /// are ignored.
+    pub fn on_unknown(&mut self, id: ContractInstanceId) {
+        if matches!(self.phase, Phase::Done(_)) {
+            return;
+        }
+        if self.outstanding != Some(id) {
+            return;
+        }
+        self.outstanding = None;
+        self.unresolved.push(id);
+        if self.policy.unknown_terminates() && !self.continue_past_unknown {
+            self.finish_indeterminate();
+        }
+    }
+
+    /// Deliver a timeout for candidate `id`.
+    ///
+    /// Renamed to [`on_unknown`](Self::on_unknown) in 0.6.0, which is what this
+    /// forwards to: a timeout establishes nothing, and treating it as absence is
+    /// the data-loss default freenet/freenet-migrate#19 removed. Callers that
+    /// used this for a *positive* not-found answer should move to
+    /// [`on_absent`](Self::on_absent) — otherwise a reachable, genuinely-empty
+    /// lineage now reports [`Outcome::Indeterminate`] instead of
+    /// [`Outcome::SeedLocal`].
+    #[deprecated(
+        since = "0.6.0",
+        note = "silence and absence are different facts: use `on_unknown` for a timeout or \
+                transport failure, `on_absent` for an answered NotFound. See freenet-migrate#19."
+    )]
+    pub fn on_timeout(&mut self, id: ContractInstanceId) {
+        self.on_unknown(id);
     }
 
     /// Take the terminal outcome (once). `None` until [`Step::Done`], or if
@@ -403,6 +599,11 @@ impl<O: ProbeStateOps> ProbeDriver<O> {
                     merged: prepared,
                     source,
                     truncated_fold: false,
+                    // Only reachable non-empty via `continue_past_unknown`:
+                    // these are generations NEWER than `source` that were never
+                    // ruled out, so the caller is told this adoption may be a
+                    // rollback past one of them.
+                    unresolved: core::mem::take(&mut self.unresolved),
                 }));
             }
             SelectionPolicy::FoldAll(_) => {
@@ -423,6 +624,7 @@ impl<O: ProbeStateOps> ProbeDriver<O> {
         let local = self.local.take().expect("local consumed once");
         // Candidates left unprobed means the hop cap fired, not exhaustion.
         let truncated_fold = !self.remaining.is_empty();
+        let unresolved = core::mem::take(&mut self.unresolved);
         let outcome = match self.fold_acc.take() {
             Some((source, folded)) => {
                 let merged = self.ops.merge_with_local(folded, &local);
@@ -430,11 +632,38 @@ impl<O: ProbeStateOps> ProbeDriver<O> {
                     merged: self.ops.prepare_forward(merged),
                     source,
                     truncated_fold,
+                    unresolved,
                 }
             }
-            None => Outcome::SeedLocal {
+            // Nothing recovered. Whether that means "there was nothing" or
+            // "we never found out" is exactly the #19 distinction: only an
+            // all-answered walk earns the sealable SeedLocal.
+            None if unresolved.is_empty() => Outcome::SeedLocal {
                 local: self.ops.prepare_forward(local),
             },
+            None => Outcome::Indeterminate { local, unresolved },
+        };
+        self.phase = Phase::Done(Some(outcome));
+    }
+
+    /// End the probe because a candidate never answered and the policy will not
+    /// walk past an unknown. Any generations already folded are surfaced rather
+    /// than discarded — but with the unresolved list attached, so the caller
+    /// cannot mistake a partial fold for a complete one.
+    fn finish_indeterminate(&mut self) {
+        let local = self.local.take().expect("local consumed once");
+        let unresolved = core::mem::take(&mut self.unresolved);
+        let outcome = match self.fold_acc.take() {
+            Some((source, folded)) => {
+                let merged = self.ops.merge_with_local(folded, &local);
+                Outcome::Recovered {
+                    merged: self.ops.prepare_forward(merged),
+                    source,
+                    truncated_fold: !self.remaining.is_empty(),
+                    unresolved,
+                }
+            }
+            None => Outcome::Indeterminate { local, unresolved },
         };
         self.phase = Phase::Done(Some(outcome));
     }
@@ -474,24 +703,33 @@ pub fn contract_probe<O: ProbeStateOps>(
 /// The thin per-environment I/O adapter for the pumped entry point
 /// ([`migrate_contract`]): one GET, awaited, with the app's own timeout.
 ///
-/// * Return `Ok(Some(bytes))` with the raw GET response state bytes.
-/// * Return `Ok(None)` for a timeout, a send failure, or any condition the
-///   app wants treated as a **miss** (the probe advances — the resilient
-///   default; see the driver's decision semantics).
+/// * Return [`ProbeAnswer::State`] with the raw GET response state bytes.
+/// * Return [`ProbeAnswer::Absent`] **only** when the node answered that there
+///   is no state under the key (stdlib's `ContractResponse::NotFound`).
+/// * Return [`ProbeAnswer::Unknown`] for a timeout, a send failure, or anything
+///   else that left the candidate's state unestablished. The probe records it
+///   as unresolved rather than empty (freenet/freenet-migrate#19), so a slow or
+///   temporarily unreachable predecessor is retried instead of sealed.
 /// * Return `Err` only for conditions that should **abort** the whole
 ///   migration (the driver's decisions are lost and the caller sees the
-///   error).
+///   error). A per-candidate transport failure is [`ProbeAnswer::Unknown`], not
+///   an abort.
+///
+/// The three-way return is deliberate: an adapter cannot express "I never heard
+/// back" as "the predecessor has nothing" without typing
+/// [`ProbeAnswer::Absent`] and being wrong on purpose.
 pub trait ProbeIo {
     /// The app's transport error type (for the abort path only).
     type Error;
 
     /// GET the state bytes for `id` — without subscribing, with
     /// `return_contract_code: true`, bounded by a timeout of roughly
-    /// [`RECOMMENDED_PROBE_TIMEOUT_MS`].
+    /// [`RECOMMENDED_PROBE_TIMEOUT_MS`]. An expired timeout is
+    /// [`ProbeAnswer::Unknown`].
     fn get(
         &mut self,
         id: ContractInstanceId,
-    ) -> impl core::future::Future<Output = Result<Option<Vec<u8>>, Self::Error>>;
+    ) -> impl core::future::Future<Output = Result<ProbeAnswer, Self::Error>>;
 }
 
 /// High-level contract-migration entry point (G1.7, contract half): drive a
@@ -507,7 +745,7 @@ pub trait ProbeIo {
 /// On an `Err` abort from [`ProbeIo::get`], the driver — and the local
 /// snapshot moved into it — is dropped; clone the snapshot before calling if
 /// you need it on the failure path. (Prefer mapping recoverable conditions to
-/// `Ok(None)`, which is a per-candidate miss, not an abort.)
+/// [`ProbeAnswer::Unknown`], which is a per-candidate non-answer, not an abort.)
 pub async fn migrate_contract<O, IO>(
     ops: O,
     io: &mut IO,
@@ -524,8 +762,9 @@ where
     loop {
         match driver.next_action() {
             Step::Get(id) => match io.get(id).await? {
-                Some(bytes) => driver.on_response(id, &bytes),
-                None => driver.on_timeout(id),
+                ProbeAnswer::State(bytes) => driver.on_response(id, &bytes),
+                ProbeAnswer::Absent => driver.on_absent(id),
+                ProbeAnswer::Unknown => driver.on_unknown(id),
             },
             Step::Done => {
                 return Ok(driver
@@ -757,7 +996,7 @@ mod tests {
     }
 
     #[test]
-    fn miss_and_timeout_advance_then_exhaustion_seeds_local() {
+    fn answered_misses_advance_then_exhaustion_seeds_local() {
         let local = MiniState::real(&[7]);
         let mut d = driver(&[3, 2, 1], local);
         let Step::Get(a) = d.next_action() else {
@@ -768,7 +1007,7 @@ mod tests {
             panic!()
         };
         assert_eq!(b, id(2));
-        d.on_timeout(b); // timeout → miss
+        d.on_absent(b); // answered NotFound → miss
         let Step::Get(c) = d.next_action() else {
             panic!()
         };
@@ -782,7 +1021,7 @@ mod tests {
     }
 
     #[test]
-    fn late_response_after_timeout_is_ignored() {
+    fn late_response_after_absent_is_ignored() {
         // The take_probe single-shot race: candidate timed out (we advanced),
         // then its real response arrives late — it must be dropped, matching
         // shipped semantics.
@@ -790,7 +1029,7 @@ mod tests {
         let Step::Get(a) = d.next_action() else {
             panic!()
         };
-        d.on_timeout(a);
+        d.on_absent(a);
         let Step::Get(b) = d.next_action() else {
             panic!()
         };
@@ -803,7 +1042,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_timeout_for_advanced_candidate_is_ignored() {
+    fn stale_absent_for_advanced_candidate_is_ignored() {
         let mut d = driver(&[3, 2], MiniState::empty());
         let Step::Get(a) = d.next_action() else {
             panic!()
@@ -812,7 +1051,7 @@ mod tests {
         let Step::Get(b) = d.next_action() else {
             panic!()
         };
-        d.on_timeout(a); // stale — must not consume b's slot
+        d.on_absent(a); // stale — must not consume b's slot
         assert_eq!(d.next_action(), Step::Get(b));
         d.on_response(b, &MiniState::real(&[5]).encode());
         assert!(matches!(d.take_outcome(), Some(Outcome::Recovered { .. })));
@@ -834,7 +1073,7 @@ mod tests {
             let Step::Get(g) = d.next_action() else {
                 panic!()
             };
-            d.on_timeout(g);
+            d.on_absent(g);
         }
         assert_eq!(d.next_action(), Step::Done);
         assert!(matches!(d.take_outcome(), Some(Outcome::SeedLocal { .. })));
@@ -918,7 +1157,7 @@ mod tests {
         let Step::Get(a) = d.next_action() else {
             panic!()
         };
-        d.on_timeout(a);
+        d.on_absent(a);
         assert_eq!(d.next_action(), Step::Done);
         let Some(Outcome::SeedLocal { local }) = d.take_outcome() else {
             panic!()
@@ -1044,22 +1283,39 @@ mod tests {
         }
     }
 
-    #[test]
-    fn migrate_contract_pump_reaches_the_same_outcome() {
-        // The async wrapper must make identical decisions to the raw driver:
-        // candidate 1 (newest) times out, candidate 2 hits.
-        struct ScriptIo {
-            responses: std::collections::HashMap<ContractInstanceId, Option<Vec<u8>>>,
-        }
-        impl ProbeIo for ScriptIo {
-            type Error = core::convert::Infallible;
-            async fn get(
-                &mut self,
-                id: ContractInstanceId,
-            ) -> Result<Option<Vec<u8>>, Self::Error> {
-                Ok(self.responses.get(&id).cloned().flatten())
+    /// Scripts one [`ProbeAnswer`] per candidate. Three-way on purpose: the
+    /// pre-0.6.0 double keyed a `HashMap<_, Option<Vec<u8>>>`, whose `None`
+    /// stood for a timeout AND for "no such contract" at once — so the harness
+    /// could not state the fault in freenet/freenet-migrate#19, let alone fail
+    /// on it. A double that cannot express the bug cannot catch it.
+    struct ScriptIo {
+        answers: std::collections::HashMap<ContractInstanceId, ProbeAnswer>,
+    }
+    impl ScriptIo {
+        fn new(answers: &[(ContractInstanceId, ProbeAnswer)]) -> Self {
+            Self {
+                answers: answers.iter().cloned().collect(),
             }
         }
+    }
+    impl ProbeIo for ScriptIo {
+        type Error = core::convert::Infallible;
+        async fn get(&mut self, id: ContractInstanceId) -> Result<ProbeAnswer, Self::Error> {
+            // An unscripted candidate is a non-answer, never an absence.
+            Ok(self
+                .answers
+                .get(&id)
+                .cloned()
+                .unwrap_or(ProbeAnswer::Unknown))
+        }
+    }
+
+    /// A two-generation lineage plus its ids (oldest-first, as the registry is).
+    fn two_generation_lineage() -> (
+        freenet_stdlib::prelude::Parameters<'static>,
+        [crate::ContractLineageEntry; 2],
+        Vec<ContractInstanceId>,
+    ) {
         let params = freenet_stdlib::prelude::Parameters::from(b"owner".to_vec());
         let lineage = [
             crate::ContractLineageEntry {
@@ -1074,10 +1330,24 @@ mod tests {
             },
         ];
         let ids = crate::predecessor_ids(&params, &lineage);
-        let mut responses = std::collections::HashMap::new();
-        responses.insert(ids[1], None); // newest: timeout
-        responses.insert(ids[0], Some(MiniState::real(&[6]).encode())); // older: hit
-        let mut io = ScriptIo { responses };
+        (params, lineage, ids)
+    }
+
+    /// THE freenet/freenet-migrate#19 regression, at the pumped entry point.
+    ///
+    /// The newest generation never answers; the older one holds real state.
+    /// Before 0.6.0 the driver walked past the silence and adopted the older
+    /// generation — the very "generation-blind selection" rollback the module
+    /// docs claim is inexpressible, reachable through one timeout, and pinned
+    /// by this test's predecessor as if it were correct. Silence does not rule
+    /// the newer generation out, so it must not be walked past.
+    #[test]
+    fn silence_on_the_newest_generation_does_not_adopt_an_older_one() {
+        let (params, lineage, ids) = two_generation_lineage();
+        let mut io = ScriptIo::new(&[
+            (ids[1], ProbeAnswer::Unknown), // newest: never answered
+            (ids[0], ProbeAnswer::State(MiniState::real(&[6]).encode())), // older: real data
+        ]);
         let outcome = futures_executor_block_on(migrate_contract(
             MiniOps,
             &mut io,
@@ -1087,11 +1357,263 @@ mod tests {
             SelectionPolicy::NewestFirstWins,
         ))
         .unwrap();
-        let Outcome::Recovered { merged, source, .. } = outcome else {
+        let Outcome::Indeterminate { local, unresolved } = outcome else {
+            panic!("silence on the newest generation must not resolve to a recovery: {outcome:?}")
+        };
+        assert_eq!(
+            unresolved,
+            vec![ids[1]],
+            "the unanswered newest generation must be named, so the app can retry"
+        );
+        assert_eq!(
+            local.messages,
+            vec![100],
+            "the local snapshot comes back untouched — nothing is adopted or PUT forward"
+        );
+    }
+
+    /// The same script with the rollback risk explicitly acknowledged: the walk
+    /// continues and the older generation IS adopted — but the result carries
+    /// the unresolved newer generation, so it is never silently clean.
+    #[test]
+    fn continue_past_unknown_recovers_but_reports_the_unresolved_generation() {
+        let (params, lineage, ids) = two_generation_lineage();
+        let mut driver = contract_probe(
+            MiniOps,
+            MiniState::real(&[100]),
+            &params,
+            &lineage,
+            SelectionPolicy::NewestFirstWins,
+        )
+        .continue_past_unknown(
+            RollbackRiskAck::i_understand_continuing_past_silence_can_roll_back(),
+        );
+
+        let Step::Get(newest) = driver.next_action() else {
+            panic!()
+        };
+        assert_eq!(newest, ids[1]);
+        driver.on_unknown(newest);
+        let Step::Get(older) = driver.next_action() else {
+            panic!("acknowledged risk must let the walk continue")
+        };
+        driver.on_response(older, &MiniState::real(&[6]).encode());
+
+        let Some(Outcome::Recovered {
+            merged,
+            source,
+            unresolved,
+            ..
+        }) = driver.take_outcome()
+        else {
+            panic!()
+        };
+        assert_eq!(source, ids[0]);
+        assert_eq!(merged.messages, vec![6, 100]);
+        assert_eq!(
+            unresolved,
+            vec![ids[1]],
+            "a possible rollback past an unanswered newer generation must be reported"
+        );
+    }
+
+    /// The pumped wrapper and the raw driver still agree, on the path where
+    /// every candidate answers: newest is positively absent, older hits.
+    #[test]
+    fn migrate_contract_pump_reaches_the_same_outcome() {
+        let (params, lineage, ids) = two_generation_lineage();
+        let mut io = ScriptIo::new(&[
+            (ids[1], ProbeAnswer::Absent), // newest: answered "nothing here"
+            (ids[0], ProbeAnswer::State(MiniState::real(&[6]).encode())),
+        ]);
+        let outcome = futures_executor_block_on(migrate_contract(
+            MiniOps,
+            &mut io,
+            MiniState::real(&[100]),
+            &params,
+            &lineage,
+            SelectionPolicy::NewestFirstWins,
+        ))
+        .unwrap();
+        let Outcome::Recovered {
+            merged,
+            source,
+            unresolved,
+            ..
+        } = outcome
+        else {
             panic!("expected recovery via the older generation")
         };
         assert_eq!(source, ids[0]);
         assert_eq!(merged.messages, vec![6, 100]);
+        assert!(
+            unresolved.is_empty(),
+            "every candidate answered, so nothing is unresolved"
+        );
+    }
+
+    /// The pure-#19 shape, with no older generation to fall back to: a lineage
+    /// whose only candidate never answers must NOT come back as `SeedLocal`.
+    ///
+    /// `SeedLocal` is the outcome an app reads as "the predecessors were reached
+    /// and had nothing" — the point at which it seeds forward and stops asking.
+    /// Reaching it on silence is what makes a slow predecessor permanently
+    /// empty.
+    #[test]
+    fn silence_is_indeterminate_never_a_sealable_seed_local() {
+        let mut d = driver(&[3], MiniState::real(&[7]));
+        let Step::Get(a) = d.next_action() else {
+            panic!()
+        };
+        d.on_unknown(a);
+        assert_eq!(d.next_action(), Step::Done);
+        match d.take_outcome() {
+            Some(Outcome::Indeterminate { local, unresolved }) => {
+                assert_eq!(unresolved, vec![id(3)]);
+                assert_eq!(local.messages, vec![7], "the snapshot comes back intact");
+            }
+            other => panic!("silence must not be a clean SeedLocal, got {other:?}"),
+        }
+    }
+
+    /// The contrast that makes the test above non-vacuous: the SAME lineage,
+    /// the SAME empty result, but the candidate ANSWERED. Absence is a real
+    /// finding, so this one does seal.
+    #[test]
+    fn an_answered_absence_is_a_sealable_seed_local() {
+        let mut d = driver(&[3], MiniState::real(&[7]));
+        let Step::Get(a) = d.next_action() else {
+            panic!()
+        };
+        d.on_absent(a);
+        assert_eq!(d.next_action(), Step::Done);
+        let Some(Outcome::SeedLocal { local }) = d.take_outcome() else {
+            panic!("an answered absence must still seed local")
+        };
+        assert_eq!(local.messages, vec![7]);
+    }
+
+    /// A partially-silent walk under fold-all: the fold keeps going (that is
+    /// Union's whole point), but the result names the generations it could not
+    /// read, so a caller cannot mistake it for a complete fold.
+    #[test]
+    fn fold_all_continues_past_silence_and_reports_the_gap() {
+        let mut d = ProbeDriver::new(
+            MiniOps,
+            MiniState::real(&[100]),
+            NewestFirst::assume_ordered(vec![id(3), id(2), id(1)]),
+            SelectionPolicy::FoldAll(
+                FoldAllAck::i_understand_fold_all_resurrects_without_tombstones(),
+            ),
+        );
+        let Step::Get(a) = d.next_action() else {
+            panic!()
+        };
+        d.on_response(a, &MiniState::real(&[1]).encode());
+        let Step::Get(b) = d.next_action() else {
+            panic!("fold-all must keep walking past silence")
+        };
+        d.on_unknown(b);
+        let Step::Get(c) = d.next_action() else {
+            panic!()
+        };
+        d.on_response(c, &MiniState::real(&[3]).encode());
+        assert_eq!(d.next_action(), Step::Done);
+        let Some(Outcome::Recovered {
+            merged, unresolved, ..
+        }) = d.take_outcome()
+        else {
+            panic!()
+        };
+        assert_eq!(merged.messages, vec![1, 3, 100]);
+        assert_eq!(
+            unresolved,
+            vec![id(2)],
+            "the generation that never answered must be named on the fold"
+        );
+    }
+
+    /// Fold-all that recovers nothing AND had a silent candidate is
+    /// indeterminate, not an empty-but-complete sweep.
+    #[test]
+    fn fold_all_with_silence_and_no_hits_is_indeterminate() {
+        let mut d = ProbeDriver::new(
+            MiniOps,
+            MiniState::real(&[7]),
+            NewestFirst::assume_ordered(vec![id(2), id(1)]),
+            SelectionPolicy::FoldAll(
+                FoldAllAck::i_understand_fold_all_resurrects_without_tombstones(),
+            ),
+        );
+        let Step::Get(a) = d.next_action() else {
+            panic!()
+        };
+        d.on_unknown(a);
+        let Step::Get(b) = d.next_action() else {
+            panic!()
+        };
+        d.on_absent(b);
+        assert_eq!(d.next_action(), Step::Done);
+        let Some(Outcome::Indeterminate { unresolved, .. }) = d.take_outcome() else {
+            panic!("one unanswered candidate makes the whole sweep inconclusive")
+        };
+        assert_eq!(unresolved, vec![id(2)]);
+    }
+
+    /// A stale non-answer (for a candidate already advanced past) must not
+    /// invent an unresolved entry, or an otherwise-clean probe would report a
+    /// phantom gap and never settle.
+    #[test]
+    fn stale_unknown_does_not_pollute_the_unresolved_list() {
+        let mut d = ProbeDriver::new(
+            MiniOps,
+            MiniState::empty(),
+            NewestFirst::assume_ordered(vec![id(2), id(1)]),
+            SelectionPolicy::FoldAll(
+                FoldAllAck::i_understand_fold_all_resurrects_without_tombstones(),
+            ),
+        );
+        let Step::Get(a) = d.next_action() else {
+            panic!()
+        };
+        d.on_absent(a);
+        let Step::Get(b) = d.next_action() else {
+            panic!()
+        };
+        d.on_unknown(a); // stale: `a` was answered and advanced past
+        assert_eq!(
+            d.next_action(),
+            Step::Get(b),
+            "stale event must not advance"
+        );
+        d.on_response(b, &MiniState::real(&[5]).encode());
+        assert_eq!(d.next_action(), Step::Done);
+        let Some(Outcome::Recovered { unresolved, .. }) = d.take_outcome() else {
+            panic!()
+        };
+        assert!(
+            unresolved.is_empty(),
+            "a stale non-answer must not be recorded, got {unresolved:?}"
+        );
+    }
+
+    /// `on_timeout` is the deprecated spelling and must forward to `on_unknown`
+    /// — not to the pre-0.6.0 "treat it as a miss" behaviour. An adopter that
+    /// has not renamed its call site gets the SAFE reading for free, which is
+    /// the whole point of the rename.
+    #[test]
+    #[allow(deprecated)]
+    fn deprecated_on_timeout_forwards_to_on_unknown() {
+        let mut d = driver(&[3], MiniState::real(&[7]));
+        let Step::Get(a) = d.next_action() else {
+            panic!()
+        };
+        d.on_timeout(a);
+        assert_eq!(d.next_action(), Step::Done);
+        let Some(Outcome::Indeterminate { unresolved, .. }) = d.take_outcome() else {
+            panic!("on_timeout must mean UNKNOWN, not absent")
+        };
+        assert_eq!(unresolved, vec![id(3)]);
     }
 
     /// Minimal single-future block_on (no async runtime dependency): the
@@ -1192,7 +1714,7 @@ mod tests {
             first, ids[1],
             "gen 2 must be probed first despite slice order"
         );
-        d.on_timeout(first);
+        d.on_absent(first);
         let Step::Get(second) = d.next_action() else {
             panic!()
         };
@@ -1218,36 +1740,17 @@ mod tests {
     fn pump_prefers_newest_when_both_generations_are_real() {
         // Same pin through the pumped entry point: both generations real —
         // the newest must win (a dropped reversal would adopt the older).
-        struct ScriptIo {
-            responses: std::collections::HashMap<ContractInstanceId, Option<Vec<u8>>>,
-        }
-        impl ProbeIo for ScriptIo {
-            type Error = core::convert::Infallible;
-            async fn get(
-                &mut self,
-                id: ContractInstanceId,
-            ) -> Result<Option<Vec<u8>>, Self::Error> {
-                Ok(self.responses.get(&id).cloned().flatten())
-            }
-        }
-        let params = freenet_stdlib::prelude::Parameters::from(b"owner".to_vec());
-        let lineage = [
-            crate::ContractLineageEntry {
-                generation: 0,
-                code_hash: [10; 32],
-                note: "older",
-            },
-            crate::ContractLineageEntry {
-                generation: 1,
-                code_hash: [11; 32],
-                note: "newer",
-            },
-        ];
-        let ids = crate::predecessor_ids(&params, &lineage);
-        let mut responses = std::collections::HashMap::new();
-        responses.insert(ids[0], Some(MiniState::real(&[1999]).encode()));
-        responses.insert(ids[1], Some(MiniState::real(&[2026]).encode()));
-        let mut io = ScriptIo { responses };
+        let (params, lineage, ids) = two_generation_lineage();
+        let mut io = ScriptIo::new(&[
+            (
+                ids[0],
+                ProbeAnswer::State(MiniState::real(&[1999]).encode()),
+            ),
+            (
+                ids[1],
+                ProbeAnswer::State(MiniState::real(&[2026]).encode()),
+            ),
+        ]);
         let outcome = futures_executor_block_on(migrate_contract(
             MiniOps,
             &mut io,
@@ -1279,7 +1782,7 @@ mod tests {
         let Step::Get(a) = d.next_action() else {
             panic!()
         };
-        d.on_timeout(a);
+        d.on_absent(a);
         let Step::Get(b) = d.next_action() else {
             panic!()
         };
@@ -1308,7 +1811,7 @@ mod tests {
         let Step::Get(b) = d.next_action() else {
             panic!()
         };
-        d.on_timeout(b);
+        d.on_absent(b);
         assert_eq!(d.next_action(), Step::Done);
         let Some(Outcome::Recovered {
             merged,
@@ -1487,7 +1990,7 @@ mod tests {
         d.on_response(a, &MiniState::real(&[1]).encode());
         assert_eq!(d.next_action(), Step::Done);
         // Late events after Done must not disturb the outcome.
-        d.on_timeout(a);
+        d.on_unknown(a);
         d.on_response(a, &MiniState::real(&[99]).encode());
         assert_eq!(d.next_action(), Step::Done);
         let Some(Outcome::Recovered { merged, .. }) = d.take_outcome() else {

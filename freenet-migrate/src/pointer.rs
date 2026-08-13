@@ -1317,8 +1317,13 @@ impl PointerResolver {
 ///
 /// Three-way on purpose. The whole safety story rests on telling a **real
 /// negative answer** apart from **not knowing**, because only the former may
-/// unlock a caller's baked-in build-time key. A two-way `Option` cannot carry
-/// that, which is why this exists rather than reusing [`ProbeIo`] directly.
+/// unlock a caller's baked-in build-time key.
+///
+/// [`crate::ProbeAnswer`] is the same three-way shape for the backward probe,
+/// for the same reason (freenet/freenet-migrate#19 — this type predates it and
+/// was the first place in the crate to reject the two-way `Option`). The two
+/// stay separate because the GETs differ: a pointer GET must **not** request the
+/// contract code, and a backward-probe GET must.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PointerFetch {
     /// The pointer's raw state bytes, exactly as the network returned them.
@@ -1336,12 +1341,10 @@ pub enum PointerFetch {
 /// awaited, with the app's own timeout.
 ///
 /// Deliberately **not** [`ProbeIo`], although it is the same shape and the same
-/// sans-IO convention. `ProbeIo::get` returns `Ok(None)` for a timeout, a send
-/// failure *and* a miss, and its documented meaning is "a per-candidate miss,
-/// the probe advances" — resilient behaviour that is right for a backward probe
-/// over a lineage and wrong here, where the difference between "no pointer
-/// exists" and "I could not reach it" is the difference between using a stale
-/// key and keeping the right one.
+/// sans-IO convention: a pointer GET must not request the contract code, and a
+/// backward-probe GET must. (Before 0.6.0 there was a second, sharper reason —
+/// `ProbeIo::get` collapsed a timeout and a real negative answer into one
+/// `Ok(None)`. That is fixed: [`crate::ProbeAnswer`] is now three-way too.)
 ///
 /// Return `Err` only for conditions that should abort the resolution; the
 /// caller sees it as [`ResolveError::Transport`].
@@ -1362,22 +1365,18 @@ pub trait PointerIo {
     ) -> impl core::future::Future<Output = Result<PointerFetch, Self::Error>>;
 }
 
-/// Adapts an existing [`ProbeIo`] to [`PointerIo`] by mapping its ambiguous
-/// `Ok(None)` to [`PointerFetch::Unreachable`].
+/// Adapts an existing [`ProbeIo`] to [`PointerIo`]. Since 0.6.0 the mapping is
+/// one-to-one — [`crate::ProbeAnswer`]'s three arms carry across exactly — so
+/// the adapter no longer loses the real-negative answer it used to.
 ///
-/// The name is the warning. Two limitations, both inherited from `ProbeIo`:
+/// One limitation remains, inherited from `ProbeIo`: **it fetches the contract
+/// code.** `ProbeIo::get` is specified as a GET with
+/// `return_contract_code: true`, which is right for a backward probe and pure
+/// waste here — it pulls the pointer's own ~130 KB WASM on every resolve to
+/// read a 100-byte record.
 ///
-/// * **It cannot report a real negative answer**, so a pointer resolved through
-///   this adapter never returns [`PointerOutcome::NeverPublished`] and a
-///   first-run consumer never reaches its baked-in fallback.
-/// * **It fetches the contract code.** `ProbeIo::get` is specified as a GET
-///   with `return_contract_code: true`, which is right for a backward probe and
-///   pure waste here: it pulls the pointer's own ~130 KB WASM on every resolve
-///   to read a 100-byte record.
-///
-/// Implement [`PointerIo`] directly for anything that resolves often or needs
-/// the first-run path. Reach for this adapter to reuse plumbing you already
-/// have.
+/// Implement [`PointerIo`] directly for anything that resolves often. Reach for
+/// this adapter to reuse plumbing you already have.
 #[derive(Debug)]
 pub struct ConservativeProbeIo<T>(pub T);
 
@@ -1386,8 +1385,9 @@ impl<T: ProbeIo> PointerIo for ConservativeProbeIo<T> {
 
     async fn get_pointer(&mut self, id: ContractInstanceId) -> Result<PointerFetch, Self::Error> {
         Ok(match self.0.get(id).await? {
-            Some(bytes) => PointerFetch::State(bytes),
-            None => PointerFetch::Unreachable,
+            crate::ProbeAnswer::State(bytes) => PointerFetch::State(bytes),
+            crate::ProbeAnswer::Absent => PointerFetch::Absent,
+            crate::ProbeAnswer::Unknown => PointerFetch::Unreachable,
         })
     }
 }
@@ -2796,12 +2796,15 @@ mod tests {
         }
     }
 
-    struct CannedProbeIo(Option<Vec<u8>>);
+    struct CannedProbeIo(crate::ProbeAnswer);
 
     impl ProbeIo for CannedProbeIo {
         type Error = &'static str;
 
-        async fn get(&mut self, _id: ContractInstanceId) -> Result<Option<Vec<u8>>, Self::Error> {
+        async fn get(
+            &mut self,
+            _id: ContractInstanceId,
+        ) -> Result<crate::ProbeAnswer, Self::Error> {
             Ok(self.0.clone())
         }
     }
@@ -2910,11 +2913,15 @@ mod tests {
     }
 
     #[test]
-    fn the_conservative_probe_io_adapter_can_never_unlock_the_fallback() {
-        // ProbeIo conflates timeout and miss, so the adapter must take the
-        // conservative branch for BOTH of its cases -- including an empty body.
+    fn the_conservative_probe_io_adapter_never_unlocks_the_fallback_on_silence() {
+        // Silence and an unreadable body are both "we did not learn anything",
+        // so the adapter must take the conservative branch and refuse the
+        // baked-in fallback.
         let vk = signing_key(7).verifying_key();
-        for probe in [CannedProbeIo(None), CannedProbeIo(Some(Vec::new()))] {
+        for probe in [
+            CannedProbeIo(crate::ProbeAnswer::Unknown),
+            CannedProbeIo(crate::ProbeAnswer::State(Vec::new())),
+        ] {
             let mut io = ConservativeProbeIo(probe);
             let outcome = block_on(resolve_app_pointer(
                 &mut io,
@@ -2928,7 +2935,7 @@ mod tests {
         }
         // But it still resolves a real record.
         let (vk, _p, s) = published(7, 3, [0x11; 32]);
-        let mut io = ConservativeProbeIo(CannedProbeIo(Some(s)));
+        let mut io = ConservativeProbeIo(CannedProbeIo(crate::ProbeAnswer::State(s)));
         assert!(matches!(
             block_on(resolve_app_pointer(
                 &mut io,
@@ -2939,5 +2946,26 @@ mod tests {
             .unwrap(),
             PointerOutcome::Resolved(_)
         ));
+    }
+
+    /// The adapter used to be lossy: `ProbeIo`'s two-way answer had no way to
+    /// say "the network answered: nothing there", so every non-hit collapsed to
+    /// `Unavailable` and a first-run consumer could never reach its baked-in
+    /// fallback through it. With [`crate::ProbeAnswer`] three-way
+    /// (freenet/freenet-migrate#19) the mapping is faithful — and, critically,
+    /// still tells this apart from silence, which the test above pins.
+    #[test]
+    fn the_conservative_probe_io_adapter_passes_a_real_negative_through() {
+        let vk = signing_key(7).verifying_key();
+        let mut io = ConservativeProbeIo(CannedProbeIo(crate::ProbeAnswer::Absent));
+        let outcome = block_on(resolve_app_pointer(
+            &mut io,
+            &vk,
+            APP_ID,
+            PointerFloor::never_resolved(),
+        ))
+        .unwrap();
+        assert_eq!(outcome, PointerOutcome::NeverPublished);
+        assert!(outcome.may_use_baked_in_fallback());
     }
 }
