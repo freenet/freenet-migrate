@@ -192,11 +192,12 @@ loop {
 }
 match driver.take_outcome().unwrap() {
     Outcome::Recovered { merged, .. }  => { /* adopt + PUT under the CURRENT key */ }
-    Outcome::SeedLocal { local }       => { /* predecessors answered, had nothing:
-                                               seed forward and record it done */ }
+    Outcome::SeedLocal { local }       => { /* asked everyone, found nothing THIS
+                                               TIME: seed forward, but see below
+                                               before recording it finished */ }
     Outcome::Indeterminate { .. }      => { /* a predecessor never answered: adopt
                                                NOTHING, retry on the next run */ }
-    Outcome::NoLegacy                  => { /* fresh app, normal first-run */ }
+    Outcome::NoLegacy { local }        => { /* fresh app, normal first-run */ }
 }
 ```
 
@@ -749,10 +750,11 @@ untouched call sites get the *safe* reading — but that preserves behaviour, no
 compilation, and an exhaustive `match` over `Outcome` still has to gain an
 `Indeterminate` arm.
 
-Then handle the new outcome. `Outcome::SeedLocal` now means "every candidate
-answered, none had state" and is safe to record as finished;
-`Outcome::Indeterminate` means at least one candidate never answered, so adopt
-nothing, seal nothing, and retry on the next run.
+Then handle the new outcome. `Outcome::SeedLocal` now means "every candidate was
+asked and answered, and none had state" — which is evidence that there is nothing
+to recover, **not proof of it**, for the reasons below;
+`Outcome::Indeterminate` means at least one candidate's state was not
+established, so adopt nothing, seal nothing, and retry on the next run.
 
 **The crate cannot do this mapping for you, and deliberately does not try.** It
 is sans-IO because each adopter reaches the network differently — River's UI

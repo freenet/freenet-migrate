@@ -32,8 +32,12 @@
 
 use std::path::{Path, PathBuf};
 
-/// Surfaces that recommend the `NotFound` wiring. Paths are repo-relative.
-const WIRING_DOCS: &[&str] = &["README.md", "CHANGELOG.md", "freenet-migrate/src/driver.rs"];
+/// Prose surfaces that recommend the `NotFound` wiring. Paths are repo-relative.
+///
+/// Whole-document checks are right for these: the caveat is a property of the
+/// document. `driver.rs` is checked per **doc block** instead — see
+/// [`doc_block_before`] for why a whole-file check there is a false pass.
+const WIRING_DOCS: &[&str] = &["README.md", "CHANGELOG.md"];
 
 /// The claim the caveat has to make. Short and central enough that a rewrite
 /// keeping the meaning keeps the phrase, and a rewrite dropping the meaning
@@ -48,14 +52,48 @@ fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
+/// The `///` doc block immediately preceding `marker`, normalized.
+///
+/// # Why a whole-file check on `driver.rs` is a false pass
+///
+/// The caveat is deliberately repeated: `ProbeAnswer::Absent` states it,
+/// `on_absent` cross-references it, `Outcome::SeedLocal` relies on it. So
+/// deleting it from the variant that *grants* the licence leaves the phrase in
+/// the file twice, and a `src.contains(..)` check stays green while the site an
+/// adopter actually reads has lost it.
+///
+/// That is not hypothetical: it was measured against the first version of this
+/// file. Deleting the caveat from the `Absent` variant alone left both checks
+/// passing, with two occurrences surviving elsewhere. A doc pin has to be
+/// scoped to the block that carries the obligation.
+fn doc_block_before(src: &str, marker: &str) -> String {
+    let at = src
+        .find(marker)
+        .unwrap_or_else(|| panic!("{marker:?} moved; re-point this pin rather than deleting it"));
+    let mut lines: Vec<&str> = Vec::new();
+    for line in src[..at].lines().rev() {
+        let t = line.trim_start();
+        if t.starts_with("///") {
+            lines.push(t);
+        } else if t.is_empty() || t.starts_with("#[") {
+            // Attributes and blank lines sit inside a declaration's preamble.
+            continue;
+        } else {
+            break;
+        }
+    }
+    lines.reverse();
+    normalized(&lines.join("\n"))
+}
+
 /// Strip doc-comment markers and collapse all runs of whitespace to one space.
 ///
 /// Without this, a phrase check is defeated by the line wrapping that prose is
 /// *made of*: rustdoc splits a sentence across `///` lines wherever it happens
 /// to reach the margin, so a literal substring search finds nothing and the
-/// check passes vacuously. Verified the hard way — the first version of the
-/// sealing-claim check below survived a mutation that re-asserted the claim,
-/// purely because the mutation's wording wrapped one word earlier.
+/// check passes vacuously. Measured: an earlier version of this file survived a
+/// mutation that re-asserted the sealing claim, purely because the mutation's
+/// wording wrapped one word earlier than the original's.
 fn normalized(text: &str) -> String {
     let stripped: String = text
         .lines()
@@ -101,46 +139,58 @@ fn docs_that_recommend_the_notfound_wiring_say_it_is_not_proof() {
     }
 
     assert!(
-        checked >= 3,
+        checked >= 2,
         "expected all {} wiring surfaces to name `ContractResponse::NotFound`, found {checked}. \
          If the guidance moved, move this check with it rather than letting it pass vacuously.",
         WIRING_DOCS.len()
     );
 }
 
-/// The other half: the outcome an app would seal on has to name the *other*
-/// reason it is not conclusive — an undecodable answer is a miss too, so a
-/// schema break across a whole lineage lands there with every generation intact
-/// underneath (freenet-migrate#8).
+/// `driver.rs`, checked per doc block rather than per file.
 ///
-/// # Why this is phrased as "must mention" and not "must not claim"
+/// Two blocks carry the obligation, for different reasons:
 ///
-/// The obvious check is the negative one: assert the docs never say
-/// `SeedLocal` is "safe to record the migration as finished". That does not
-/// work, and it is worth writing down why rather than rediscovering it.
-/// A substring search cannot tell an assertion from its denial — the sentence
-/// that *corrects* the claim quotes the claim, so the negative check fires on
-/// the very prose it was meant to protect. A check that goes red on correct
-/// writing does not survive: the next person deletes it, or "fixes" it by
-/// deleting the caveat. Positive assertions are the only durable shape for a
-/// prose test.
+/// * `ProbeAnswer::Absent` is where the caveat is **stated**. It is the answer
+///   an adapter constructs, so it is where the reliability of the answer
+///   belongs.
+/// * `Outcome::SeedLocal` is where the caveat is **cashed**. It is the doc an
+///   adopter reads while writing the `match` arm that decides whether to stop
+///   asking — and someone writing `Outcome::SeedLocal { local } => …` has no
+///   reason to open `ProbeAnswer::Absent`'s docs. A caveat that lives only at
+///   the definition site is a caveat the person making the decision never sees.
 #[test]
-fn the_sealable_outcome_names_the_schema_break_that_also_lands_there() {
+fn the_absent_and_seed_local_doc_blocks_each_carry_the_caveat() {
     let root = repo_root();
     let driver = root.join("freenet-migrate/src/driver.rs");
-    let raw = std::fs::read_to_string(&driver).expect("driver.rs is the outcome's definition");
-    let text = normalized(&raw);
+    let src = std::fs::read_to_string(&driver).expect("driver.rs is the definition site");
 
+    let absent = doc_block_before(&src, "    Absent,");
     assert!(
-        text.contains("SeedLocal"),
-        "this check is pinned to `Outcome::SeedLocal`; if it was renamed, rename it here too"
+        absent.contains(CAVEAT),
+        "`ProbeAnswer::Absent`'s own doc block no longer says the answer is {CAVEAT:?}. \
+         This is the block that grants the answer its meaning; the caveat surviving \
+         elsewhere in the file does not help an adapter reading this variant."
     );
     assert!(
-        text.contains("freenet-migrate#8"),
-        "`driver.rs` documents `Outcome::SeedLocal` without pointing at \
-         freenet-migrate#8. `ProbeStateOps::decode` returning `None` and `is_real` \
-         returning `false` are both misses, so a schema break across an ENTIRE lineage \
-         produces the same outcome as a genuinely empty one, with every generation's \
-         data intact underneath it. An outcome an app may act on has to name that."
+        absent.contains("unauthenticated"),
+        "`ProbeAnswer::Absent`'s doc lost the REASON the caveat holds — absence on \
+         Freenet is unauthenticated, so any responding node can claim not-found. \
+         Without the reason the caveat reads as boilerplate and gets trimmed."
+    );
+
+    let seed_local = doc_block_before(&src, "    SeedLocal {");
+    assert!(
+        seed_local.contains("ProbeAnswer::Absent") || seed_local.contains(CAVEAT),
+        "`Outcome::SeedLocal`'s doc block neither states the caveat nor points at \
+         `ProbeAnswer::Absent`. This is the doc an adopter reads while writing the \
+         match arm that stops the migration asking — the one place the conclusion is \
+         actually acted on."
+    );
+    assert!(
+        seed_local.contains("freenet-migrate#8"),
+        "`Outcome::SeedLocal`'s doc block does not point at freenet-migrate#8. \
+         `decode -> None` and `is_real -> false` are misses too, so a schema break \
+         across an ENTIRE lineage produces this outcome with every generation's data \
+         intact underneath it."
     );
 }
