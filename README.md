@@ -693,6 +693,11 @@ leaving the contract-side surface untouched.
 The two halves version independently, so an app can take one without the other.
 Targets current stdlib **0.8.x**.
 
+**Unreleased: 0.6.0**, breaking on the **contract** half — silence is no longer
+absence ([#19]). Four of the five adopters below need a code change, three of
+them to compile at all. See [Upgrading to 0.6.0](#upgrading-to-060) and the
+CHANGELOG.
+
 ### Adopters
 
 The adoption tracked by
@@ -720,6 +725,44 @@ freenet-stdlib 0.8.x while that workspace is on 0.6.0, and stdlib exports
 a hard duplicate-symbol error under rust-lld. Adopting the runtime driver
 there is blocked on that workspace moving to stdlib 0.8, which re-keys every
 repo and is its own migration event.
+
+## Upgrading to 0.6.0
+
+0.6.0 makes a predecessor's **silence** distinct from its **absence** ([#19]).
+The whole migration is one decision, made once at the point where your transport
+turns a GET into a result:
+
+| Your transport saw | Answer with | Driver event |
+|---|---|---|
+| state bytes | `ProbeAnswer::State(bytes)` | `on_response(id, &bytes)` |
+| the node's real "not found" — stdlib's **`ContractResponse::NotFound`** | `ProbeAnswer::Absent` | `on_absent(id)` |
+| timeout, send failure, dropped transport, cancelled correlation slot, an unexpected reply | `ProbeAnswer::Unknown` | `on_unknown(id)` |
+
+`ProbeIo::get` returns `ProbeAnswer` in place of `Option<Vec<u8>>`;
+`ProbeDriver::on_timeout` is deprecated and forwards to `on_unknown`, so
+untouched call sites get the *safe* reading — but that preserves behaviour, not
+compilation, and an exhaustive `match` over `Outcome` still has to gain an
+`Indeterminate` arm.
+
+Then handle the new outcome. `Outcome::SeedLocal` now means "every candidate
+answered, none had state" and is safe to record as finished;
+`Outcome::Indeterminate` means at least one candidate never answered, so adopt
+nothing, seal nothing, and retry on the next run.
+
+**The crate cannot do this mapping for you, and deliberately does not try.** It
+is sans-IO because each adopter reaches the network differently — River's UI
+through a shared-handler `WebApi` with no request/response correlation, Atlas
+through its own client wrapper, Delta through its ws layer — so there is no
+single response type a helper could accept. What is common is the *rule*, which
+is the table above; `ContractResponse::NotFound` is the one stdlib variant that
+earns `Absent`, and everything else that is not state is `Unknown`.
+
+A caution worth carrying into that mapping: `Absent` is the strongest negative
+Freenet can give, not proof. Absence is unauthenticated, and a contract that
+exists can answer "not found" while it is momentarily unfindable. Advancing past
+it is fine; making an irreversible decision on it is not. Prefer an idempotent
+operation a later run can redo, and tell the operator — Atlas's migrate command
+is the worked example.
 
 ## License
 

@@ -73,13 +73,39 @@ Absence now requires a positive answer.
   and `probe_executable`'s `Ok(true)` no longer claims to make a *later* empty
   export trustworthy.
 
-### Adopters
+### Blast radius: four of the five adopters need a code change
 
-River and Delta both drive `ProbeDriver` directly and both mapped their GET
-timeout to `on_timeout`; ghostkeys has no contract half. So no adopter
-implements `ProbeIo` today and the trait's signature change breaks no one. The
-`on_timeout` deprecation warning is the intended signal to go and classify the
-two cases at the call site.
+**Three crates will not compile until they are updated**, and `on_timeout`
+forwarding does not help them — it preserves *behaviour*, not *compilation*.
+Verified against each app's `origin/main`:
+
+| App | What breaks | Why |
+|-----|-------------|-----|
+| Atlas (`cli/src/main.rs:840`) | **E0271** | implements `ProbeIo`; `async fn get(..) -> Result<Option<Vec<u8>>>` no longer matches `Result<ProbeAnswer, _>` |
+| Atlas (`cli/src/main.rs:588`) | **E0004** | exhaustive `match outcome` over `Recovered` / `SeedLocal` / `NoLegacy`, no catch-all |
+| River UI (`ui/…/backward_probe.rs:362`) | **E0004** | same shape, `Some(..)` arms plus `None` |
+| River CLI (`cli/src/api.rs:426`) | **E0004** | same shape |
+| Delta (`ui/…/operations.rs:2294`) | test failure | `driver_all_miss_seeds_local_snapshot` asserts `SeedLocal` after an all-`None` response map, which is now `Indeterminate` |
+
+**Two of them fail CI on the deprecation alone**, as a hard error rather than a
+warning: Delta runs `cargo clippy --all-targets -- -D warnings`
+(`.github/workflows/ci.yml:41`) and Atlas sets `RUSTFLAGS: -D warnings`
+(`ci.yml:10`). So `on_timeout` is not a soft landing for either — they must
+classify their call site to build at all.
+
+freenet-git is genuinely unaffected: it takes the build half only
+(`freenet-migrate-build`), which this release does not touch.
+
+The `Outcome` breakage is deliberate rather than incidental. An app that seeds
+its local snapshot forward on `SeedLocal` has to look at `Indeterminate` before
+it ships, and a compile error is the only reliable way to make that happen.
+
+**What each contract-half adopter should do:** map the network's real
+"not found" to `ProbeAnswer::Absent` and everything else non-answering to
+`ProbeAnswer::Unknown` — see "Upgrading to 0.6.0" in the README. Atlas already
+classifies the two apart internally (`LegacyProbe::Absent`) and was flattening
+them at the crate boundary because the old return type had nowhere to put the
+distinction; that wiring is now a one-line change rather than a loss.
 
 ## freenet-migrate 0.5.0
 

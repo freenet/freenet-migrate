@@ -123,11 +123,25 @@ pub enum ProbeAnswer {
     /// an answer, and is a miss.
     State(Vec<u8>),
     /// The candidate answered **positively** that it holds no state — e.g.
-    /// stdlib's `ContractResponse::NotFound`. A miss the probe can trust: it
-    /// advances, and an all-`Absent` walk is a clean [`Outcome::SeedLocal`].
+    /// stdlib's `ContractResponse::NotFound`. The probe advances, and an
+    /// all-`Absent` walk is a clean [`Outcome::SeedLocal`].
     ///
     /// Only return this for an answer you actually received. A deadline that
     /// expired is [`Unknown`](Self::Unknown).
+    ///
+    /// **`Absent` is the strongest negative Freenet can give, which is not the
+    /// same as proof.** Absence is unauthenticated — any responding node can
+    /// claim "not found" — and a contract that genuinely exists can answer this
+    /// way while it is momentarily unfindable, which the network's documented
+    /// near-miss floor makes an ordinary event rather than a rare one. So
+    /// `Absent` means "asked, and told no", which is what makes it safe to
+    /// *advance past*; it does not license an irreversible conclusion. Where
+    /// the consequence of being wrong is permanent — sealing a generation as
+    /// empty forever, or overwriting on the strength of it — prefer an
+    /// idempotent operation that a later run can redo, and say so to the
+    /// operator. Atlas does exactly this: it reports a not-found generation
+    /// loudly and notes that re-running recovers it, because its merge is
+    /// idempotent.
     Absent,
     /// Nothing was established: the request timed out, the send failed, the
     /// transport dropped, the response was unparseable at the transport layer,
@@ -523,8 +537,10 @@ impl<O: ProbeStateOps> ProbeDriver<O> {
 
     /// Deliver a **positive absence** for candidate `id`: the node answered
     /// that there is no state under that key (stdlib's
-    /// `ContractResponse::NotFound`). A miss the probe can trust — it advances,
-    /// and an all-absent walk ends in a clean [`Outcome::SeedLocal`].
+    /// `ContractResponse::NotFound`). The probe advances, and an all-absent
+    /// walk ends in a clean [`Outcome::SeedLocal`]. See [`ProbeAnswer::Absent`]
+    /// for what that answer is and is not worth — it is the strongest negative
+    /// the network can give, not proof.
     ///
     /// Do not call this for a deadline that expired; that is
     /// [`on_unknown`](Self::on_unknown). Stale events (for a candidate no
