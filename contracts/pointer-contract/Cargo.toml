@@ -58,7 +58,12 @@ freenet-main-contract = ["freenet-stdlib/contract"]
 # directly resolves to the same package and adds nothing to the graph. The
 # frozen-WASM check in CI (`./build-wasm.sh --check`) is what proves that
 # claim rather than merely asserting it.
-publish = ["dep:bs58"]
+# `ed25519-dalek/zeroize` activates that crate's zeroizing `Drop` for
+# `SigningKey`, which is compiled OUT by default: the base dependency takes only
+# `features = ["alloc"]`, so today nothing scrubs a production signing key from
+# memory after use. Enabled HERE rather than on the dependency line so it stays
+# off for the wasm32 build and cannot touch the frozen artifact.
+publish = ["dep:bs58", "dep:zeroize", "ed25519-dalek/zeroize"]
 
 [dependencies]
 # EXACT pins ("=", not "^"). A caret range lets a fresh resolve on a machine
@@ -77,6 +82,16 @@ ed25519-dalek = { version = "=2.1.1", default-features = false, features = ["all
 # Pinned exactly, like everything else here: this crate's whole premise is that a
 # fresh resolve on a machine without the lockfile cannot change its bytes.
 bs58 = { version = "=0.5.1", default-features = false, features = ["alloc"], optional = true }
+# Same gating, same reason. Used to scrub the key file's text and every
+# intermediate copy of the secret on the way to `SigningKey`.
+#
+# PINNED TO THE VERSION ALREADY IN THE LOCKFILE, and that is load-bearing.
+# zeroize is ALREADY a transitive dependency here via curve25519-dalek, which
+# IS compiled into the frozen WASM. A first attempt pinned `=1.8.2`, which
+# DOWNGRADED the existing 1.9.0 resolution and changed the artifact's bytes --
+# `build-wasm.sh --check` caught it. Naming a version here that differs from
+# what is already resolved is a flag day, not a dependency addition.
+zeroize = { version = "=1.9.0", default-features = false, features = ["alloc"], optional = true }
 
 [dev-dependencies]
 # Test keys are derived from fixed byte arrays, never generated, so the test

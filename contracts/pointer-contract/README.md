@@ -373,6 +373,15 @@ $ pointer-record verify --author-vk river:v1:vk:<base58> --app-id river.room-con
 verified=true
 ```
 
+**This does not reopen what "no crates.io" is guarding.** Step 0 says there is
+deliberately no crates.io release because a published source crate invites
+rebuilding the WASM locally. `cargo install --features publish` builds only the
+host binaries: the WASM entry points live behind `freenet-main-contract`, a
+different feature that this command never enables, and the artifact is produced
+solely by `build-wasm.sh`. So installing the tool cannot produce a WASM at all,
+let alone a differently-hashed one. The two statements are consistent; they were
+not visibly so, which is why this paragraph exists.
+
 **`--locked` is not optional here.** Without it Cargo re-resolves and may pick a
 newer semver-compatible transitive dependency, so the binary you install is not
 the one CI exercised — which quietly defeats the `--rev` pin you just took the
@@ -521,9 +530,13 @@ after the first record is committed, which is precisely the state this section
 exists to prevent. `verify` compares the *bytes*, and its signature check means
 a hand-edited hash fails too.
 
-River's `scripts/check-pointer-freshness.sh` is the reference implementation,
+The reference implementation is River's `scripts/check-pointer-freshness.sh`,
 built on the same `check-migration.sh` pattern its delegate registry already
-uses.
+uses. It is **open, not yet merged**: freenet/river#624. An earlier version of
+this paragraph asserted it in the present tense while it existed only as an
+uncommitted file on one machine — flagged in review, and worth correcting
+rather than quietly softening, because a document whose whole subject is stale
+references should not carry one.
 
 ---
 

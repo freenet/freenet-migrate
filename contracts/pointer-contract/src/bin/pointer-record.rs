@@ -39,6 +39,7 @@
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use freenet_pointer_contract::{sign_record, PointerParams, PointerRecord};
 use freenet_stdlib::prelude::{ContractKey, Parameters};
+use zeroize::Zeroizing;
 
 /// The published pointer code hash, baked in from `CODEHASH` at compile time.
 ///
@@ -149,6 +150,25 @@ fn cmd_sign(o: &Opts) -> R<()> {
     let code_hash = o.code_hash("--code-hash")?;
 
     let sk = read_signing_key_from_stdin()?;
+    for line in sign_record_lines(&sk, &expected_vk, app_id, version, code_hash)? {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+/// Everything `sign` does except read stdin and print, so it can be TESTED.
+///
+/// The vk-match refusal below is the property this tool leans on hardest, and
+/// before this split no test could reach it: every test stopped one level lower,
+/// at argument parsing. It was verified once, by hand, at a terminal. A refactor
+/// could have dropped it with CI green.
+fn sign_record_lines(
+    sk: &SigningKey,
+    expected_vk: &VerifyingKey,
+    app_id: &[u8],
+    version: u32,
+    code_hash: [u8; 32],
+) -> R<Vec<String>> {
     let actual_vk = sk.verifying_key();
 
     // See the module docs: this is the check that stops a drifted key file from
@@ -168,7 +188,7 @@ fn cmd_sign(o: &Opts) -> R<()> {
     }
 
     let (key, params) = derive(&actual_vk, app_id)?;
-    let record = sign_record(&sk, &params, version, code_hash).map_err(|e| e.to_string())?;
+    let record = sign_record(sk, &params, version, code_hash).map_err(|e| e.to_string())?;
     let bytes = record.encode();
 
     // Verify what we just produced, through the same path a consumer uses. If
@@ -177,21 +197,48 @@ fn cmd_sign(o: &Opts) -> R<()> {
     PointerRecord::decode_verified(&bytes, &params)
         .map_err(|e| format!("BUG: freshly signed record does not verify: {e}"))?;
 
-    println!("key={}", key.id());
-    println!("params={}", to_hex(&params));
-    println!("version={version}");
-    println!("code_hash={}", to_hex(&code_hash));
-    println!("state={}", to_hex(&bytes));
-    Ok(())
+    Ok(vec![
+        format!("key={}", key.id()),
+        format!("params={}", to_hex(&params)),
+        format!("version={version}"),
+        format!("code_hash={}", to_hex(&code_hash)),
+        format!("state={}", to_hex(&bytes)),
+    ])
 }
 
 fn cmd_verify(o: &Opts) -> R<()> {
     let vk = o.author_vk()?;
     let app_id = o.app_id()?;
     let state = o.state()?;
-    let (key, params) = derive(&vk, app_id)?;
+    for line in verify_record_lines(
+        &vk,
+        app_id,
+        &state,
+        o.opt_u32("--expect-version")?,
+        o.opt_code_hash("--expect-code-hash")?,
+        o.get("--expect-key"),
+    )? {
+        println!("{line}");
+    }
+    Ok(())
+}
 
-    let record = PointerRecord::decode_verified(&state, &params).map_err(|e| {
+/// Everything `verify` does except read arguments and print, so it can be
+/// TESTED — in particular the rule that ALL `--expect-*` mismatches are
+/// reported together rather than only the first. That behaviour was designed
+/// deliberately and had no test; a regression to short-circuit on the first
+/// mismatch would have shipped silently.
+fn verify_record_lines(
+    vk: &VerifyingKey,
+    app_id: &[u8],
+    state: &[u8],
+    expect_version: Option<u32>,
+    expect_code_hash: Option<[u8; 32]>,
+    expect_key: Option<&str>,
+) -> R<Vec<String>> {
+    let (key, params) = derive(vk, app_id)?;
+
+    let record = PointerRecord::decode_verified(state, &params).map_err(|e| {
         format!(
             "record does not verify under author_vk={} app_id={}: {e}",
             to_hex(&vk.to_bytes()),
@@ -204,7 +251,7 @@ fn cmd_verify(o: &Opts) -> R<()> {
     // wrong field, and these are usually wrong together (a hand-edited hash
     // with the version left behind).
     let mut bad = Vec::new();
-    if let Some(want) = o.opt_u32("--expect-version")? {
+    if let Some(want) = expect_version {
         if record.version != want {
             bad.push(format!(
                 "version: expected {want}, record has {}",
@@ -212,7 +259,7 @@ fn cmd_verify(o: &Opts) -> R<()> {
             ));
         }
     }
-    if let Some(want) = o.opt_code_hash("--expect-code-hash")? {
+    if let Some(want) = expect_code_hash {
         if record.code_hash != want {
             bad.push(format!(
                 "code_hash: expected {}, record has {}",
@@ -221,7 +268,7 @@ fn cmd_verify(o: &Opts) -> R<()> {
             ));
         }
     }
-    if let Some(want) = o.get("--expect-key") {
+    if let Some(want) = expect_key {
         if key.id().to_string() != want {
             bad.push(format!("key: expected {want}, derives to {}", key.id()));
         }
@@ -233,11 +280,12 @@ fn cmd_verify(o: &Opts) -> R<()> {
         ));
     }
 
-    println!("key={}", key.id());
-    println!("version={}", record.version);
-    println!("code_hash={}", to_hex(&record.code_hash));
-    println!("verified=true");
-    Ok(())
+    Ok(vec![
+        format!("key={}", key.id()),
+        format!("version={}", record.version),
+        format!("code_hash={}", to_hex(&record.code_hash)),
+        "verified=true".to_string(),
+    ])
 }
 
 // ------------------------------------------------------------------- helpers
@@ -254,11 +302,24 @@ fn derive(vk: &VerifyingKey, app_id: &[u8]) -> R<(ContractKey, Vec<u8>)> {
 /// variable or a temp file on the way.
 fn read_signing_key_from_stdin() -> R<SigningKey> {
     use std::io::Read;
-    let mut buf = String::new();
+    // `Zeroizing` so the key file's bytes are overwritten when this returns
+    // rather than merely freed. See `signing_key_from_text`.
+    let mut buf = Zeroizing::new(String::new());
     std::io::stdin()
         .read_to_string(&mut buf)
         .map_err(|e| format!("reading the signing key from stdin: {e}"))?;
-    if buf.trim().is_empty() {
+    signing_key_from_text(&buf)
+}
+
+/// The whole key parse, separated from the reading so it can be TESTED.
+///
+/// It previously lived inside `read_signing_key_from_stdin`, which meant no
+/// test could reach it — and the one test named after it re-implemented the
+/// extraction inline and asserted that copy against itself, so the real
+/// function could have been reverted to the buggy `split('=').nth(1)` with the
+/// suite still green. An adversarial review caught that; this split is the fix.
+fn signing_key_from_text(text: &str) -> R<SigningKey> {
+    if text.trim().is_empty() {
         return Err("no signing key on stdin (redirect a key file into this command)".into());
     }
 
@@ -267,20 +328,20 @@ fn read_signing_key_from_stdin() -> R<SigningKey> {
     // otherwise be picked instead, and the record comes out signed by the wrong
     // key. The `--author-vk` check downstream catches that, but only depending
     // on which key is which, and the error it prints does not point here.
-    let token = match buf.lines().find(|l| is_signing_key_line(l)) {
+    let token = Zeroizing::new(match text.lines().find(|l| is_signing_key_line(l)) {
         // `split_once`, not `split('=').nth(1)`: the latter silently truncates
         // at a second `=`, quietly mangling any padded encoding a key file
         // happens to use.
         Some(line) => line
             .split_once('=')
-            .map(|(_, v)| v.trim().trim_matches('"').trim().to_string())
+            .map(|(_, v)| unquote_toml_value(v))
             .ok_or_else(|| "a 'signing_key' line was found but has no '= value'".to_string())?,
-        None => buf.trim().to_string(),
-    };
+        None => text.trim().to_string(),
+    });
 
     reject_wrong_key_type(&token, "sk", "signing key")?;
-    let bytes = decode_key_material(&token, 32, "signing key")?;
-    let arr: [u8; 32] = bytes.try_into().expect("length checked above");
+    let bytes = Zeroizing::new(decode_key_material(&token, 32, "signing key")?);
+    let arr: [u8; 32] = bytes.as_slice().try_into().expect("length checked above");
     Ok(SigningKey::from_bytes(&arr))
 }
 
@@ -290,6 +351,29 @@ fn read_signing_key_from_stdin() -> R<SigningKey> {
 /// Hex is tried first and only for an exactly-64-character input, because the
 /// base58 and hex alphabets overlap: a 64-character base58 string of the right
 /// length would otherwise be silently decoded as hex into different bytes.
+/// The value half of a `key = value` line, with quotes and any trailing comment
+/// removed.
+///
+/// A quoted value ends at its CLOSING quote, so `"abc" # note` yields `abc` and
+/// a `#` inside the quotes survives. Without that, the old
+/// `trim().trim_matches('"').trim()` left `abc" # note` — the leading quote was
+/// stripped, the trailing one was not there to strip, and the whole thing went
+/// to the decoder. It failed loudly rather than silently, which is why nobody
+/// noticed, but a trailing comment on a key line is an ordinary thing to write.
+fn unquote_toml_value(v: &str) -> String {
+    let v = v.trim();
+    if let Some(rest) = v.strip_prefix('"') {
+        return match rest.find('"') {
+            Some(end) => rest[..end].to_string(),
+            None => rest.trim().to_string(),
+        };
+    }
+    match v.split_once('#') {
+        Some((before, _)) => before.trim().to_string(),
+        None => v.to_string(),
+    }
+}
+
 /// True only for a real `signing_key = …` line, never for `signing_key_backup`.
 fn is_signing_key_line(line: &str) -> bool {
     line.trim_start()
@@ -345,10 +429,21 @@ fn decode_key_material(s: &str, want: usize, what: &str) -> R<Vec<u8>> {
         return from_hex(token).map_err(|e| format!("{what}: {e}"));
     }
 
+    // The decoder's own error names the offending CHARACTER — bs58 0.5's
+    // `InvalidCharacter` Display prints it literally. For a public value that
+    // is helpful; for the SIGNING KEY it puts one character of the secret on
+    // stderr, where CI captures it. So secret-bearing callers get a message
+    // that says what is wrong without quoting the input.
     let decoded = bs58::decode(token)
         .with_alphabet(bs58::Alphabet::BITCOIN)
         .into_vec()
-        .map_err(|e| format!("{what} is neither {}-char hex nor base58: {e}", want * 2))?;
+        .map_err(|e| {
+            if what.contains("signing key") {
+                format!("{what} is neither {}-char hex nor valid base58", want * 2)
+            } else {
+                format!("{what} is neither {}-char hex nor base58: {e}", want * 2)
+            }
+        })?;
     if decoded.len() != want {
         return Err(format!(
             "{what} decoded to {} bytes, expected {want}",
@@ -648,14 +743,177 @@ mod tests {
         assert!(reject_wrong_key_type("river:v1:vk:1111", "sk", "signing key").is_err());
     }
 
+    /// Replaces a test that carried this name and was VACUOUS: it never called
+    /// `read_signing_key_from_stdin`, it re-implemented the extraction inline
+    /// with `split('=').nth(1)` — the very pattern the production code had just
+    /// been fixed away from — and asserted that copy against itself. Reverting
+    /// the real `split_once('=')` left it green. Found by an adversarial review;
+    /// `signing_key_from_text` was split out of the stdin read so a test can
+    /// reach the real thing.
     #[test]
-    fn a_key_file_yields_its_signing_key_line() {
-        // Shape of the real file, comments and all.
-        let file = "# River web container keys\n[keys]\nsigning_key = \"river:v1:sk:11111111111111111111111111111111\"\nverifying_key = \"river:v1:vk:xyz\"\n";
-        let line = file.lines().find(|l| is_signing_key_line(l)).unwrap();
-        let token = line.split('=').nth(1).unwrap().trim().trim_matches('"');
-        assert_eq!(token, "river:v1:sk:11111111111111111111111111111111");
-        assert_eq!(decode_key_material(token, 32, "sk").unwrap(), [0u8; 32]);
+    fn a_key_file_yields_the_signing_key_the_real_parser_finds() {
+        let sk = SigningKey::from_bytes(&[9u8; 32]);
+        let b58 = bs58::encode(sk.to_bytes()).into_string();
+        let file = format!(
+            "# River web container keys\n[keys]\nsigning_key = \"river:v1:sk:{b58}\"\nverifying_key = \"river:v1:vk:zzz\"\n"
+        );
+        let got = signing_key_from_text(&file).expect("the real parser must read this file");
+        assert_eq!(got.to_bytes(), sk.to_bytes());
+
+        // A bare token with no TOML around it, the other accepted shape.
+        assert_eq!(
+            signing_key_from_text(&b58).unwrap().to_bytes(),
+            sk.to_bytes()
+        );
+        // And empty input is refused rather than producing some default key.
+        assert!(signing_key_from_text("   \n\t ").is_err());
+    }
+
+    /// The specific regression the vacuous test could not catch: a value with a
+    /// SECOND `=` after the assignment. `split('=').nth(1)` truncates it;
+    /// `split_once('=')` does not.
+    #[test]
+    fn a_signing_key_value_containing_an_equals_is_not_truncated() {
+        let sk = SigningKey::from_bytes(&[11u8; 32]);
+        let hex: String = sk.to_bytes().iter().map(|b| format!("{b:02x}")).collect();
+        // A trailing comment introduces the second `=`.
+        let file = format!("signing_key = \"{hex}\" # rotated, v=2\n");
+        // Quoted, so the value ends at the closing quote and the comment is
+        // dropped -- the point is that the parse does not stop at the second `=`.
+        let got = signing_key_from_text(&file);
+        assert!(got.is_ok(), "{:?}", got.err());
+        assert_eq!(got.unwrap().to_bytes(), sk.to_bytes());
+
+        // Unquoted with a trailing comment, and a `#` INSIDE quotes, which must
+        // survive because it is part of the value rather than a comment.
+        assert_eq!(unquote_toml_value(" abc # note "), "abc");
+        assert_eq!(unquote_toml_value(" \"ab#cd\" # note "), "ab#cd");
+        assert_eq!(unquote_toml_value(" plain "), "plain");
+    }
+
+    /// THE property this tool leans on hardest, and it had no test at all:
+    /// `sign` must refuse when the key it was handed does not derive the
+    /// `--author-vk` the caller supplied. Verified once by hand before; now
+    /// pinned.
+    #[test]
+    fn sign_refuses_when_the_key_does_not_match_the_author_vk() {
+        let real = SigningKey::from_bytes(&[1u8; 32]);
+        let other = SigningKey::from_bytes(&[2u8; 32]);
+        let err = sign_record_lines(
+            &real,
+            &other.verifying_key(),
+            b"river.room-contract",
+            1,
+            [0xaa; 32],
+        )
+        .expect_err("signing with a key that does not match --author-vk must be refused");
+        assert!(err.contains("does NOT match --author-vk"), "{err}");
+
+        // ...and the matching case still produces a record, so the test above
+        // is about the mismatch and not about signing being broken outright.
+        let ok = sign_record_lines(
+            &real,
+            &real.verifying_key(),
+            b"river.room-contract",
+            1,
+            [0xaa; 32],
+        )
+        .expect("a matching key must sign");
+        assert!(ok.iter().any(|l| l.starts_with("state=")));
+    }
+
+    /// `verify` reports EVERY `--expect-*` mismatch, not just the first. That
+    /// was a deliberate design choice with no test, so a regression to
+    /// short-circuit would have shipped silently.
+    #[test]
+    fn verify_reports_all_expectation_mismatches_together() {
+        let sk = SigningKey::from_bytes(&[5u8; 32]);
+        let vk = sk.verifying_key();
+        let (key, params) = derive(&vk, b"river.room-contract").unwrap();
+        let state = sign_record(&sk, &params, 4, [0x11; 32]).unwrap().encode();
+
+        let err = verify_record_lines(
+            &vk,
+            b"river.room-contract",
+            &state,
+            Some(9),          // wrong
+            Some([0x22; 32]), // wrong
+            Some("nope"),     // wrong
+        )
+        .expect_err("three wrong expectations must fail");
+        assert!(err.contains("version:"), "{err}");
+        assert!(err.contains("code_hash:"), "{err}");
+        assert!(err.contains("key:"), "{err}");
+
+        // All three correct -> verified, so the assertions above are about the
+        // expectations and not about verification failing for another reason.
+        let ok = verify_record_lines(
+            &vk,
+            b"river.room-contract",
+            &state,
+            Some(4),
+            Some([0x11; 32]),
+            Some(&key.id().to_string()),
+        )
+        .expect("matching expectations must verify");
+        assert!(ok.contains(&"verified=true".to_string()));
+
+        // A tampered signature is refused regardless of expectations.
+        let mut bad = state;
+        *bad.last_mut().unwrap() ^= 0x01;
+        assert!(verify_record_lines(&vk, b"river.room-contract", &bad, None, None, None).is_err());
+    }
+
+    /// The published TEST-VECTORS.md values, driven through THIS TOOL's own
+    /// code path rather than the library's.
+    ///
+    /// The library already pins those vectors, but through `sign_record` /
+    /// `ContractKey::from_params` directly — never through the binary's hex
+    /// formatting or its `state=` output. So the tool's agreement with the
+    /// document was established once, by hand, and nothing would have caught a
+    /// later divergence in casing, field order or encoding.
+    #[test]
+    fn the_tool_reproduces_the_published_test_vectors() {
+        let sk = SigningKey::from_bytes(&[1u8; 32]);
+        let vk = sk.verifying_key();
+        assert_eq!(
+            to_hex(&vk.to_bytes()),
+            "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c"
+        );
+        let lines =
+            sign_record_lines(&sk, &vk, b"river.room-contract", 7, [0xaa; 32]).expect("sign");
+        let get = |k: &str| {
+            lines
+                .iter()
+                .find_map(|l| l.strip_prefix(k))
+                .unwrap_or_else(|| panic!("no {k} line"))
+                .to_string()
+        };
+        assert_eq!(get("key="), "Hjus5Fnb6NWxKGN64MQwmbgk1Vd6YojykLtxnXipR6Lx");
+        assert_eq!(
+            get("params="),
+            "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c\
+             72697665722e726f6f6d2d636f6e7472616374"
+                .replace(['\n', ' '], "")
+        );
+        assert_eq!(
+            get("state="),
+            "00000007\
+             aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\
+             ee3c33cf7bac4f2c2dc4d3a0eff2300a12174d44084f340d6d68c98d63a63953\
+             5fece9eed85c2218af2ba566bda24f4c63ec2fca140f6a35bc6230811f27a10d"
+                .replace(['\n', ' '], "")
+        );
+        // And the document's own file agrees, so this cannot drift from it
+        // without one of the two failing.
+        let doc = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/TEST-VECTORS.md"))
+            .expect("TEST-VECTORS.md");
+        let compact: String = doc.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            compact.contains(&get("state=")),
+            "state not in TEST-VECTORS.md"
+        );
+        assert!(compact.contains("Hjus5Fnb6NWxKGN64MQwmbgk1Vd6YojykLtxnXipR6Lx"));
     }
 
     #[test]

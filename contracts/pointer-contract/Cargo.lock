@@ -403,6 +403,7 @@ dependencies = [
  "bs58",
  "ed25519-dalek",
  "freenet-stdlib",
+ "zeroize",
 ]
 
 [[package]]
