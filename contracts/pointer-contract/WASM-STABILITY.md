@@ -86,32 +86,36 @@ is that no serialization crate's version drift can change the encoding of the
 two things that determine this contract's *address* and its *state*. It does not
 mean the artifact is free of serialization code.
 
-## The gate on the first publish
+## The gate on the first publish: run and passed
 
-The freeze is only partly verified, and the missing part blocks **publishing**,
-not merging.
+The freeze was once only partly verified, and the missing part blocked
+**publishing** rather than merging.
 
-Verified: the committed artifact loads in a real wasmtime engine, imports
+Verified by CI: the committed artifact loads in a real wasmtime engine, imports
 exactly `freenet_contract_io::__frnt__fill_buffer` and nothing else, exports the
-four entry points with the signatures the node calls, and runs its own
-allocator (`../pointer-contract-conformance/`).
+four entry points with the signatures the node calls, and runs its own allocator
+(`../pointer-contract-conformance/`).
 
-**Not verified: that this contract's logic is correct when compiled to
-`wasm32`.** Every test of the logic runs the same Rust compiled natively, and
-the conformance suite never calls the entry points. A `wasm32` backend
-miscompile in `curve25519-dalek` or `blake3`, or a `ContractInterfaceResult`
-encoding mismatch, would pass both suites — and a signature check that
-misbehaves only on `wasm32` fails silently rather than loudly, which is the
-worst shape for a fault in this particular contract.
+Not verified until 2026-08-17: **that this contract's logic is correct when
+compiled to `wasm32`.** Every test of the logic ran the same Rust compiled
+natively, and the conformance suite never called the entry points. A `wasm32`
+backend miscompile in `curve25519-dalek` or `blake3`, or a
+`ContractInterfaceResult` encoding mismatch, would have passed both suites — and
+a signature check that misbehaves only on `wasm32` fails silently rather than
+loudly, which is the worst shape for a fault in this particular contract.
 
-So before the first publish, do one manual run against a real local node: PUT a
-signed record, GET it back and verify it, then push a stale one and a forged one
-and confirm both are refused. That is about an hour, and it closes the one gap a
-flag day cannot fix. See the STOP box in `README.md`.
+**That run has now happened: 10 checks, 0 failures**, against throwaway loopback
+nodes on freenet 0.2.128 / fdev 0.3.273. The evidence, including the control
+that keeps the forgery check from being confounded and the one coverage caveat
+(`update_state` exercised in local mode only, because of freenet-core#5361), is
+recorded in the corresponding box in `README.md`. Read it there rather than
+trusting this sentence.
 
-The freenet-core end-to-end test (exporting `ContractRuntimeInterface` from
-`dev_tool` and driving all four entry points there) is the durable follow-on,
-not the gate itself, and not a substitute for the manual run.
+The freenet-core end-to-end test — exporting `ContractRuntimeInterface` from
+`dev_tool` and driving all four entry points there — remains the durable
+follow-on. It was never a substitute for the manual run, and now that the manual
+run is done it is the thing that keeps this true on every future toolchain.
+
 
 ## Inspection inherits the author's blind spots; execution does not
 

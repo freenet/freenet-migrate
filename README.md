@@ -260,13 +260,16 @@ has no lineage to walk. For that, resolve the author's
 its address is derivable offline from `(author_vk, app_id)`, and its state names
 the app's current `code_hash`.
 
-> **Nothing has published a pointer yet.** The contract's WASM is frozen and
-> CI-enforced, but it has not been published to the network and the first
-> publish is gated on a manual end-to-end run (see the STOP box in
-> [`contracts/pointer-contract/README.md`](./contracts/pointer-contract/README.md)).
-> Until then a resolve returns `NeverPublished` if your transport reports a real
-> "not found", and `Unavailable` if it cannot tell. So during this period a first-run
-> consumer legitimately falls back to its baked-in key.
+> **The pre-publish gate has passed (2026-08-17); nothing has published a
+> pointer yet.** The contract's WASM is frozen and CI-enforced, and its logic
+> has now been executed on `wasm32` against a real node — the evidence is
+> recorded in
+> [`contracts/pointer-contract/README.md`](./contracts/pointer-contract/README.md).
+> What remains is that no author has published a record, so there is nothing on
+> the network to resolve. Until one does, a resolve returns `NeverPublished` if
+> your transport reports a real "not found", and `Unavailable` if it cannot
+> tell. So during this period a first-run consumer legitimately falls back to
+> its baked-in key.
 
 ```rust,ignore
 use freenet_migrate::{resolve_app_pointer, PointerFloor, PointerOutcome};

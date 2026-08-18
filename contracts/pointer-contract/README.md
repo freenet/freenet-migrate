@@ -424,48 +424,56 @@ let record = freenet_pointer_contract::sign_record(
 // pointer key from Step 1.
 ```
 
-> ### STOP — do not publish yet. One manual check is required first.
+> ### The pre-publish gate: RUN AND PASSED, 2026-08-17
 >
-> The artifact is frozen, CI-enforced, and loads in a real WASM runtime. But
-> **nothing has ever executed this contract's logic on `wasm32`**, and nothing
-> has exercised the bincode boundary end to end. The unit tests run the same
-> Rust compiled natively; the conformance suite loads the module and checks its
-> shape, but never calls the four entry points.
+> This box used to say "do not publish yet". The manual run it required has
+> happened; what follows records it, so the next reader can judge the evidence
+> rather than take "it passed" on trust.
 >
-> So a `wasm32` backend miscompile in `curve25519-dalek` or `blake3`, or a
-> `ContractInterfaceResult` encoding mismatch, is invisible to **both** suites.
-> A signature check that silently misbehaves only on `wasm32` would pass
-> everything in this repository.
+> **Environment.** freenet `0.2.128 (c121e06374a4)`, fdev `0.3.273`, two
+> throwaway loopback nodes (neither is production). The committed
+> `pointer-v1.wasm` was PUT as-is, its BLAKE3 base58-encoded independently
+> beforehand and checked against `CODEHASH`.
 >
-> **Required before the first publish — about an hour, against a real local
-> node:**
+> **Result: 10 checks, 0 failures.**
 >
-> 1. PUT a signed record. Confirm it lands and a GET returns the same 100 bytes.
-> 2. GET it back and verify the signature client-side, so the round trip is
->    checked and not just the storage.
-> 3. Push a **stale** record (lower version). Confirm it is refused, and that the
->    stored record is unchanged.
-> 4. Push a **forged** record (right shape, wrong signer). Confirm it is refused.
+> 1. The contract key the node derives from the raw wasm (`fdev
+>    get-contract-id`) is identical to the key the documented consumer path
+>    derives from `CODEHASH`. No fork of the convention.
+> 2. A validly signed v1 PUTs (`validate_state` accept path on `wasm32`).
+> 3. GET returns the same 100 bytes; the signature verifies client-side.
+> 4. UPDATE to v2 applies.
+> 5. A **stale** v1, validly signed, leaves the stored record at v2. Asserted on
+>    the stored bytes, not on an error: `update_state` treats a stale-but-valid
+>    record as a no-op success by design, so a gate expecting an error here
+>    would fail for the wrong reason.
+> 6. A **forged** v3 (right shape, wrong signer) is refused; stored record
+>    unchanged at v2.
+> 7. **Control:** a *genuine* v3 carrying the same version and the same code
+>    hash as the forgery, differing only in the signer, IS accepted. Without
+>    this, check 6 is indistinguishable from "nothing updates past v2 at all".
+> 8. A v4 pushed as `UpdateData::State` applies, so both update wire shapes are
+>    exercised.
+> 9. A forged INITIAL state under a second `app_id` is refused
+>    (`validate_state` reject path).
 >
-> Steps 3 and 4 matter most: they are the paths where a `wasm32`-only fault
-> would look like success rather than like a crash.
+> Check 4 is the positive control for 5 and 6: had updates been silently
+> no-opping, it fails first and the later checks are reported as vacuous rather
+> than as passes.
 >
-> Why this blocks publishing and not merging: merging only lands code, and code
-> can be changed. Publishing is the moment the freeze becomes load-bearing —
-> integrators start deriving keys from this code hash and can no longer be moved
-> off it. A fault found before the first publish is an ordinary edit; found
-> after, it is a flag day that re-keys every pointer in the ecosystem.
+> **One coverage caveat, stated because it is real.** `validate_state`, both
+> paths, ran under network mode AND local mode. `update_state` ran under
+> **local mode only**: on a single network-mode node every UPDATE fails with
+> `missing contract` while GET keeps returning the state, which is
+> freenet-core#5361 and not a fault in this contract. Local mode runs the same
+> wasm runtime, the same executor and the same `ContractInterfaceResult`
+> encoding, so the gap this gate named — `wasm32` logic and the encoding
+> boundary — is closed. What remains unexercised is `update_state` reached
+> through the network op path.
 >
-> **The durable follow-on**, tracked separately and NOT a substitute for the
-> manual run: freenet-core exports `ContractRuntimeInterface` from `dev_tool`
-> (it is `pub use`d in its private `wasm_runtime` module today) and drives all
-> four entry points against `pointer-v1.wasm` in its own CI. That belongs there
-> rather than here because the value is a host we do not control saying no —
-> reimplementing the handshake locally would only prove this repository agrees
-> with itself.
->
-> This box is the gate. Delete it in the commit that records the manual run, and
-> not before.
+> The durable follow-on is unchanged and still worth doing: freenet-core
+> driving all four entry points against `pointer-v1.wasm` in its own CI, where
+> the value is a host we do not control saying no.
 
 **PUT the committed `pointer-v1.wasm`, and check its hash against `CODEHASH`
 first.** Do not build the WASM yourself as part of your release. Building it
