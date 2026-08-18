@@ -260,16 +260,30 @@ has no lineage to walk. For that, resolve the author's
 its address is derivable offline from `(author_vk, app_id)`, and its state names
 the app's current `code_hash`.
 
-> **The pre-publish gate has passed (2026-08-17); nothing has published a
-> pointer yet.** The contract's WASM is frozen and CI-enforced, and its logic
-> has now been executed on `wasm32` against a real node — the evidence is
-> recorded in
+> **The pointer contract is LIVE. River publishes the first two records
+> (2026-08-18).** The pre-publish gate passed on 2026-08-17 and the contract's
+> logic has been executed on `wasm32` against a real node — evidence in
 > [`contracts/pointer-contract/README.md`](./contracts/pointer-contract/README.md).
-> What remains is that no author has published a record, so there is nothing on
-> the network to resolve. Until one does, a resolve returns `NeverPublished` if
-> your transport reports a real "not found", and `Unavailable` if it cannot
-> tell. So during this period a first-run consumer legitimately falls back to
-> its baked-in key.
+>
+> | `app_id` | pointer key |
+> |---|---|
+> | `river.room-contract` | `Ai4VLoC2jGdhpcB2UU8VPo3efUoxjm1Ju9VKXqRC63Az` |
+> | `river.chat-delegate` | `6qF2H5JRPBxbKC45UtPnzdDzyfsejYFW1UwDLGDU66mu` |
+>
+> Author key `river:v1:vk:9Ebskq4y7NvJpTQTrF1FAxU8g6bR4Rhe4TRikXba55EJ`, published
+> in River's `FREENET.md` — take it from there, not from here.
+>
+> Both were read back from the network after publishing and resolved through
+> `resolve_app_pointer` itself, returning `Resolved` with the code hash of the
+> artifact actually running. (The same harness returned `Unavailable` before the
+> publish, so that is a before/after rather than a self-confirming check.)
+>
+> **Adoption is still thin.** Atlas and Delta have records prepared but not yet
+> published; every other app has none. For an app that has not published, a
+> resolve returns `NeverPublished` if your transport reports a real "not found",
+> and `Unavailable` if it cannot tell — so a first-run consumer of THOSE apps
+> still legitimately falls back to its baked-in key. Resolve first regardless;
+> that is what makes the fallback safe to keep.
 
 ```rust,ignore
 use freenet_migrate::{resolve_app_pointer, PointerFloor, PointerOutcome};

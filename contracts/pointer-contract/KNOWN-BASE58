@@ -23,3 +23,13 @@ k2Nt3AT6K7L9obj1GwogHN2dpzY1MVaz9AAhXbLBkAS
 # freenet-migrate's own lineage test fixture, for a different contract.
 # If freenet-migrate changes that fixture, update this line.
 8qbHbw2BbbTHBW1sbeqakYXVKRQM8Ne7pLK7m6CVfeR
+
+# River's two pointer keys and its author verifying key, published 2026-08-18 —
+# the first records on the network. These are base58 of code-hash SHAPE but are
+# not code hashes: the first two are pointer contract instance ids
+# (BLAKE3(CODEHASH || author_vk||app_id)) and the third is an ed25519 verifying
+# key. Listed so the stale-hash guard does not flag them, and so adding any
+# further one stays a visible act.
+Ai4VLoC2jGdhpcB2UU8VPo3efUoxjm1Ju9VKXqRC63Az
+6qF2H5JRPBxbKC45UtPnzdDzyfsejYFW1UwDLGDU66mu
+9Ebskq4y7NvJpTQTrF1FAxU8g6bR4Rhe4TRikXba55EJ
