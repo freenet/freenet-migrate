@@ -312,14 +312,37 @@ fn to_hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
+/// Decode hex, rejecting anything that is not hex rather than panicking on it.
+///
+/// The alphabet is checked BEFORE any slicing, and the slicing is then done on
+/// bytes. `&s[i..i + 2]` on a `&str` panics when `i + 2` lands inside a
+/// multi-byte character, and `"\u{20AC}1"` ("EUR1") is four bytes, so it passes
+/// an even-length check and then panics on the first slice. `--state` and
+/// `--code-hash` are exactly the arguments that carry untrusted or
+/// copy-pasted text, so this has to be a clean error.
+///
+/// A panic here fails closed — a CI gate sees a non-zero exit either way — but
+/// "byte index 2 is not a char boundary" tells the person reading the log
+/// nothing about what they actually typed wrong.
 fn from_hex(s: &str) -> Result<Vec<u8>, String> {
-    if s.len() % 2 != 0 {
-        return Err("hex string has an odd length".into());
+    let b = s.as_bytes();
+    if b.len() % 2 != 0 {
+        return Err(format!("hex string has an odd length ({} chars)", b.len()));
     }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|e| e.to_string()))
-        .collect()
+    if let Some(bad) = b.iter().find(|c| !c.is_ascii_hexdigit()) {
+        return Err(format!(
+            "not a hex string: contains the byte 0x{bad:02x}, which is not a hex digit"
+        ));
+    }
+    Ok(b.chunks_exact(2)
+        .map(|p| {
+            // Both bytes are ASCII hex digits, checked above, so neither
+            // conversion can fail.
+            let hi = (p[0] as char).to_digit(16).expect("checked ascii hex");
+            let lo = (p[1] as char).to_digit(16).expect("checked ascii hex");
+            (hi * 16 + lo) as u8
+        })
+        .collect())
 }
 
 // --------------------------------------------------------------- arg parsing
@@ -471,6 +494,45 @@ mod tests {
         // is silently addressing nothing.
         let bytes = bs58::decode(parsed).into_vec().expect("base58");
         assert_eq!(bytes.len(), 32);
+    }
+
+    /// Found by an adversarial review: `&s[i..i + 2]` on a `&str` panics when
+    /// the index lands inside a multi-byte character. "EUR1" is four bytes, so
+    /// it passed the even-length check and then panicked — reachable from
+    /// `--state`, which is exactly where copy-pasted or network-sourced text
+    /// arrives.
+    #[test]
+    fn multibyte_input_is_an_error_not_a_panic() {
+        for bad in [
+            "\u{20AC}1",
+            "\u{20AC}\u{20AC}",
+            "z\u{00E9}",
+            "\u{00E9}\u{00E9}",
+        ] {
+            let err = from_hex(bad)
+                .err()
+                .unwrap_or_else(|| panic!("{bad:?} must not decode as hex"));
+            assert!(!err.is_empty());
+        }
+        // And the same input through the public entry points, which is how it
+        // would actually arrive.
+        assert!(decode_key_material("\u{20AC}1", 32, "k").is_err());
+    }
+
+    #[test]
+    fn non_hex_ascii_is_rejected_with_a_useful_message() {
+        let err = from_hex("zz").err().expect("zz is not hex");
+        assert!(err.contains("not a hex digit"), "{err}");
+        // Odd length is still its own distinct error.
+        let err = from_hex("abc").err().expect("odd length");
+        assert!(err.contains("odd length"), "{err}");
+    }
+
+    /// Uppercase hex must decode identically — a code hash pasted from a tool
+    /// that renders uppercase is not a different value.
+    #[test]
+    fn hex_is_case_insensitive() {
+        assert_eq!(from_hex("DEADbeef").unwrap(), vec![0xde, 0xad, 0xbe, 0xef]);
     }
 
     #[test]
