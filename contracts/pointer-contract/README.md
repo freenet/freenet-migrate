@@ -354,7 +354,7 @@ so an app does not have to grow its own signing code:
 
 ```console
 $ cargo install --git https://github.com/freenet/freenet-migrate --rev <pin> \
-      --features publish freenet-pointer-contract
+      --features publish --locked freenet-pointer-contract
 
 $ pointer-record key --author-vk river:v1:vk:<base58> --app-id river.room-contract
 key=...
@@ -373,7 +373,14 @@ $ pointer-record verify --author-vk river:v1:vk:<base58> --app-id river.room-con
 verified=true
 ```
 
-Three properties worth knowing before you wrap it in something:
+**`--locked` is not optional here.** Without it Cargo re-resolves and may pick a
+newer semver-compatible transitive dependency, so the binary you install is not
+the one CI exercised — which quietly defeats the `--rev` pin you just took the
+trouble to write. For a tool that decides what a record's bytes ARE, and that a
+freshness gate trusts as its oracle, the resolve has to be as pinned as the
+revision. Same reason this crate's own dependencies use `=` rather than `^`.
+
+Three further properties worth knowing before you wrap it in something:
 
 - **The signing key is read from stdin, never from a flag.** Anything on `argv`
   is visible in `ps` to every other user on the machine and lands in shell
