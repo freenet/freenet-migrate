@@ -107,7 +107,7 @@ loudly, which is the worst shape for a fault in this particular contract.
 **That run has now happened: 10 checks, 0 failures**, against throwaway loopback
 nodes on freenet 0.2.128 / fdev 0.3.273. The evidence, including the control
 that keeps the forgery check from being confounded and the one coverage caveat
-(`update_state` exercised in local mode only, because of freenet-core#5361), is
+(`update_state` exercised in local mode only, because of freenet-core#4978), is
 recorded in the corresponding box in `README.md`. Read it there rather than
 trusting this sentence.
 

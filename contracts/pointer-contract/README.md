@@ -465,7 +465,7 @@ let record = freenet_pointer_contract::sign_record(
 > paths, ran under network mode AND local mode. `update_state` ran under
 > **local mode only**: on a single network-mode node every UPDATE fails with
 > `missing contract` while GET keeps returning the state, which is
-> freenet-core#5361 and not a fault in this contract. Local mode runs the same
+> freenet-core#4978 and not a fault in this contract. Local mode runs the same
 > wasm runtime, the same executor and the same `ContractInterfaceResult`
 > encoding, so the gap this gate named — `wasm32` logic and the encoding
 > boundary — is closed. What remains unexercised is `update_state` reached
