@@ -400,6 +400,7 @@ dependencies = [
 name = "freenet-pointer-contract"
 version = "1.0.0"
 dependencies = [
+ "bs58",
  "ed25519-dalek",
  "freenet-stdlib",
 ]

@@ -48,7 +48,17 @@ freenet-main-contract = ["freenet-stdlib/contract"]
 # Publisher-side signing helpers. NOT enabled for the canonical WASM build --
 # a node only ever verifies, never signs, so this keeps signing code out of the
 # frozen artifact.
-publish = []
+#
+# `dep:bs58` rides along here rather than in the unconditional dependency list
+# for the same reason. Publishers and CI gates deal in the base58 forms that
+# actually appear in an app's FREENET.md (`CODEHASH`, an author verifying key,
+# a contract key); the contract itself never parses one, because its params
+# carry raw bytes. bs58 0.5.1 is ALREADY in this crate's lockfile transitively
+# via freenet-stdlib, at the identical version pinned here, so naming it
+# directly resolves to the same package and adds nothing to the graph. The
+# frozen-WASM check in CI (`./build-wasm.sh --check`) is what proves that
+# claim rather than merely asserting it.
+publish = ["dep:bs58"]
 
 [dependencies]
 # EXACT pins ("=", not "^"). A caret range lets a fresh resolve on a machine
@@ -63,6 +73,10 @@ freenet-stdlib = { version = "=0.8.5", default-features = false }
 # ed25519-dalek 2.1.1, `alloc` only: no `rand_core`, so no `getrandom`, so no
 # wasm-bindgen contamination in the WASM build. Verification never needs an RNG.
 ed25519-dalek = { version = "=2.1.1", default-features = false, features = ["alloc"] }
+# Optional, and reached only through the `publish` feature -- see the note there.
+# Pinned exactly, like everything else here: this crate's whole premise is that a
+# fresh resolve on a machine without the lockfile cannot change its bytes.
+bs58 = { version = "=0.5.1", default-features = false, features = ["alloc"], optional = true }
 
 [dev-dependencies]
 # Test keys are derived from fixed byte arrays, never generated, so the test
@@ -81,4 +95,11 @@ strip = true
 [[bin]]
 name = "pointer-codehash"
 path = "src/bin/pointer-codehash.rs"
+required-features = ["publish"]
+
+# The publisher-side and CI-gate tool. Same gating rationale as the bin above:
+# it is a host binary, so the wasm32 build must never try to compile it.
+[[bin]]
+name = "pointer-record"
+path = "src/bin/pointer-record.rs"
 required-features = ["publish"]

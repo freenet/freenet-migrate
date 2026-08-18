@@ -347,6 +347,53 @@ shared floor either rejects good records or carries a bound that is too low.
 
 ## Publisher side
 
+### Use the `pointer-record` tool, not a signing script of your own
+
+The `publish` feature ships a binary that signs, derives and verifies records,
+so an app does not have to grow its own signing code:
+
+```console
+$ cargo install --git https://github.com/freenet/freenet-migrate --rev <pin> \
+      --features publish freenet-pointer-contract
+
+$ pointer-record key --author-vk river:v1:vk:<base58> --app-id river.room-contract
+key=...
+params=...
+
+$ pointer-record sign --author-vk river:v1:vk:<base58> --app-id river.room-contract \
+      --version 1 --code-hash $(b3sum --no-names your.wasm) \
+      < ~/.config/river/web-container-keys.toml
+key=...
+version=1
+code_hash=...
+state=<the 100 bytes, hex>
+
+$ pointer-record verify --author-vk river:v1:vk:<base58> --app-id river.room-contract \
+      --state <hex|file|-> --expect-version 1 --expect-code-hash <hash>
+verified=true
+```
+
+Three properties worth knowing before you wrap it in something:
+
+- **The signing key is read from stdin, never from a flag.** Anything on `argv`
+  is visible in `ps` to every other user on the machine and lands in shell
+  history. A whole key file is accepted, so the usual invocation is a redirect
+  and the caller never handles the secret itself.
+- **`sign` refuses unless `--author-vk` matches the key it was given.** Take
+  that value from the app's published `FREENET.md`, not from the key file: the
+  point is to catch a key file that has drifted from the identity integrators
+  actually verify against. A record signed by the wrong key is perfectly valid
+  and completely unusable, and nothing downstream will tell you.
+- **Output is `key=value` lines**, so a CI gate can `grep` it without a JSON
+  parser. Everything that fails, fails loudly with a non-zero exit.
+
+`verify` is what a **CI freshness gate** runs: given the app's committed WASM
+and its committed record, it proves the record is signed by the published author
+key AND names the hash of the WASM that is actually committed. See "Keeping a
+pointer fresh" below.
+
+### The library calls, if you are building this into something else
+
 Enable the `publish` feature for the signing helpers.
 
 ```rust
@@ -435,6 +482,41 @@ for you:
    `<project>.<artifact>`, e.g. `river.room-contract`, `river.chat-delegate`,
    `ghostkeys.ghostkey-delegate`. Name the artifact, not its kind — this is why
    the state carries no `kind` field.
+
+---
+
+## Keeping a pointer fresh
+
+**Once a pointer exists, a stale pointer is worse than no pointer.** Before you
+publish one, an integrator pinning your key knows they are pinning it. After,
+they resolve, get a confident answer, and derive a dead key — so the failure
+mode gets quieter exactly when more people depend on it.
+
+Publishing is therefore the easy half. The half that has to survive everyone
+forgetting about it is: **whenever the pointed-at WASM re-keys, a new record is
+signed**, enforced by the app's own CI rather than by anyone's memory.
+
+The shape that works, because the app already has the pieces:
+
+1. Commit the signed record alongside the WASM it names — the record is 100
+   bytes and carries its own signature, so it is checkable without a network or
+   a key.
+2. On every PR, if the committed WASM's BLAKE3 changed and the committed record
+   does not name the new hash, **fail the build**. That is one
+   `pointer-record verify --expect-code-hash $(b3sum committed.wasm)`.
+3. Require the version to be strictly greater than the version in the base
+   commit's record, from a single committed counter. Two release machines, or a
+   retry after a flaky PUT, otherwise sign two different records at one version.
+
+Step 2 is the one that matters and the one that is easy to weaken into a
+presence check ("is there a record at all?"). A presence check passes forever
+after the first record is committed, which is precisely the state this section
+exists to prevent. `verify` compares the *bytes*, and its signature check means
+a hand-edited hash fails too.
+
+River's `scripts/check-pointer-freshness.sh` is the reference implementation,
+built on the same `check-migration.sh` pattern its delegate registry already
+uses.
 
 ---
 
