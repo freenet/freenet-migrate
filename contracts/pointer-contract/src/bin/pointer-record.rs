@@ -341,7 +341,16 @@ fn signing_key_from_text(text: &str) -> R<SigningKey> {
 
     reject_wrong_key_type(&token, "sk", "signing key")?;
     let bytes = Zeroizing::new(decode_key_material(&token, 32, "signing key")?);
-    let arr: [u8; 32] = bytes.as_slice().try_into().expect("length checked above");
+    // `Zeroizing` on the ARRAY too, not only on the Vec it came from.
+    // `try_into` for `[u8; 32]` is a memcpy into a fresh stack array, so this is
+    // a second, independent copy of the raw private key — freed rather than
+    // overwritten when the function returns, which is exactly what the rest of
+    // this path exists to prevent. Caught in review after the first zeroize
+    // pass wrapped everything else and missed it.
+    //
+    // The `SigningKey` this constructs is covered separately, by ed25519-dalek's
+    // own zeroizing Drop (enabled through the `publish` feature).
+    let arr = Zeroizing::new(<[u8; 32]>::try_from(bytes.as_slice()).expect("length checked above"));
     Ok(SigningKey::from_bytes(&arr))
 }
 
@@ -765,15 +774,35 @@ mod tests {
             signing_key_from_text(&b58).unwrap().to_bytes(),
             sk.to_bytes()
         );
-        // And empty input is refused rather than producing some default key.
-        assert!(signing_key_from_text("   \n\t ").is_err());
+        // Empty input is refused BY THE EARLY CHECK, asserted on its specific
+        // message. `decode_key_material` would also reject an empty token, so a
+        // bare `is_err()` here would still pass with the early check deleted --
+        // it would just say something less useful.
+        let err = signing_key_from_text("   \n\t ").expect_err("empty input must be refused");
+        assert!(err.contains("no signing key on stdin"), "{err}");
     }
 
-    /// The specific regression the vacuous test could not catch: a value with a
-    /// SECOND `=` after the assignment. `split('=').nth(1)` truncates it;
-    /// `split_once('=')` does not.
+    /// Pins `unquote_toml_value`'s quote/comment handling.
+    ///
+    /// **This test was originally named and documented as pinning the
+    /// `split_once('=')` vs `split('=').nth(1)` distinction, and that was
+    /// wrong.** A reviewer re-ran the mutation properly — changing ONLY the
+    /// split and keeping `unquote_toml_value` — and the suite stayed green. My
+    /// own "mutation verified" run had replaced the whole expression, including
+    /// the call to `unquote_toml_value`, so the red I saw came from reverting
+    /// the helper, not the split.
+    ///
+    /// The distinction really is subsumed: `unquote_toml_value` ends a quoted
+    /// value at its closing quote, and neither hex nor base58 contains `=`, so
+    /// for every input this tool accepts the quote is found before any second
+    /// `=` and the earlier truncation removes nothing that would have survived.
+    /// `split_once` is kept because it is clearer and correct for an unquoted
+    /// value, not because a test defends it.
+    ///
+    /// What this test actually defends is the helper: revert its quoted branch
+    /// to `trim_matches('"')` and this goes red.
     #[test]
-    fn a_signing_key_value_containing_an_equals_is_not_truncated() {
+    fn a_quoted_signing_key_value_survives_a_trailing_comment() {
         let sk = SigningKey::from_bytes(&[11u8; 32]);
         let hex: String = sk.to_bytes().iter().map(|b| format!("{b:02x}")).collect();
         // A trailing comment introduces the second `=`.
@@ -789,6 +818,33 @@ mod tests {
         assert_eq!(unquote_toml_value(" abc # note "), "abc");
         assert_eq!(unquote_toml_value(" \"ab#cd\" # note "), "ab#cd");
         assert_eq!(unquote_toml_value(" plain "), "plain");
+    }
+
+    /// A decode failure on the SIGNING KEY must not quote the input.
+    ///
+    /// bs58 0.5's `InvalidCharacter` Display prints the offending character
+    /// literally, so an unfiltered error puts one character of the secret on
+    /// stderr, where CI captures it. Public values keep the detail, because for
+    /// them it is genuinely useful — so this asserts BOTH directions, and a fix
+    /// that simply redacted everything would fail the second half.
+    #[test]
+    fn a_decode_failure_never_quotes_the_signing_key() {
+        // '0' is not in the Bitcoin base58 alphabet, so this fails to decode.
+        let secret_ish = "0OIl_not_base58_and_not_hex";
+        let err = decode_key_material(secret_ish, 32, "signing key").expect_err("must not decode");
+        assert!(
+            !err.contains('0') || !err.contains("provided string contained"),
+            "the signing-key error must not carry bs58's character detail: {err}"
+        );
+        assert!(err.contains("neither"), "{err}");
+
+        // The same input as a PUBLIC value keeps the detailed message.
+        let pub_err = decode_key_material(secret_ish, 32, "author verifying key")
+            .expect_err("must not decode");
+        assert!(
+            pub_err.len() > err.len(),
+            "public values should keep the detail the secret path drops:\n  secret: {err}\n  public: {pub_err}"
+        );
     }
 
     /// THE property this tool leans on hardest, and it had no test at all:
