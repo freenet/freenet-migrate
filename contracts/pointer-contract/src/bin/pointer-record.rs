@@ -262,18 +262,23 @@ fn read_signing_key_from_stdin() -> R<SigningKey> {
         return Err("no signing key on stdin (redirect a key file into this command)".into());
     }
 
-    let token = match buf
-        .lines()
-        .find(|l| l.trim_start().starts_with("signing_key"))
-    {
+    // The key must be EXACTLY `signing_key`, not merely a line starting with
+    // it: a `signing_key_backup = …` line sitting above the real one would
+    // otherwise be picked instead, and the record comes out signed by the wrong
+    // key. The `--author-vk` check downstream catches that, but only depending
+    // on which key is which, and the error it prints does not point here.
+    let token = match buf.lines().find(|l| is_signing_key_line(l)) {
+        // `split_once`, not `split('=').nth(1)`: the latter silently truncates
+        // at a second `=`, quietly mangling any padded encoding a key file
+        // happens to use.
         Some(line) => line
-            .split('=')
-            .nth(1)
-            .map(|v| v.trim().trim_matches('"').trim().to_string())
+            .split_once('=')
+            .map(|(_, v)| v.trim().trim_matches('"').trim().to_string())
             .ok_or_else(|| "a 'signing_key' line was found but has no '= value'".to_string())?,
         None => buf.trim().to_string(),
     };
 
+    reject_wrong_key_type(&token, "sk", "signing key")?;
     let bytes = decode_key_material(&token, 32, "signing key")?;
     let arr: [u8; 32] = bytes.try_into().expect("length checked above");
     Ok(SigningKey::from_bytes(&arr))
@@ -285,6 +290,51 @@ fn read_signing_key_from_stdin() -> R<SigningKey> {
 /// Hex is tried first and only for an exactly-64-character input, because the
 /// base58 and hex alphabets overlap: a 64-character base58 string of the right
 /// length would otherwise be silently decoded as hex into different bytes.
+/// True only for a real `signing_key = …` line, never for `signing_key_backup`.
+fn is_signing_key_line(line: &str) -> bool {
+    line.trim_start()
+        .strip_prefix("signing_key")
+        .is_some_and(|rest| rest.trim_start().starts_with('='))
+}
+
+/// Refuse a value whose own type tag says it is something else.
+///
+/// A verifying key and a signing key are both 32 bytes, both base58, and in
+/// these key files they sit on adjacent lines differing by three letters. Two
+/// things follow, and the second is the serious one:
+///
+/// * `VerifyingKey::from_bytes` rejects a non-point, so passing a signing key
+///   as `--author-vk` errors only about half the time — the rest of the time it
+///   derives a plausible key for a pointer nobody will ever query.
+/// * `--author-vk river:v1:sk:…` would put a PRIVATE KEY on `argv`, where it is
+///   visible in `ps` and lands in shell history. This tool reads the signing key
+///   from stdin precisely so that cannot happen; ignoring an `sk` tag in a flag
+///   would leave the same hole open through the front door.
+///
+/// Untagged values (bare base58, or hex) are unaffected: the tag is checked
+/// only when the caller actually supplied one.
+fn reject_wrong_key_type(s: &str, want_tag: &str, what: &str) -> R<()> {
+    let parts: Vec<&str> = s.split(':').collect();
+    if parts.len() < 2 {
+        return Ok(()); // untagged; nothing claimed, so nothing to contradict
+    }
+    let tag = parts[parts.len() - 2];
+    if !matches!(tag, "vk" | "sk" | "sig") || tag == want_tag {
+        return Ok(());
+    }
+    if tag == "sk" {
+        return Err(format!(
+            "refusing to read a SIGNING key as the {what}: the value is tagged ':sk:'.\n\
+             A private key must never be passed as a flag - it is visible in `ps` to\n\
+             every user on this machine and lands in your shell history. Pass the\n\
+             VERIFYING key (':vk:') here; the signing key is read from stdin."
+        ));
+    }
+    Err(format!(
+        "the value given for the {what} is tagged ':{tag}:', not ':{want_tag}:'"
+    ))
+}
+
 fn decode_key_material(s: &str, want: usize, what: &str) -> R<Vec<u8>> {
     let token = s.rsplit(':').next().unwrap_or(s).trim();
     if token.is_empty() {
@@ -412,6 +462,7 @@ impl Opts {
 
     fn author_vk(&self) -> R<VerifyingKey> {
         let raw = self.req("--author-vk")?;
+        reject_wrong_key_type(raw, "vk", "author verifying key")?;
         let bytes = decode_key_material(raw, 32, "author verifying key")?;
         let arr: [u8; 32] = bytes.try_into().expect("length checked");
         VerifyingKey::from_bytes(&arr)
@@ -562,14 +613,46 @@ mod tests {
         assert_eq!(decode_key_material(&hex, 32, "k").unwrap(), bytes);
     }
 
+    /// Found by an adversarial review: `starts_with("signing_key")` also matched
+    /// `signing_key_backup`, so a key file carrying a backup line above the real
+    /// one signed with the WRONG key. The `--author-vk` check downstream happened
+    /// to catch it, but only depending on which key was which.
+    #[test]
+    fn a_signing_key_line_is_matched_exactly_not_by_prefix() {
+        let file = "[keys]\nsigning_key_backup = \"river:v1:sk:1111\"\nsigning_key = \"river:v1:sk:2222\"\n";
+        let picked = file
+            .lines()
+            .find(|l| is_signing_key_line(l))
+            .expect("the real signing_key line");
+        assert!(picked.contains("2222"), "picked the backup line: {picked}");
+        assert!(!is_signing_key_line("signing_key_backup = \"x\""));
+        assert!(!is_signing_key_line("# signing_key = \"x\""));
+        assert!(is_signing_key_line("  signing_key   =  \"x\""));
+    }
+
+    /// A verifying key and a signing key are both 32 base58 bytes and sit on
+    /// adjacent lines of the same file. Passing the private one as `--author-vk`
+    /// would put it on argv, where `ps` and shell history can see it — the exact
+    /// exposure the stdin-only design exists to prevent.
+    #[test]
+    fn a_signing_key_is_refused_where_a_verifying_key_is_expected() {
+        let err = reject_wrong_key_type("river:v1:sk:1111", "vk", "author verifying key")
+            .expect_err("an sk-tagged value must be refused as a vk");
+        assert!(err.contains("SIGNING key"), "{err}");
+        // The right tag passes, and so does an untagged value: the tag is
+        // consulted only when the caller actually supplied one.
+        assert!(reject_wrong_key_type("river:v1:vk:1111", "vk", "x").is_ok());
+        assert!(reject_wrong_key_type("1111", "vk", "x").is_ok());
+        assert!(reject_wrong_key_type("deadbeef", "vk", "x").is_ok());
+        // ...and the mirror direction, so a vk cannot be fed in as the key.
+        assert!(reject_wrong_key_type("river:v1:vk:1111", "sk", "signing key").is_err());
+    }
+
     #[test]
     fn a_key_file_yields_its_signing_key_line() {
         // Shape of the real file, comments and all.
         let file = "# River web container keys\n[keys]\nsigning_key = \"river:v1:sk:11111111111111111111111111111111\"\nverifying_key = \"river:v1:vk:xyz\"\n";
-        let line = file
-            .lines()
-            .find(|l| l.trim_start().starts_with("signing_key"))
-            .unwrap();
+        let line = file.lines().find(|l| is_signing_key_line(l)).unwrap();
         let token = line.split('=').nth(1).unwrap().trim().trim_matches('"');
         assert_eq!(token, "river:v1:sk:11111111111111111111111111111111");
         assert_eq!(decode_key_material(token, 32, "sk").unwrap(), [0u8; 32]);
