@@ -1468,8 +1468,14 @@ impl<E> From<PointerError> for ResolveError<E> {
 /// [`ResolveError::may_use_baked_in_fallback`] answer that for every arm, so
 /// neither an error nor an unreachable pointer can be mistaken for "no pointer
 /// exists". Reaching `NeverPublished` at all requires a [`PointerIo`] that
-/// reports [`PointerFetch::Absent`]; through [`ConservativeProbeIo`] it is
-/// unreachable by construction.
+/// reports [`PointerFetch::Absent`] — a real negative from the network, not a
+/// timeout. [`ConservativeProbeIo`] forwards such a negative, so
+/// `NeverPublished` **is** reachable through it; what the adapter guarantees is
+/// the other direction, that silence can never become one
+/// (`ProbeAnswer::Unknown` maps to [`PointerFetch::Unreachable`]). Both
+/// directions are pinned by tests: see
+/// `the_conservative_probe_io_adapter_passes_a_real_negative_through` and
+/// `the_conservative_probe_io_adapter_never_unlocks_the_fallback_on_silence`.
 ///
 /// Everything that is neither `Resolved`/`Unchanged` nor `NeverPublished` —
 /// including an `Err` of either kind, [`PointerOutcome::Stale`],
