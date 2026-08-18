@@ -84,21 +84,50 @@ usage:
   file is accepted: the value of the first 'signing_key' line is used.
 ";
 
+/// Flags each subcommand accepts. Anything else is an ERROR, never ignored.
+///
+/// This list is the whole reason the parser is not three lines. A gate script
+/// that misspells `--expect-code-hash` must fail, not quietly check one fewer
+/// thing and print `verified=true`: the caller of `verify` is usually CI, and a
+/// silently-relaxed expectation there is a gate that has stopped gating while
+/// still reporting success. The same trap was found and fixed once already in
+/// this crate's `build-wasm.sh`, whose `--check` used to accept `-check` and
+/// `--check=1` and compare nothing.
+const FLAGS_KEY: &[&str] = &["--author-vk", "--app-id"];
+const FLAGS_SIGN: &[&str] = &["--author-vk", "--app-id", "--version", "--code-hash"];
+const FLAGS_VERIFY: &[&str] = &[
+    "--author-vk",
+    "--app-id",
+    "--state",
+    "--expect-version",
+    "--expect-code-hash",
+    "--expect-key",
+];
+
 fn run() -> R<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let cmd = args.first().map(String::as_str).unwrap_or("");
-    let opts = Opts::parse(&args[args.len().min(1)..])?;
+    let (cmd, rest) = match args.split_first() {
+        Some((c, r)) => (c.as_str(), r),
+        None => return Err(format!("no subcommand given\n\n{USAGE}")),
+    };
 
+    let allowed = match cmd {
+        "key" => FLAGS_KEY,
+        "sign" => FLAGS_SIGN,
+        "verify" => FLAGS_VERIFY,
+        "-h" | "--help" | "help" => {
+            print!("{USAGE}");
+            return Ok(());
+        }
+        other => return Err(format!("unknown subcommand '{other}'\n\n{USAGE}")),
+    };
+
+    let opts = Opts::parse(rest, allowed)?;
     match cmd {
         "key" => cmd_key(&opts),
         "sign" => cmd_sign(&opts),
         "verify" => cmd_verify(&opts),
-        "-h" | "--help" | "help" => {
-            print!("{USAGE}");
-            Ok(())
-        }
-        "" => Err(format!("no subcommand given\n\n{USAGE}")),
-        other => Err(format!("unknown subcommand '{other}'\n\n{USAGE}")),
+        _ => unreachable!("allowed-flag lookup already rejected other subcommands"),
     }
 }
 
@@ -301,8 +330,20 @@ fn from_hex(s: &str) -> Result<Vec<u8>, String> {
 struct Opts(Vec<(String, String)>);
 
 impl Opts {
-    fn parse(args: &[String]) -> R<Self> {
-        let mut out = Vec::new();
+    /// Parses `--flag value` / `--flag=value` pairs, rejecting anything the
+    /// subcommand did not ask for.
+    ///
+    /// Both rejections matter and neither is pedantry:
+    ///
+    /// * **Unknown flags** would otherwise be collected and never looked at, so
+    ///   a typo'd `--expect-code-hash` silently removes a check while `verify`
+    ///   still exits 0.
+    /// * **Duplicate flags** are ambiguous — a caller writing one twice means
+    ///   "last wins", `get` returns the FIRST, and the two readings differ
+    ///   exactly when it matters. There is no reading that is safe to guess, so
+    ///   this refuses instead of picking one.
+    fn parse(args: &[String], allowed: &[&str]) -> R<Self> {
+        let mut out: Vec<(String, String)> = Vec::new();
         let mut i = 0;
         while i < args.len() {
             let a = &args[i];
@@ -311,16 +352,29 @@ impl Opts {
             }
             // `--flag=value` and `--flag value` both work; a caller who mixes
             // them should not have to find out which one this tool wanted.
-            if let Some((k, v)) = a.split_once('=') {
-                out.push((k.to_string(), v.to_string()));
+            let (k, v) = if let Some((k, v)) = a.split_once('=') {
                 i += 1;
+                (k.to_string(), v.to_string())
             } else {
                 let v = args
                     .get(i + 1)
                     .ok_or_else(|| format!("'{a}' needs a value\n\n{USAGE}"))?;
-                out.push((a.clone(), v.clone()));
                 i += 2;
+                (a.clone(), v.clone())
+            };
+            if !allowed.contains(&k.as_str()) {
+                return Err(format!(
+                    "unknown flag '{k}' for this subcommand.\n\
+                     Accepted here: {}\n\n{USAGE}",
+                    allowed.join(" ")
+                ));
             }
+            if out.iter().any(|(existing, _)| *existing == k) {
+                return Err(format!(
+                    "'{k}' given more than once. Refusing to guess which one you meant."
+                ));
+            }
+            out.push((k, v));
         }
         Ok(Self(out))
     }
@@ -462,10 +516,10 @@ mod tests {
     #[test]
     fn flags_parse_in_both_spellings() {
         let a = |s: &str| s.split(' ').map(String::from).collect::<Vec<_>>();
-        let o = Opts::parse(&a("--app-id river.room-contract --version 3")).unwrap();
+        let o = Opts::parse(&a("--app-id river.room-contract --version 3"), FLAGS_SIGN).unwrap();
         assert_eq!(o.get("--app-id"), Some("river.room-contract"));
         assert_eq!(o.req_u32("--version").unwrap(), 3);
-        let o = Opts::parse(&a("--app-id=river.chat-delegate --version=7")).unwrap();
+        let o = Opts::parse(&a("--app-id=river.chat-delegate --version=7"), FLAGS_SIGN).unwrap();
         assert_eq!(o.get("--app-id"), Some("river.chat-delegate"));
         assert_eq!(o.req_u32("--version").unwrap(), 7);
     }
@@ -473,7 +527,49 @@ mod tests {
     #[test]
     fn a_flag_with_no_value_is_an_error_rather_than_a_default() {
         let args = vec!["--app-id".to_string()];
-        assert!(Opts::parse(&args).is_err());
+        assert!(Opts::parse(&args, FLAGS_SIGN).is_err());
+    }
+
+    /// The gate-goes-vacuous case, and the reason the allowed-flag lists exist.
+    ///
+    /// A CI script that misspells `--expect-code-hash` must FAIL. Before this
+    /// was enforced, the unknown flag was collected, never read, and `verify`
+    /// printed `verified=true` having checked one fewer thing than the author
+    /// believed — a gate reporting success while no longer gating.
+    #[test]
+    fn a_misspelled_expectation_is_rejected_rather_than_ignored() {
+        let a = |s: &str| s.split(' ').map(String::from).collect::<Vec<_>>();
+        let err = Opts::parse(&a("--app-id x --expect-codehash deadbeef"), FLAGS_VERIFY)
+            .err()
+            .expect("a misspelled expectation must not parse");
+        assert!(err.contains("--expect-codehash"), "{err}");
+
+        // Correctly spelled, it parses — so the test above is about the typo and
+        // not about the flag being unsupported outright.
+        assert!(Opts::parse(&a("--app-id x --expect-code-hash deadbeef"), FLAGS_VERIFY).is_ok());
+    }
+
+    /// A flag the subcommand does not take is an error even when another
+    /// subcommand accepts it: `verify` must not silently swallow `--version`
+    /// (whose `verify` spelling is `--expect-version`).
+    #[test]
+    fn a_flag_belonging_to_another_subcommand_is_rejected() {
+        let a = |s: &str| s.split(' ').map(String::from).collect::<Vec<_>>();
+        assert!(Opts::parse(&a("--version 3"), FLAGS_SIGN).is_ok());
+        assert!(Opts::parse(&a("--version 3"), FLAGS_VERIFY).is_err());
+    }
+
+    /// "Last wins" and "first wins" differ exactly when a caller has made a
+    /// mistake, so neither is safe to guess.
+    #[test]
+    fn a_duplicated_flag_is_refused_rather_than_resolved() {
+        let a = |s: &str| s.split(' ').map(String::from).collect::<Vec<_>>();
+        let err = Opts::parse(&a("--expect-version 7 --expect-version 999"), FLAGS_VERIFY)
+            .err()
+            .expect("a duplicated flag must not parse");
+        assert!(err.contains("more than once"), "{err}");
+        // Mixed spellings are still the same flag.
+        assert!(Opts::parse(&a("--app-id=a --app-id b"), FLAGS_KEY).is_err());
     }
 
     /// The derivation this tool exists to keep honest: the key must come out of

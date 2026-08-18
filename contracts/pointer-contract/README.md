@@ -503,7 +503,7 @@ The shape that works, because the app already has the pieces:
    a key.
 2. On every PR, if the committed WASM's BLAKE3 changed and the committed record
    does not name the new hash, **fail the build**. That is one
-   `pointer-record verify --expect-code-hash $(b3sum committed.wasm)`.
+   `pointer-record verify --expect-code-hash $(b3sum --no-names committed.wasm)`.
 3. Require the version to be strictly greater than the version in the base
    commit's record, from a single committed counter. Two release machines, or a
    retry after a flaky PUT, otherwise sign two different records at one version.
