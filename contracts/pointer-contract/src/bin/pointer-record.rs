@@ -521,10 +521,10 @@ mod tests {
 
     #[test]
     fn non_hex_ascii_is_rejected_with_a_useful_message() {
-        let err = from_hex("zz").err().expect("zz is not hex");
+        let err = from_hex("zz").expect_err("zz is not hex");
         assert!(err.contains("not a hex digit"), "{err}");
         // Odd length is still its own distinct error.
-        let err = from_hex("abc").err().expect("odd length");
+        let err = from_hex("abc").expect_err("odd length");
         assert!(err.contains("odd length"), "{err}");
     }
 
