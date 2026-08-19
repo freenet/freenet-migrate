@@ -570,6 +570,24 @@ path-remapped, and CI-checked. See [WASM-STABILITY.md](WASM-STABILITY.md).
   a verified identity.
 - **Forward key compromise.** Monotonic `version` bounds backward replay only.
   Whoever holds the author key can sign a pointer to anything.
+- **The version ceiling is a one-shot permanent capture.** `MAX_VERSION` is
+  `u32::MAX - 1`, and the doc on that constant explains the reservation in terms
+  of an author's own mistake. For a consumer that treats a record as
+  *authorization* rather than as an address, it reads worse: whoever holds the
+  author key can sign ONCE at `MAX_VERSION` naming code they control, and the
+  legitimate author then has nowhere higher to go, because every rule requires a
+  strictly greater version and `u32::MAX` is rejected. There is no revocation,
+  and publishing a withdrawal does not help, since a withdrawal is itself a
+  record at a version and must also be strictly greater. Every consumer verifies
+  that record correctly, because it *is* correctly signed.
+
+  This is not a defect to fix. Key theft is terminal for this format by
+  construction, and a ceiling has to exist somewhere; all the ceiling changes is
+  that the attacker needs one signature rather than a race. It is written down
+  because the consequence is invisible from the constant's own doc, and because
+  it has a practical implication for the KEY rather than the format: an author
+  whose record authorizes anything should treat that signing key as a root key,
+  and should not reuse a key that also signs routine releases.
 - **Calling another app's delegate.** Addressing is only half of it: an
   integrator that wants to *message* another app's delegate also needs the
   runtime to attest who is calling. That is a separate, known, currently
