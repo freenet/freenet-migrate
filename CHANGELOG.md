@@ -4,7 +4,13 @@
 
 **Additive, delegate half only.** New
 `SecretSelectionPolicy::NewestSnapshotWinsContinuePastUnresponsive`
-([#14](https://github.com/freenet/freenet-migrate/issues/14)).
+([#14](https://github.com/freenet/freenet-migrate/issues/14)). The minor version
+bump (not a patch) is the conventional pre-1.0 signal for a new public enum
+variant — `SecretSelectionPolicy` is not `#[non_exhaustive]` before this
+release (it is now), so an external exhaustive `match` over it, though none is
+known to exist, would need a new arm. This is a version-number convention, not
+a behavior change: no known adopter's code needs to change, since every one of
+them constructs the policy rather than matching it exhaustively.
 
 ### The problem
 
@@ -42,13 +48,33 @@ it, so the fall-through is never silently clean.
 loud `RollbackRiskAck` (reused from the contract driver's identical trade-off —
 see 0.6.0 below). If the unresponsive predecessor actually held a newer,
 authoritative snapshot rather than simply being unregistered on this node, an
-older generation's data-bearing answer becomes authoritative in its place, and
-a key the true newest generation deleted could be resurrected. Construct the
-ack only when that risk is acceptable, or when silence has already been
-established as the ordinary case rather than a transient fault.
+older generation's data-bearing answer becomes authoritative in its place —
+either as delete-by-absence resurrection, or as **silent, permanent
+value-shadowing**: the successor's never-clobber writer means a later run in
+which the newest predecessor becomes reachable and offers its own different,
+real value for the same key gets declined as `AlreadyAuthoritative`, with the
+report reading completely clean (`is_complete() == true`,
+`any_unresponsive() == false`). There is no signal anywhere that the durable
+value is the wrong one. Ordinary transient unreachability is enough to trigger
+it — no storage fault required.
+
+One case is closed for free: a predecessor already proven data-bearing by a
+surviving marker from an earlier run (`MigrationMarker::InProgress { saw_data:
+true }`) still halts the walk on a *later* unresponsive result, rather than
+falling through — `unresponsive_terminates` now takes that history into
+account. It cannot help on a predecessor's first-ever attempt, which is
+indistinguishable from "never registered," the ordinary case this variant
+exists to fall through on; closing that fully needs the
+`probe_executable -> Result<bool, E>` classification work #14 explicitly
+defers as a separate follow-up. Construct the ack only when the residual risk
+is acceptable, or when silence has already been established as the ordinary
+case rather than a transient fault.
 
 Plain `NewestSnapshotWins`'s halting behavior is unchanged — the new variant is
-opt-in.
+opt-in. Both the closed case and the accepted residual are pinned by tests:
+`a_predecessor_proven_data_bearing_by_a_surviving_marker_still_halts_when_later_unresponsive`
+and
+`continue_past_unresponsive_can_permanently_shadow_a_later_recovered_true_value`.
 
 ## freenet-migrate 0.6.0
 

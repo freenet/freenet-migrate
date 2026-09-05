@@ -595,10 +595,20 @@ driver's `NewestFirstWins` / `FoldAll`):
   every remaining generation `Superseded`. The unresponsive predecessor is
   still recorded and still trips `DelegateMigrationReport::any_unresponsive`
   (the app must still not treat this as a clean fresh install — river#204).
-  This forfeits the anti-rollback guarantee for older generations: if the
-  unresponsive predecessor actually held a newer, authoritative snapshot rather
-  than simply being unregistered, an older generation's data becomes
-  authoritative in its place, hence the loud `RollbackRiskAck`.
+  This forfeits the anti-rollback guarantee for older generations, hence the
+  loud `RollbackRiskAck`: if the unresponsive predecessor actually held a
+  newer, authoritative snapshot rather than simply being unregistered, an
+  older generation's data becomes authoritative in its place, which can mean
+  either delete-by-absence resurrection OR silent, permanent value-shadowing
+  under the successor's never-clobber writer — the true value is discarded on
+  a later run with the report reading completely clean, no signal anywhere
+  that it happened. One case is narrowed for free: a predecessor already
+  *proven* data-bearing by a surviving marker from an earlier run still halts
+  the walk on a later unresponsive result, rather than falling through. It
+  cannot help on a predecessor's very first attempt (indistinguishable from
+  "never registered," the ordinary case this variant exists for) — closing
+  that fully needs the probe-classification work #14 defers as a separate
+  follow-up. See the variant's doc comment for the full scenario.
 - `UnionAllGenerations(ack)`: import every generation (never-clobber, newest still
   wins conflicts) — the river#204 stranded-data recovery mode. It resurrects
   delete-by-absence data, hence the loud ack.

@@ -250,6 +250,7 @@ impl MigrationAuthorization {
 /// The two modes trade delete-by-absence safety against stranded-data recovery,
 /// the same tension the contract side resolves with `NewestFirstWins` vs
 /// `FoldAll`.
+#[non_exhaustive]
 #[derive(Debug)]
 pub enum SecretSelectionPolicy {
     /// **Default / safe.** Walk predecessors newest-first; the newest predecessor
@@ -286,11 +287,41 @@ pub enum SecretSelectionPolicy {
     /// generations** — hence the [`RollbackRiskAck`]. If the unresponsive
     /// predecessor actually holds a newer, authoritative snapshot (rather than
     /// simply being unregistered on this node), an older generation's data-bearing
-    /// answer becomes authoritative in its place, and a key the true newest
-    /// generation deleted could be resurrected. Construct the ack only if that
-    /// risk is acceptable for this app, or if silence has already been
-    /// established as the ordinary case (an unregistered legacy delegate) rather
-    /// than a transient fault.
+    /// answer becomes authoritative in its place. Two distinct consequences, both
+    /// real, not just the first:
+    ///
+    /// * **Delete-by-absence resurrection** — a key the true newest generation
+    ///   deleted could reappear, sourced from the older generation.
+    /// * **Silent, permanent value-shadowing (the worse one).** The successor's
+    ///   writer is never-clobber, so once the older generation's value for a key
+    ///   lands and its `Done` marker seals, a *later* run in which the newest
+    ///   predecessor becomes reachable and offers its own (different, real,
+    ///   newer) value for that same key gets `ItemWrite::AlreadyAuthoritative` —
+    ///   the true value is silently discarded, not written, not reported as a
+    ///   conflict. That later run's report reads completely clean
+    ///   ([`DelegateMigrationReport::is_complete`]` == true`,
+    ///   [`any_unresponsive`](DelegateMigrationReport::any_unresponsive)` ==
+    ///   false`): there is **no signal anywhere** that the durable value is the
+    ///   wrong one. This can happen from ordinary transient unreachability alone
+    ///   — no flush failure or storage fault required — and is pinned by
+    ///   `continue_past_unresponsive_can_permanently_shadow_a_later_recovered_true_value`
+    ///   in this module's tests.
+    ///
+    ///   One case is narrowed for free: if an earlier run already left a
+    ///   surviving [`MigrationMarker::InProgress`] with `saw_data: true` for the
+    ///   unresponsive predecessor — positive proof, not mere silence, that it
+    ///   holds real data — a later `Unresponsive` result on that SAME predecessor
+    ///   still halts the walk rather than falling through, closing the shadowing
+    ///   path for any predecessor this app has ever successfully reached before.
+    ///   It does not and cannot help on a predecessor's very first attempt, which
+    ///   is indistinguishable from "never registered" — the ordinary case this
+    ///   variant exists to fall through on. Fully closing that residual needs the
+    ///   `probe_executable -> Result<bool, E>` classification work
+    ///   freenet/freenet-migrate#14 explicitly defers as a separate follow-up.
+    ///
+    /// Construct the ack only if this risk is acceptable for this app, or if
+    /// silence has already been established as the ordinary case (an
+    /// unregistered legacy delegate) rather than a transient fault.
     NewestSnapshotWinsContinuePastUnresponsive(RollbackRiskAck),
     /// **Opt-in recovery.** Import *every* predecessor newest-first, with the
     /// newest generation's value winning any key conflict **only because the app's
@@ -382,13 +413,29 @@ impl SecretSelectionPolicy {
     }
 
     /// Whether an `Unresponsive` predecessor terminates the walk. Under plain
-    /// `NewestSnapshotWins` it does — falling through to import an older snapshot
-    /// past an unknown newer state would risk resurrecting keys the newer
-    /// generation deleted. `NewestSnapshotWinsContinuePastUnresponsive` opts out of
-    /// that (see its docs and [`RollbackRiskAck`]). Union keeps going regardless
-    /// (it wants every generation).
-    fn unresponsive_terminates(&self) -> bool {
-        matches!(self, SecretSelectionPolicy::NewestSnapshotWins)
+    /// `NewestSnapshotWins` it always does — falling through to import an older
+    /// snapshot past an unknown newer state would risk resurrecting keys the newer
+    /// generation deleted, or shadowing a value it holds. Union never does (it
+    /// wants every generation regardless).
+    ///
+    /// `NewestSnapshotWinsContinuePastUnresponsive` opts out of the halt (see its
+    /// docs and [`RollbackRiskAck`]) — **except** when `prior_saw_data` is `true`:
+    /// a surviving [`MigrationMarker::InProgress`] with `saw_data: true` is
+    /// positive proof, from an earlier run, that this predecessor holds real data,
+    /// not merely silence on this attempt. Falling through in that case would
+    /// let an older, definitely-inferior generation seal a `Done` marker while the
+    /// known-data-bearing generation is only transiently unreachable — under the
+    /// successor's never-clobber writer that seal can then permanently shadow the
+    /// true value even after this predecessor becomes reachable again on a later
+    /// run (see the variant's doc for the full scenario). A predecessor with no
+    /// such history (the common case — a legacy generation that was simply never
+    /// registered) still falls through, which is the whole point of the variant.
+    fn unresponsive_terminates(&self, prior_saw_data: bool) -> bool {
+        match self {
+            SecretSelectionPolicy::NewestSnapshotWins => true,
+            SecretSelectionPolicy::NewestSnapshotWinsContinuePastUnresponsive(_) => prior_saw_data,
+            SecretSelectionPolicy::UnionAllGenerations(_) => false,
+        }
     }
 
     /// How a **legacy generation-keyed** done marker (from the older
@@ -1679,7 +1726,7 @@ where
                         generation,
                         error: None,
                     });
-                    terminated = policy.unresponsive_terminates();
+                    terminated = policy.unresponsive_terminates(prior_saw_data);
                     continue;
                 }
                 Err(e) => {
@@ -1688,7 +1735,7 @@ where
                         generation,
                         error: Some(format!("{e:?}")),
                     });
-                    terminated = policy.unresponsive_terminates();
+                    terminated = policy.unresponsive_terminates(prior_saw_data);
                     continue;
                 }
             }
@@ -1701,7 +1748,7 @@ where
                         generation,
                         error: Some(format!("{e:?}")),
                     });
-                    terminated = policy.unresponsive_terminates();
+                    terminated = policy.unresponsive_terminates(prior_saw_data);
                     continue;
                 }
             };
@@ -2718,6 +2765,181 @@ mod tests {
         assert!(
             !io.fetched.contains(key_of(&oldest).bytes()),
             "the oldest generation must not even be enumerated"
+        );
+    }
+
+    /// The `prior_saw_data` guard on `unresponsive_terminates`: once a
+    /// predecessor's `InProgress { saw_data: true }` marker survives a run (proof
+    /// it holds real data, even though this run's write didn't land), a LATER
+    /// run's mere transient unreachability must not be treated as "safe to walk
+    /// past" — that would let an older, definitely-inferior generation seal a
+    /// `Done` marker while the known-data-bearing generation is only temporarily
+    /// unreachable, permanently shadowing it under a never-clobber writer (a
+    /// skeptical-review finding on this PR). Without the guard this test's run 2
+    /// would let `old`'s "wrong" value land and seal.
+    #[test]
+    fn a_predecessor_proven_data_bearing_by_a_surviving_marker_still_halts_when_later_unresponsive()
+    {
+        let old = entry(1, 1);
+        let new = entry(2, 2);
+        let mut writer = ScriptedWriter::default().fail_write(b"data");
+
+        // Run 1: `new` is reached and IS data-bearing, but its write fails
+        // retryably — Incomplete, with an InProgress{saw_data:true} marker left
+        // behind. Being data-bearing (even with a failed write) is already
+        // authoritative under this policy, so `old` is Superseded without ever
+        // being touched — unaffected by this PR.
+        let mut io1 = MockIo::default().executable_with(&key_of(&new), &[(b"data", b"newval")]);
+        let report1 = block_on(migrate_delegate_secrets(
+            &mut writer,
+            &mut io1,
+            &[old, new],
+            ack(),
+            SecretSelectionPolicy::NewestSnapshotWinsContinuePastUnresponsive(
+                RollbackRiskAck::i_understand_continuing_past_silence_can_roll_back(),
+            ),
+        ));
+        assert!(matches!(
+            report1.predecessors[0],
+            PredecessorMigration::Incomplete { .. }
+        ));
+        assert!(
+            matches!(
+                writer.markers.get(key_of(&new).bytes()),
+                Some(MigrationMarker::InProgress { saw_data: true })
+            ),
+            "run 1 must leave proof that `new` holds real data"
+        );
+        assert!(
+            !io1.fetched.contains(key_of(&old).bytes()),
+            "old untouched in run 1"
+        );
+
+        // Run 2: the write fault is gone, but now `new` is merely unreachable
+        // (a probe failure, not a write failure) — indistinguishable, on this
+        // attempt alone, from a predecessor that never existed. `old` DOES have
+        // real (different, wrong) data for the same key.
+        writer.fail.clear();
+        let mut io2 = MockIo::default()
+            .dead(&key_of(&new))
+            .executable_with(&key_of(&old), &[(b"data", b"oldval")]);
+        let report2 = block_on(migrate_delegate_secrets(
+            &mut writer,
+            &mut io2,
+            &[old, new],
+            ack(),
+            SecretSelectionPolicy::NewestSnapshotWinsContinuePastUnresponsive(
+                RollbackRiskAck::i_understand_continuing_past_silence_can_roll_back(),
+            ),
+        ));
+        assert!(matches!(
+            report2.predecessors[0],
+            PredecessorMigration::Unresponsive { .. }
+        ));
+        assert!(
+            matches!(
+                report2.predecessors[1],
+                PredecessorMigration::Superseded { .. }
+            ),
+            "the guard must stop the walk at `new`, so `old` stays Superseded, got {:?}",
+            report2.predecessors[1]
+        );
+        assert!(
+            !io2.fetched.contains(key_of(&old).bytes()),
+            "old must never even be enumerated — that is what the guard buys"
+        );
+        assert_eq!(
+            writer.applied.get(b"data".as_slice()),
+            None,
+            "old's wrong value must never land while `new` is only proven-but-unreachable"
+        );
+        assert!(report2.any_unresponsive());
+        assert!(!report2.is_complete());
+    }
+
+    /// The residual risk `RollbackRiskAck` accepts, pinned rather than left as a
+    /// surprise: unlike the test above, a predecessor `new` that has NEVER
+    /// before been reached carries no marker to consult, so its FIRST-ever
+    /// `Unresponsive` result is indistinguishable from "never registered" — the
+    /// common case this whole policy variant exists to fall through. If `new`
+    /// later turns out to have held real (different) data all along, the
+    /// already-sealed older generation's value is never-clobber and permanently
+    /// wins: the second run's report reads completely clean
+    /// (`is_complete() == true`, `any_unresponsive() == false`) while the true
+    /// value is silently discarded. Closing this fully needs the
+    /// probe-classification work the issue explicitly defers
+    /// (freenet/freenet-migrate#14's "separate follow-up"), so this test exists
+    /// to make the accepted trade a checked fact rather than an assumption — the
+    /// same role `union_resurrects_a_deleted_key_documented` plays for Union's
+    /// analogous hazard.
+    #[test]
+    fn continue_past_unresponsive_can_permanently_shadow_a_later_recovered_true_value() {
+        let old = entry(1, 1);
+        let new = entry(2, 2);
+        let mut writer = ScriptedWriter::default();
+        let policy = || {
+            SecretSelectionPolicy::NewestSnapshotWinsContinuePastUnresponsive(
+                RollbackRiskAck::i_understand_continuing_past_silence_can_roll_back(),
+            )
+        };
+
+        // Run 1: `new` has never been reached before (no marker) and is
+        // unresponsive on this, its first, attempt. `old` supplies real data for
+        // the same key and is accepted as authoritative.
+        let mut io1 = MockIo::default()
+            .dead(&key_of(&new))
+            .executable_with(&key_of(&old), &[(b"data", b"old-real-value")]);
+        let report1 = block_on(migrate_delegate_secrets(
+            &mut writer,
+            &mut io1,
+            &[old, new],
+            ack(),
+            policy(),
+        ));
+        assert!(matches!(
+            report1.predecessors[0],
+            PredecessorMigration::Unresponsive { .. }
+        ));
+        assert!(matches!(
+            report1.predecessors[1],
+            PredecessorMigration::Imported { .. }
+        ));
+        assert_eq!(
+            writer.applied.get(b"data".as_slice()).map(Vec::as_slice),
+            Some(b"old-real-value".as_slice())
+        );
+
+        // Run 2: `new` is reachable now and turns out to hold its OWN real,
+        // different value for the same key — proof it was never actually empty,
+        // merely unlucky in run 1.
+        let mut io2 =
+            MockIo::default().executable_with(&key_of(&new), &[(b"data", b"new-real-value")]);
+        let report2 = block_on(migrate_delegate_secrets(
+            &mut writer,
+            &mut io2,
+            &[old, new],
+            ack(),
+            policy(),
+        ));
+
+        assert_eq!(
+            writer.applied.get(b"data".as_slice()).map(Vec::as_slice),
+            Some(b"old-real-value".as_slice()),
+            "the true, newer value must be silently and permanently discarded under \
+             never-clobber — THE accepted risk this ack exists to name"
+        );
+        assert!(
+            matches!(
+                report2.predecessors[0],
+                PredecessorMigration::Imported { .. }
+            ),
+            "`new` reads as a normal, successful import this run, got {:?}",
+            report2.predecessors[0]
+        );
+        assert!(
+            report2.is_complete() && !report2.any_unresponsive(),
+            "THE hazard: the report reads fully clean even though the durable value \
+             is the wrong (older) one"
         );
     }
 
@@ -4230,9 +4452,16 @@ mod tests {
     fn a_failed_marker_read_halts_the_walk_under_every_policy() {
         // Without a marker read the crate cannot tell migrated from not-migrated, so
         // guessing either way risks a double import or a silent skip. Nothing is
-        // imported and the walk stops — under Union too, unlike an Unresponsive
-        // predecessor, because it is the SUCCESSOR side that is broken.
-        for policy in [newest(), union()] {
+        // imported and the walk stops — under every policy, including the
+        // continue-past-unresponsive variant, unlike an Unresponsive predecessor,
+        // because it is the SUCCESSOR side that is broken.
+        for policy in [
+            newest(),
+            SecretSelectionPolicy::NewestSnapshotWinsContinuePastUnresponsive(
+                RollbackRiskAck::i_understand_continuing_past_silence_can_roll_back(),
+            ),
+            union(),
+        ] {
             let old = entry(1, 1);
             let new = entry(2, 2);
             let mut writer = ScriptedWriter::default().fail_marker_read(&key_of(&new));
