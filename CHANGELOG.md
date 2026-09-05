@@ -1,5 +1,55 @@
 # Changelog
 
+## freenet-migrate 0.7.0
+
+**Additive, delegate half only.** New
+`SecretSelectionPolicy::NewestSnapshotWinsContinuePastUnresponsive`
+([#14](https://github.com/freenet/freenet-migrate/issues/14)).
+
+### The problem
+
+Under `NewestSnapshotWins` (the default), a predecessor that cannot be
+confirmed executable is recorded as `PredecessorMigration::Unresponsive` and
+**terminates the walk**. In isolation that is the right call — falling through
+past an unknown newer state risks resurrecting a key the newer generation
+deleted. But silence is the **normal** case for almost every legacy generation
+on almost every node (the predecessor delegate is simply not registered there
+any more), so the first silent generation stopped the walk and every older
+generation was never even asked. In practice, `NewestSnapshotWins` disabled
+migration for any lineage with more than one generation.
+
+`UnionAllGenerations` already walks past an unresponsive predecessor, so it was
+the only available workaround — at the cost of Union's own semantics (a
+deleted key can be resurrected from an older generation).
+
+### The fix
+
+`SecretSelectionPolicy::NewestSnapshotWinsContinuePastUnresponsive(RollbackRiskAck)`
+is a new, additive enum variant (existing `NewestSnapshotWins` and
+`UnionAllGenerations` call sites are unaffected — this cannot break an
+adopter that constructs the policy but does not exhaustively match it, which
+is every known adopter as of this release). It keeps `NewestSnapshotWins`'s
+authoritative-newest-data-bearing-wins rule, but an `Unresponsive` predecessor
+no longer halts the walk: the search continues to the next older predecessor
+instead of marking every remaining generation `Superseded`.
+
+The unresponsive predecessor is still recorded as `PredecessorMigration::
+Unresponsive` and still trips `DelegateMigrationReport::any_unresponsive` — an
+adopter gating fresh-install on that flag (as river#204 requires) still sees
+it, so the fall-through is never silently clean.
+
+**This forfeits the anti-rollback guarantee for older generations**, hence the
+loud `RollbackRiskAck` (reused from the contract driver's identical trade-off —
+see 0.6.0 below). If the unresponsive predecessor actually held a newer,
+authoritative snapshot rather than simply being unregistered on this node, an
+older generation's data-bearing answer becomes authoritative in its place, and
+a key the true newest generation deleted could be resurrected. Construct the
+ack only when that risk is acceptable, or when silence has already been
+established as the ordinary case rather than a transient fault.
+
+Plain `NewestSnapshotWins`'s halting behavior is unchanged — the new variant is
+opt-in.
+
 ## freenet-migrate 0.6.0
 
 **Breaking, contract half only.** Silence is no longer absence

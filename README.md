@@ -583,7 +583,22 @@ driver's `NewestFirstWins` / `FoldAll`):
 - `NewestSnapshotWins` (safe default): the newest predecessor that yields data is
   authoritative; older ones are not imported after it. Preserves delete-by-absence
   (a key the newer generation deleted can't be resurrected from an older one). Cost:
-  a key that only ever lived in an older generation stays unrecovered.
+  a key that only ever lived in an older generation stays unrecovered. **An
+  `Unresponsive` predecessor halts the walk here too** — and silence is the
+  *normal* case for almost every legacy generation on almost every node (the
+  predecessor delegate is simply not registered there any more), so this
+  variant alone effectively disables migration once the lineage has more than
+  one generation (freenet/freenet-migrate#14).
+- `NewestSnapshotWinsContinuePastUnresponsive(ack)`: same authoritative-newest-
+  data-bearing-wins rule, but an `Unresponsive` predecessor does not halt the
+  walk — the search continues to the next older predecessor instead of marking
+  every remaining generation `Superseded`. The unresponsive predecessor is
+  still recorded and still trips `DelegateMigrationReport::any_unresponsive`
+  (the app must still not treat this as a clean fresh install — river#204).
+  This forfeits the anti-rollback guarantee for older generations: if the
+  unresponsive predecessor actually held a newer, authoritative snapshot rather
+  than simply being unregistered, an older generation's data becomes
+  authoritative in its place, hence the loud `RollbackRiskAck`.
 - `UnionAllGenerations(ack)`: import every generation (never-clobber, newest still
   wins conflicts) — the river#204 stranded-data recovery mode. It resurrects
   delete-by-absence data, hence the loud ack.
@@ -710,7 +725,11 @@ fresh-installing — freenet/river#204), and the redesigned sans-IO transport se
 a future node-side copy-forward (freenet-core#2776) swaps under with no app
 re-adoption. 0.5.0 reshapes the delegate half so the crate decides what to
 migrate and the app does the writing; it is breaking on the delegate half only,
-leaving the contract-side surface untouched.
+leaving the contract-side surface untouched. 0.7.0 adds
+`SecretSelectionPolicy::NewestSnapshotWinsContinuePastUnresponsive`, an opt-in
+fix for `NewestSnapshotWins` halting on the *first* silent predecessor — the
+common case, not the rare one — which disabled migration in practice for any
+lineage longer than one generation ([#14]).
 
 **Published:** `freenet-migrate` **0.5.0**, `freenet-migrate-build` **0.2.0**.
 The two halves version independently, so an app can take one without the other.
@@ -720,6 +739,12 @@ Targets current stdlib **0.8.x**.
 absence ([#19]). Four of the five adopters below need a code change, three of
 them to compile at all. See [Upgrading to 0.6.0](#upgrading-to-060) and the
 CHANGELOG.
+
+**Unreleased: 0.7.0**, additive on the **delegate** half — the new
+`NewestSnapshotWinsContinuePastUnresponsive` policy variant ([#14]). No
+adopter below needs a code change: every known adopter constructs
+`SecretSelectionPolicy` rather than exhaustively matching it, so a new variant
+does not break compilation. Adopting it is optional per app.
 
 ### Adopters
 
@@ -830,3 +855,4 @@ LGPL-3.0-only. See [LICENSE](./LICENSE).
 
 [#19]: https://github.com/freenet/freenet-migrate/issues/19
 [#8]: https://github.com/freenet/freenet-migrate/issues/8
+[#14]: https://github.com/freenet/freenet-migrate/issues/14

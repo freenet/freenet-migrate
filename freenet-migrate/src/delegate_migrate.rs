@@ -133,16 +133,24 @@
 //! 0.5.0 derives termination from the policy and the predecessor's **data-bearing**
 //! state, never from whether a write succeeded:
 //!
-//! | outcome | `NewestSnapshotWins` | `UnionAllGenerations` |
-//! |---|---|---|
-//! | `Imported` / data-bearing `Incomplete` / data-bearing `AlreadyMigrated` | stop (authoritative snapshot) | continue |
-//! | `NoData` / empty `Incomplete` | continue | continue |
-//! | `Unresponsive` | stop (unknown newer state) | continue |
-//! | `WriterUnavailable` | stop | stop (successor-side bookkeeping is broken) |
+//! | outcome | `NewestSnapshotWins` | `...ContinuePastUnresponsive` | `UnionAllGenerations` |
+//! |---|---|---|---|
+//! | `Imported` / data-bearing `Incomplete` / data-bearing `AlreadyMigrated` | stop (authoritative snapshot) | stop (authoritative snapshot) | continue |
+//! | `NoData` / empty `Incomplete` | continue | continue | continue |
+//! | `Unresponsive` | stop (unknown newer state) | continue (opted into the rollback risk — freenet/freenet-migrate#14) | continue |
+//! | `WriterUnavailable` | stop | stop | stop (successor-side bookkeeping is broken) |
 //!
-//! A data-bearing predecessor is authoritative under `NewestSnapshotWins` whether or
-//! not its writes all landed, so that column is unchanged. What changes is Union: a
-//! failed write no longer abandons the older generations.
+//! A data-bearing predecessor is authoritative under either `NewestSnapshotWins`
+//! variant whether or not its writes all landed, so that column is unchanged. What
+//! changes is Union: a failed write no longer abandons the older generations.
+//!
+//! `NewestSnapshotWinsContinuePastUnresponsive` (0.7.0,
+//! [`SecretSelectionPolicy::NewestSnapshotWinsContinuePastUnresponsive`]) exists
+//! because the `Unresponsive`/`NewestSnapshotWins` cell above is the **common**
+//! case, not a rare fault: a predecessor delegate is simply not registered on most
+//! nodes for most legacy generations, so plain `NewestSnapshotWins` halts on the
+//! very first one and never even asks the older generations that may hold the
+//! user's data. See its doc and [`RollbackRiskAck`] for the trade it makes.
 //!
 //! The one thing the old halt genuinely bought is kept by a narrower mechanism:
 //! a key whose write **failed retryably** on a newer predecessor is **withheld**
@@ -188,6 +196,7 @@ use crate::delegate::{
     pred_wip_marker, SecretPair, SecretStore, PRED_DONE_MARKER_VALUE_DATA,
     PRED_DONE_MARKER_VALUE_EMPTY,
 };
+use crate::driver::RollbackRiskAck;
 use crate::lineage::DelegateLineageEntry;
 
 /// Consent / authorization for a secret migration — a **required** parameter of
@@ -257,6 +266,32 @@ pub enum SecretSelectionPolicy {
     /// honor this stop-at-first-data-bearing / delete-by-absence guarantee, because
     /// the v1 wire carries no generations/policy — see `SecretTransport`.
     NewestSnapshotWins,
+    /// **Opt-in fall-through.** Same authoritative-newest-data-bearing-wins rule
+    /// as [`NewestSnapshotWins`](Self::NewestSnapshotWins), except an
+    /// `Unresponsive` predecessor does not halt the walk: the search continues to
+    /// the next older predecessor instead of marking every remaining generation
+    /// `Superseded`. This is the freenet/freenet-migrate#14 fix — under plain
+    /// `NewestSnapshotWins`, silence is the **normal** case for almost every
+    /// legacy generation on almost every node (the predecessor delegate is simply
+    /// not registered there any more), so the first silent generation halting the
+    /// walk disables migration in practice.
+    ///
+    /// The predecessor that went unresponsive is still recorded as
+    /// [`PredecessorMigration::Unresponsive`] and still trips
+    /// [`DelegateMigrationReport::any_unresponsive`] — the app must still not
+    /// treat the migration as a clean fresh install (freenet/river#204) — but
+    /// older generations are no longer abandoned on that account alone.
+    ///
+    /// **This forfeits the anti-rollback guarantee for those older
+    /// generations** — hence the [`RollbackRiskAck`]. If the unresponsive
+    /// predecessor actually holds a newer, authoritative snapshot (rather than
+    /// simply being unregistered on this node), an older generation's data-bearing
+    /// answer becomes authoritative in its place, and a key the true newest
+    /// generation deleted could be resurrected. Construct the ack only if that
+    /// risk is acceptable for this app, or if silence has already been
+    /// established as the ordinary case (an unregistered legacy delegate) rather
+    /// than a transient fault.
+    NewestSnapshotWinsContinuePastUnresponsive(RollbackRiskAck),
     /// **Opt-in recovery.** Import *every* predecessor newest-first, with the
     /// newest generation's value winning any key conflict **only because the app's
     /// writer declines a key it already holds** ([`SecretStoreIo`] does so
@@ -339,13 +374,19 @@ impl SecretSelectionPolicy {
     /// from whether every write of it landed (see the module docs, "Termination is a
     /// POLICY question").
     fn data_bearing_is_authoritative(&self, had_data: bool) -> bool {
-        matches!(self, SecretSelectionPolicy::NewestSnapshotWins) && had_data
+        matches!(
+            self,
+            SecretSelectionPolicy::NewestSnapshotWins
+                | SecretSelectionPolicy::NewestSnapshotWinsContinuePastUnresponsive(_)
+        ) && had_data
     }
 
-    /// Whether an `Unresponsive` predecessor terminates the walk. Under
+    /// Whether an `Unresponsive` predecessor terminates the walk. Under plain
     /// `NewestSnapshotWins` it does — falling through to import an older snapshot
     /// past an unknown newer state would risk resurrecting keys the newer
-    /// generation deleted. Union keeps going (it wants every generation).
+    /// generation deleted. `NewestSnapshotWinsContinuePastUnresponsive` opts out of
+    /// that (see its docs and [`RollbackRiskAck`]). Union keeps going regardless
+    /// (it wants every generation).
     fn unresponsive_terminates(&self) -> bool {
         matches!(self, SecretSelectionPolicy::NewestSnapshotWins)
     }
@@ -355,7 +396,10 @@ impl SecretSelectionPolicy {
     /// [`LegacyBridge`].
     fn legacy_bridge(&self) -> LegacyBridge {
         match self {
-            SecretSelectionPolicy::NewestSnapshotWins => LegacyBridge::AtOrAboveGeneration,
+            SecretSelectionPolicy::NewestSnapshotWins
+            | SecretSelectionPolicy::NewestSnapshotWinsContinuePastUnresponsive(_) => {
+                LegacyBridge::AtOrAboveGeneration
+            }
             SecretSelectionPolicy::UnionAllGenerations(_) => LegacyBridge::ExactGenerationOnly,
         }
     }
@@ -2565,6 +2609,115 @@ mod tests {
         assert!(
             report.any_unresponsive(),
             "the unreadable newest generation is still reported"
+        );
+    }
+
+    /// freenet/freenet-migrate#14: `NewestSnapshotWinsContinuePastUnresponsive` is
+    /// the opt-in escape hatch from the halt pinned above. Same script as
+    /// `newest_snapshot_wins_halts_on_a_silent_export_no_fall_through` — a silent
+    /// export on the newest generation, real data on the older one — but this
+    /// policy variant reaches and imports the older generation's data instead of
+    /// abandoning it. The unresponsive newest generation is still reported (the
+    /// river#204 gate: an app must not treat this as a clean fresh install), so
+    /// the fall-through is never silently clean.
+    #[test]
+    fn continue_past_unresponsive_recovers_older_data_but_still_reports_the_unresponsive_newest() {
+        let old = entry(1, 1);
+        let new = entry(2, 2);
+        let mut store = MemStore::default();
+        let mut io = MockIo::default()
+            .silent_export(&key_of(&new))
+            .executable_with(&key_of(&old), &[(b"data", b"v")]);
+        let report = block_on(migrate_delegate_secrets(
+            &mut store_io(&mut store),
+            &mut io,
+            &[old, new],
+            ack(),
+            SecretSelectionPolicy::NewestSnapshotWinsContinuePastUnresponsive(
+                RollbackRiskAck::i_understand_continuing_past_silence_can_roll_back(),
+            ),
+        ));
+        assert!(
+            matches!(
+                report.predecessors[0],
+                PredecessorMigration::Unresponsive { error: Some(_), .. }
+            ),
+            "the newest generation is still Unresponsive, got {:?}",
+            report.predecessors[0]
+        );
+        assert!(
+            matches!(
+                report.predecessors[1],
+                PredecessorMigration::Imported { .. }
+            ),
+            "the older generation must be reached and imported, got {:?}",
+            report.predecessors[1]
+        );
+        assert_eq!(
+            store.get_secret(b"data").unwrap(),
+            b"v",
+            "the opt-in must fall through to the older generation's real data"
+        );
+        assert!(
+            io.fetched.contains(key_of(&old).bytes()),
+            "the older generation must actually be enumerated, not skipped"
+        );
+        assert!(
+            report.any_unresponsive(),
+            "the app must still be told a newer generation could not be confirmed"
+        );
+        assert!(
+            !report.is_complete(),
+            "an unresolved newest generation must not read as a complete migration"
+        );
+    }
+
+    /// `NewestSnapshotWinsContinuePastUnresponsive` stays `NewestSnapshotWins`
+    /// once it finds data — it is not Union wearing a different name. A
+    /// three-generation lineage: newest silent, middle data-bearing, oldest also
+    /// data-bearing. The middle generation's data becomes authoritative and the
+    /// oldest is `Superseded`, never imported — the contrast with Union, which
+    /// would import both.
+    #[test]
+    fn continue_past_unresponsive_still_stops_at_the_first_data_bearing_generation() {
+        let oldest = entry(1, 1);
+        let middle = entry(2, 2);
+        let newest = entry(3, 3);
+        let mut store = MemStore::default();
+        let mut io = MockIo::default()
+            .dead(&key_of(&newest))
+            .executable_with(&key_of(&middle), &[(b"data", b"middle")])
+            .executable_with(&key_of(&oldest), &[(b"data", b"oldest")]);
+        let report = block_on(migrate_delegate_secrets(
+            &mut store_io(&mut store),
+            &mut io,
+            &[oldest, middle, newest],
+            ack(),
+            SecretSelectionPolicy::NewestSnapshotWinsContinuePastUnresponsive(
+                RollbackRiskAck::i_understand_continuing_past_silence_can_roll_back(),
+            ),
+        ));
+        assert!(matches!(
+            report.predecessors[0],
+            PredecessorMigration::Unresponsive { .. }
+        ));
+        assert!(matches!(
+            report.predecessors[1],
+            PredecessorMigration::Imported { .. }
+        ));
+        assert!(
+            matches!(
+                report.predecessors[2],
+                PredecessorMigration::Superseded { .. }
+            ),
+            "the oldest generation must stay Superseded once a data-bearing \
+             generation was found, got {:?}",
+            report.predecessors[2]
+        );
+        assert_eq!(store.get_secret(b"data").unwrap(), b"middle");
+        assert!(
+            !io.fetched.contains(key_of(&oldest).bytes()),
+            "the oldest generation must not even be enumerated"
         );
     }
 
