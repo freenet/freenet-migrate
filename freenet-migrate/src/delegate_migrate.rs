@@ -1816,14 +1816,17 @@ fn resolve_outcomes(
                     rejected: u32::try_from(tally.rejected).unwrap_or(u32::MAX),
                 })
             }
-            // Superseded only resolves when THIS run proves why: a snapshot policy,
-            // every newer predecessor resolved, and one of them data-bearing — so
-            // it was skipped for an authoritative newer snapshot, not behind a halt
-            // (an unresponsive or failing newer one), which leaves it unexamined.
+            // Superseded only resolves when THIS run proves why: under a snapshot
+            // policy, a newer predecessor resolved data-bearing. A snapshot policy
+            // terminates at its FIRST data-bearing predecessor, so if one is newer
+            // than this row it is what superseded it, and this generation would
+            // never be imported however the rest resolve. Anything else (an
+            // unresponsive newer one under plain `NewestSnapshotWins`, a
+            // `WriterUnavailable` halt) left it unexamined. Union never supersedes
+            // for authority, only behind a `WriterUnavailable` halt, so it never
+            // resolves here even when a newer generation imported.
             PredecessorMigration::Superseded { .. }
-                if snapshot_policy
-                    && resolved.iter().all(Option::is_some)
-                    && resolved.iter().flatten().any(|r| r.is_data_bearing()) =>
+                if snapshot_policy && resolved.iter().flatten().any(|r| r.is_data_bearing()) =>
             {
                 Some(JournalResolution::SupersededByAuthoritative)
             }
@@ -5615,6 +5618,7 @@ mod tests {
         retryable_fail: BTreeSet<Vec<u8>>,
         permanent_fail: BTreeSet<Vec<u8>>,
         offered: Vec<Vec<u8>>,
+        fail_marker_read: BTreeSet<Vec<u8>>,
     }
 
     impl InspectingWriter {
@@ -5626,6 +5630,7 @@ mod tests {
                 retryable_fail: BTreeSet::new(),
                 permanent_fail: BTreeSet::new(),
                 offered: Vec::new(),
+                fail_marker_read: BTreeSet::new(),
             }
         }
         fn raw(&mut self) -> SecretStoreIo<'_, MemStore> {
@@ -5639,6 +5644,11 @@ mod tests {
             &mut self,
             query: &MarkerQuery<'_>,
         ) -> Result<Option<MigrationMarker>, Self::Error> {
+            if self.fail_marker_read.contains(query.predecessor.bytes()) {
+                return Err(SecretStoreWriteFailed {
+                    key: query.predecessor.bytes().to_vec(),
+                });
+            }
             self.raw().migration_marker(query).await
         }
         async fn record_marker(
@@ -6298,6 +6308,166 @@ mod tests {
         assert!(
             block_on(begin_migration_journal(&mut store_io(&mut store), &lineage)).is_err(),
             "begin must fail loudly: nothing durable would record the migration"
+        );
+    }
+
+    /// Under Union an older generation behind a `WriterUnavailable` halt was
+    /// never examined, even though an even newer generation imported fine. It
+    /// must stay pending: Union owes it an import.
+    #[test]
+    fn union_keeps_a_generation_behind_a_halt_pending_even_after_a_newer_import() {
+        let (g1, g2, g3) = (entry(1, 1), entry(2, 2), entry(3, 3));
+        let lineage = [g1.clone(), g2.clone(), g3.clone()];
+        let mut writer = InspectingWriter::new(&lineage);
+        writer.fail_marker_read.insert(key_of(&g2).bytes().to_vec());
+        let mut io = MockIo::default()
+            .executable_with(&key_of(&g3), &[(b"room:3", b"3")])
+            .executable_with(&key_of(&g1), &[(b"room:1", b"1")]);
+        let run = block_on(migrate_delegate_secrets_journaled(
+            &mut writer,
+            &mut io,
+            &lineage,
+            ack(),
+            union(),
+        ));
+        assert!(matches!(
+            run.report.predecessors[2],
+            PredecessorMigration::Superseded { .. }
+        ));
+        assert_eq!(
+            state_of(&writer.store, &g3),
+            JournalState::Resolved(JournalResolution::Imported)
+        );
+        assert!(matches!(
+            state_of(&writer.store, &g1),
+            JournalState::Pending { .. }
+        ));
+        assert!(!run.status.is_complete());
+    }
+
+    /// Under `...ContinuePastUnresponsive` a silent newest generation stays
+    /// pending while the data-bearing one below it imports and supersedes the
+    /// rest. Those are resolved, because no outcome of the silent one could
+    /// ever make them importable.
+    #[test]
+    fn continue_past_unresponsive_resolves_what_the_authoritative_snapshot_supersedes() {
+        let (g1, g2, g3) = (entry(1, 1), entry(2, 2), entry(3, 3));
+        let lineage = [g1.clone(), g2.clone(), g3.clone()];
+        let mut store = MemStore::default();
+        let mut io = MockIo::default()
+            .dead(&key_of(&g3))
+            .executable_with(&key_of(&g2), &[(b"room:2", b"2")])
+            .executable_with(&key_of(&g1), &[(b"room:1", b"1")]);
+        let policy = SecretSelectionPolicy::NewestSnapshotWinsContinuePastUnresponsive(
+            RollbackRiskAck::i_understand_continuing_past_silence_can_roll_back(),
+        );
+        let run = journaled(&mut store, &mut io, &lineage, policy);
+        assert!(matches!(
+            state_of(&store, &g3),
+            JournalState::Pending { .. }
+        ));
+        assert_eq!(
+            state_of(&store, &g2),
+            JournalState::Resolved(JournalResolution::Imported)
+        );
+        assert_eq!(
+            state_of(&store, &g1),
+            JournalState::Resolved(JournalResolution::SupersededByAuthoritative)
+        );
+        assert!(
+            !run.status.is_complete(),
+            "the silent newest is still owed a probe"
+        );
+    }
+
+    /// An adapter written before `probe_verdict` existed (it implements only the
+    /// boolean probe) must get the old behaviour: an unanswered probe is a
+    /// silence, never "not installed".
+    #[test]
+    fn an_adapter_without_the_override_never_reports_not_installed() {
+        struct BoolOnlyIo;
+        impl PredecessorSecretsIo for BoolOnlyIo {
+            type Error = IoAbort;
+            async fn probe_executable(&mut self, _p: &DelegateKey) -> Result<bool, IoAbort> {
+                Ok(false)
+            }
+            async fn fetch_secrets(
+                &mut self,
+                _p: &DelegateKey,
+            ) -> Result<Vec<SecretPair>, IoAbort> {
+                Ok(vec![])
+            }
+        }
+        let lineage = [entry(1, 1)];
+        let mut store = MemStore::default();
+        let run = block_on(migrate_delegate_secrets_journaled(
+            &mut store_io(&mut store),
+            &mut BoolOnlyIo,
+            &lineage,
+            ack(),
+            union(),
+        ));
+        assert!(matches!(
+            run.report.predecessors[0],
+            PredecessorMigration::Unresponsive { .. }
+        ));
+        assert!(!run.status.is_complete());
+        assert_eq!(
+            block_on(BoolOnlyIo.probe_verdict(&key_of(&lineage[0]))),
+            Ok(ProbeVerdict::NoReply)
+        );
+    }
+
+    /// The final journal store failing on its own (no start store needed) is
+    /// reported too, not swallowed.
+    #[test]
+    fn a_failed_final_journal_store_is_reported() {
+        let lineage = [entry(1, 1)];
+        let k = key_of(&lineage[0]);
+        let mut store = MemStore::default();
+        store.set_secret(
+            MIGRATION_JOURNAL_KEY,
+            &MigrationJournal::new_pending(&lineage).encode(),
+        );
+        store.fail_writes_to(MIGRATION_JOURNAL_KEY);
+        let mut io = MockIo::default().executable_with(&k, &[]);
+        let run = journaled(&mut store, &mut io, &lineage, union());
+        assert!(
+            run.journal_error
+                .as_deref()
+                .is_some_and(|e| e.contains("journal store failed")),
+            "got {:?}",
+            run.journal_error
+        );
+        assert!(
+            !stored_status(&store, &lineage).is_complete(),
+            "the stored journal is the old, pending one"
+        );
+    }
+
+    /// Resolution is sticky; the only change allowed is towards data.
+    #[test]
+    fn a_resolution_only_ever_upgrades_towards_data() {
+        let e = entry(1, 1);
+        let k = key_of(&e);
+        let mut j = MigrationJournal::new_pending(&[e.clone()]);
+        j.record(&k, 1, Some(JournalResolution::NotInstalled));
+        j.record(&k, 1, None);
+        assert_eq!(
+            j.entry(&k).unwrap().state,
+            JournalState::Resolved(JournalResolution::NotInstalled)
+        );
+        j.record(&k, 1, Some(JournalResolution::Imported));
+        assert_eq!(
+            j.entry(&k).unwrap().state,
+            JournalState::Resolved(JournalResolution::Imported),
+            "an import supersedes an earlier 'nothing here'"
+        );
+        j.record(&k, 1, Some(JournalResolution::NotInstalled));
+        assert_eq!(
+            j.entry(&k).unwrap().state,
+            JournalState::Resolved(JournalResolution::Imported),
+            "a later 'nothing here' never erases a recorded import"
         );
     }
 }
