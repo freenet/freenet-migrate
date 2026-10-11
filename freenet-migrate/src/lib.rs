@@ -91,11 +91,12 @@ pub use delegate::{
 };
 pub use delegate_migrate::{
     begin_migration_journal, migrate_delegate_secrets, migrate_delegate_secrets_journaled,
-    register_delegate_with_migration, DelegateMigrationReport, ImportTally, ItemWrite,
-    JournaledMigrationReport, LegacyBridge, MarkerQuery, MigrationAuthorization, MigrationMarker,
-    NoCrossEntryInvariantsAck, PredecessorMigration, PredecessorSecretsIo, ProbeVerdict,
-    RecoveredSecret, RegisterAndMigrateIo, RetryAdvice, SecretSelectionPolicy, SecretStoreIo,
-    SecretStoreWriteFailed, SuccessorSecretsIo, UnionAck, WriterFailure, WriterStage,
+    note_app_import_started, register_delegate_with_migration, DelegateMigrationReport,
+    ImportTally, ItemWrite, JournaledMigrationReport, LegacyBridge, MarkerQuery,
+    MigrationAuthorization, MigrationMarker, NoCrossEntryInvariantsAck, PredecessorMigration,
+    PredecessorSecretsIo, ProbeVerdict, RecoveredSecret, RegisterAndMigrateIo, RetryAdvice,
+    SecretSelectionPolicy, SecretStoreIo, SecretStoreWriteFailed, SuccessorSecretsIo, UnionAck,
+    WriterFailure, WriterStage,
 };
 pub use driver::{
     contract_probe, migrate_contract, FoldAllAck, NewestFirst, Outcome, ProbeAnswer, ProbeDriver,
@@ -104,9 +105,9 @@ pub use driver::{
 };
 pub use error::MigrateError;
 pub use journal::{
-    journal_status, JournalDecodeError, JournalEntry, JournalResolution, JournalState,
-    JournalStatus, JournaledSuccessorIo, MigrationJournal, PendingPredecessor,
-    MIGRATION_JOURNAL_KEY, MIGRATION_JOURNAL_VERSION,
+    journal_status, JournalBinding, JournalDecodeError, JournalEntry, JournalError,
+    JournalResolution, JournalState, JournalStatus, JournaledSuccessorIo, MigrationJournal,
+    PendingPredecessor, PolicyFamily, MIGRATION_JOURNAL_KEY, MIGRATION_JOURNAL_VERSION,
 };
 pub use lineage::{ContractLineageEntry, DelegateLineageEntry, Lineage};
 pub use pointer::{
