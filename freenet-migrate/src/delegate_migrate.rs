@@ -5797,7 +5797,7 @@ mod tests {
     #[test]
     fn two_generations_must_each_resolve_before_complete() {
         let (old, new) = (entry(1, 1), entry(2, 2));
-        let lineage = [old.clone(), new.clone()];
+        let lineage = [old, new];
         let mut store = MemStore::default();
         let mut io = MockIo::default()
             .executable_with(&key_of(&new), &[(b"room:new", b"N")])
@@ -5927,7 +5927,7 @@ mod tests {
     #[test]
     fn an_absent_generation_answering_first_cannot_complete_the_migration() {
         let (holder, absent) = (entry(1, 1), entry(2, 2));
-        let lineage = [holder.clone(), absent.clone()];
+        let lineage = [holder, absent];
         let mut store = MemStore::default();
         let mut io = MockIo::default()
             .not_installed(&key_of(&absent))
@@ -5973,7 +5973,7 @@ mod tests {
     #[test]
     fn not_installed_does_not_halt_newest_snapshot_wins() {
         let (old, new) = (entry(1, 1), entry(2, 2));
-        let lineage = [old.clone(), new.clone()];
+        let lineage = [old, new];
         let mut store = MemStore::default();
         let mut io = MockIo::default()
             .not_installed(&key_of(&new))
@@ -6015,7 +6015,7 @@ mod tests {
     #[test]
     fn superseded_resolves_only_behind_an_authoritative_snapshot() {
         let (old, new) = (entry(1, 1), entry(2, 2));
-        let lineage = [old.clone(), new.clone()];
+        let lineage = [old, new];
 
         let mut store = MemStore::default();
         let mut io = MockIo::default()
@@ -6048,7 +6048,7 @@ mod tests {
     #[test]
     fn union_never_resolves_a_superseded_predecessor() {
         let (old, new) = (entry(1, 1), entry(2, 2));
-        let lineage = [old.clone(), new.clone()];
+        let lineage = [old, new];
         // The newer predecessor resolved on an earlier run.
         let mut journal = MigrationJournal::new_pending(&lineage);
         journal.record(&key_of(&new), 2, Some(JournalResolution::Imported));
@@ -6121,7 +6121,7 @@ mod tests {
     #[test]
     fn a_rerun_on_a_complete_journal_changes_nothing() {
         let (absent, holder) = (entry(1, 1), entry(2, 2));
-        let lineage = [absent.clone(), holder.clone()];
+        let lineage = [absent, holder];
         let mut store = MemStore::default();
         let mut io = MockIo::default()
             .not_installed(&key_of(&absent))
@@ -6232,23 +6232,20 @@ mod tests {
     #[test]
     fn journal_status_reads_the_stored_bytes_conservatively() {
         let (a, b) = (entry(1, 1), entry(2, 2));
-        assert_eq!(
-            journal_status(None, &[a.clone()]),
-            JournalStatus::NotStarted
-        );
-        let garbage = journal_status(Some(b"not cbor"), &[a.clone()]);
+        assert_eq!(journal_status(None, &[a]), JournalStatus::NotStarted);
+        let garbage = journal_status(Some(b"not cbor"), &[a]);
         assert!(matches!(garbage, JournalStatus::Unreadable(_)));
         assert!(
             garbage.interrupted_import(),
             "unreadable is treated as interrupted"
         );
 
-        let mut only_a = MigrationJournal::new_pending(&[a.clone()]);
+        let mut only_a = MigrationJournal::new_pending(&[a]);
         only_a.record(&key_of(&a), 1, Some(JournalResolution::NoData));
         let bytes = only_a.encode();
-        assert!(journal_status(Some(&bytes), &[a.clone()]).is_complete());
+        assert!(journal_status(Some(&bytes), &[a]).is_complete());
         assert!(
-            !journal_status(Some(&bytes), &[a.clone(), b.clone()]).is_complete(),
+            !journal_status(Some(&bytes), &[a, b]).is_complete(),
             "a lineage entry the journal never saw is pending"
         );
         assert!(
@@ -6317,7 +6314,7 @@ mod tests {
     #[test]
     fn union_keeps_a_generation_behind_a_halt_pending_even_after_a_newer_import() {
         let (g1, g2, g3) = (entry(1, 1), entry(2, 2), entry(3, 3));
-        let lineage = [g1.clone(), g2.clone(), g3.clone()];
+        let lineage = [g1, g2, g3];
         let mut writer = InspectingWriter::new(&lineage);
         writer.fail_marker_read.insert(key_of(&g2).bytes().to_vec());
         let mut io = MockIo::default()
@@ -6352,7 +6349,7 @@ mod tests {
     #[test]
     fn continue_past_unresponsive_resolves_what_the_authoritative_snapshot_supersedes() {
         let (g1, g2, g3) = (entry(1, 1), entry(2, 2), entry(3, 3));
-        let lineage = [g1.clone(), g2.clone(), g3.clone()];
+        let lineage = [g1, g2, g3];
         let mut store = MemStore::default();
         let mut io = MockIo::default()
             .dead(&key_of(&g3))
@@ -6450,7 +6447,7 @@ mod tests {
     fn a_resolution_only_ever_upgrades_towards_data() {
         let e = entry(1, 1);
         let k = key_of(&e);
-        let mut j = MigrationJournal::new_pending(&[e.clone()]);
+        let mut j = MigrationJournal::new_pending(&[e]);
         j.record(&k, 1, Some(JournalResolution::NotInstalled));
         j.record(&k, 1, None);
         assert_eq!(

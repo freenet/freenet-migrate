@@ -679,6 +679,41 @@ match import_secrets_once(&mut ctx, &exported, successor_generation)? {
 > neither transport (the interim path is async and uncorrelated; the node path
 > returns nothing app-side).
 
+#### Knowing when the migration is done: the journal (0.7.0, opt-in)
+
+The walk is durable within a predecessor, but an app also needs a durable answer
+to "has every predecessor been dealt with?" on every load, without re-probing
+them all. In a browser app served by the gateway there is no `localStorage`, and
+a tab can die between any two writes, so that answer cannot come from session
+state (freenet/river#760). Store a `MigrationJournal` in the successor instead:
+
+```rust,ignore
+// Load path. One read of the stored journal decides whether the walk runs.
+match journal_status(stored_journal_bytes.as_deref(), DELEGATE_LINEAGE) {
+    JournalStatus::Complete => { /* migrated: never probe the predecessors again */ }
+    status => {
+        // Durable intent BEFORE the first migration write (yours or the walk's).
+        begin_migration_journal(&mut successor, DELEGATE_LINEAGE).await?;
+        let run = migrate_delegate_secrets_journaled(
+            &mut successor, &mut io, DELEGATE_LINEAGE, authz, policy,
+        ).await;
+        // `run.status` is what was stored. While it is incomplete, re-run on the
+        // next load; `status.interrupted_import()` says the successor may hold a
+        // PARTIAL copy right now, so do not treat it as authoritative yet.
+    }
+}
+```
+
+`successor` implements `JournaledSuccessorIo` (two methods: load and store the
+journal bytes under one key the predecessor adapter never offers for import;
+`SecretStoreIo` does this for you). Implement
+`PredecessorSecretsIo::probe_verdict` if your transport can tell a definitive
+"not installed" from silence; without it an absent predecessor stays pending.
+
+What resolves a predecessor is a table in the `journal` module docs; the short
+version is that silence never does, a permanent rejection does (with a count),
+and a generation skipped behind a halt does not.
+
 ### Known limitations
 
 - **`ExportedSecrets` is not authenticated.** Its `source_generation` is echoed
@@ -703,7 +738,9 @@ match import_secrets_once(&mut ctx, &exported, successor_generation)? {
   only an explicit `UnregisterDelegate` removes it — so this is not time-decay;
   it is per-node registration/availability.) A predecessor the reached node never
   registered is indistinguishable from a broken one — both surface as
-  `Unresponsive`, which the app must show rather than silently fresh-installing.
+  `Unresponsive`, which the app must show rather than silently fresh-installing —
+  unless the adapter implements `probe_verdict` over a node that answers "not
+  installed" definitively (0.7.0).
   The node-side copy-forward removes the dependency by reading storage directly.
 
 ## Building & testing

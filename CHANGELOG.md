@@ -76,6 +76,56 @@ opt-in. Both the closed case and the accepted residual are pinned by tests:
 and
 `continue_past_unresponsive_can_permanently_shadow_a_later_recovered_true_value`.
 
+### Durable, verifiable migration completeness ([#37](https://github.com/freenet/freenet-migrate/issues/37))
+
+**Additive and opt-in.** Every existing entry point, trait method and report
+behaves exactly as before; adopters that do not call the new API see no change.
+
+**The problem.** The walk was already durable *within* a predecessor (in-progress
+marker before the first item, done marker after the flush). What nothing recorded
+durably was whether *every* predecessor had been dealt with, which an app has to
+answer on every load to decide whether the walk must run again. Apps answered it
+in-session (quiescence of the probe fan-out, in-flight counters, a `localStorage`
+flag), and in a browser app served by the gateway every one of those fails: the
+app iframe has no `localStorage`, and a tab can die between any two writes.
+freenet/river#760 measured it: a tab closed after the first per-room write left 1
+of 4 rooms on every later load. Four review rounds of in-session fixes
+(freenet/river#758) each found a new hole, because "done" was still a guess.
+
+**The fix.** A `MigrationJournal`, stored in the successor through the new
+`JournaledSuccessorIo` trait, lists every predecessor as `Pending` or
+`Resolved`:
+
+* `begin_migration_journal` stores it, every predecessor pending, before the app's
+  first migration write.
+* `migrate_delegate_secrets_journaled` runs the ordinary walk, durably flags a
+  data-bearing predecessor before its first item, and records what each
+  predecessor resolved to.
+* `journal_status` is the app's pure load-time read: `NotStarted`, `Unreadable`,
+  `Incomplete { pending }` (re-run the walk) or `Complete` (nothing left to probe,
+  durably — which also stops an empty account re-probing every generation on
+  every load).
+
+Completeness is arithmetic over durable state; there is no timing anywhere in it.
+Silence and timeouts never resolve (attempts are counted, nothing is given up on);
+an item permanently rejected resolves with a count instead of re-running the
+migration forever; an older generation superseded behind a halt stays pending, and
+under `UnionAllGenerations` never resolves as superseded at all. Resolution is
+sticky, so `Complete` is a seal.
+
+**`ProbeVerdict` and `PredecessorSecretsIo::probe_verdict`.** A new default trait
+method with a third answer, `NotInstalled`, for an adapter whose transport can tell
+"this node has no such delegate" from silence (a typed node error, never a
+timeout). The default forwards to `probe_executable` and never answers
+`NotInstalled`, so existing adapters are unaffected. An adapter that opts in gets
+`NoData` for that predecessor (no completion marker, no termination under any
+policy) and a resolved journal entry. A `NotInstalled` answer contradicting an
+earlier attempt that saw data is not believed.
+
+**`SecretStoreIo`** implements `JournaledSuccessorIo`, storing the journal under
+`MIGRATION_JOURNAL_KEY`, inside the crate's reserved namespace (filtered from
+every export).
+
 ## freenet-migrate 0.6.0
 
 **Breaking, contract half only.** Silence is no longer absence
