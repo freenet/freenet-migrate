@@ -6363,9 +6363,16 @@ mod tests {
         let lineage = [old, new];
         let mut writer = InspectingWriter::new(&lineage);
         writer.retryable_fail.insert(b"room:x".to_vec());
+        // The older generation also has a permanently rejected item, so only the
+        // withheld key stands between it and an `ImportedWithRejections`
+        // resolution that would seal `room:x` away.
+        writer.permanent_fail.insert(b"room:corrupt".to_vec());
         let mut io = MockIo::default()
             .executable_with(&key_of(&new), &[(b"room:x", b"new")])
-            .executable_with(&key_of(&old), &[(b"room:x", b"old")]);
+            .executable_with(
+                &key_of(&old),
+                &[(b"room:x", b"old"), (b"room:corrupt", b"?")],
+            );
         let run = writer.run(&mut io, union());
         assert!(matches!(
             state_of(&writer.store, &old),
@@ -6461,6 +6468,15 @@ mod tests {
         assert!(status.pending_all_absent(2));
         assert!(!status.pending_all_absent(3));
         assert!(!status.is_complete());
+
+        // A predecessor that may hold a partial import is never "absent", however
+        // long its streak: the successor may already hold part of it.
+        let mut flagged = stored_journal(&store);
+        flagged.mark_data_bearing(&k, 1);
+        flagged.record(&k, 1, RunOutcome::Unresolved { absent: true });
+        assert!(!flagged
+            .status(&lineage, &union_binding())
+            .pending_all_absent(1));
         journaled(
             &mut store,
             &mut MockIo::default().dead(&k),
