@@ -197,6 +197,9 @@ use crate::delegate::{
     PRED_DONE_MARKER_VALUE_EMPTY,
 };
 use crate::driver::RollbackRiskAck;
+use crate::journal::{
+    JournalResolution, JournalStatus, JournaledSuccessorIo, MigrationJournal, MIGRATION_JOURNAL_KEY,
+};
 use crate::lineage::DelegateLineageEntry;
 
 /// Consent / authorization for a secret migration — a **required** parameter of
@@ -501,6 +504,38 @@ pub trait PredecessorSecretsIo {
         predecessor: &DelegateKey,
     ) -> impl Future<Output = Result<bool, Self::Error>>;
 
+    /// The executability preflight with a third answer: **definitively not
+    /// installed** (freenet/freenet-migrate#37). The walk calls this, not
+    /// [`probe_executable`](Self::probe_executable).
+    ///
+    /// The default forwards to `probe_executable` and can only answer
+    /// [`ProbeVerdict::Executable`] or [`ProbeVerdict::NoReply`] (`Ok(false)`), so
+    /// an adapter that does not override it behaves exactly as before.
+    ///
+    /// Override it only if the app's transport can tell "this node has no such
+    /// delegate" from "it did not answer" — a typed node error, never a timeout.
+    /// [`ProbeVerdict::NotInstalled`] is reported as
+    /// [`PredecessorMigration::NoData`] with **no** completion marker, does not
+    /// stop the walk under any policy (an absent delegate holds no newer state to
+    /// protect), and resolves the predecessor in a [`crate::MigrationJournal`]. So
+    /// it is a claim that this predecessor holds nothing on this node: return it
+    /// for a silence and the predecessor's data is never migrated.
+    fn probe_verdict(
+        &mut self,
+        predecessor: &DelegateKey,
+    ) -> impl Future<Output = Result<ProbeVerdict, Self::Error>> {
+        let probe = self.probe_executable(predecessor);
+        async move {
+            probe.await.map(|executable| {
+                if executable {
+                    ProbeVerdict::Executable
+                } else {
+                    ProbeVerdict::NoReply
+                }
+            })
+        }
+    }
+
     /// Enumerate `predecessor`'s secrets as raw `(key, value)` pairs, via the
     /// app's own delegate protocol. Called only after
     /// [`probe_executable`](Self::probe_executable) returned `Ok(true)`.
@@ -534,6 +569,23 @@ pub trait PredecessorSecretsIo {
         &mut self,
         predecessor: &DelegateKey,
     ) -> impl Future<Output = Result<Vec<SecretPair>, Self::Error>>;
+}
+
+/// What the executability preflight established about a predecessor (see
+/// [`PredecessorSecretsIo::probe_verdict`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ProbeVerdict {
+    /// It executed and answered the cheap no-op.
+    Executable,
+    /// No answer within the app's bound — the old WASM could not execute, the node
+    /// does not have it, or the request was lost. Recorded as
+    /// [`PredecessorMigration::Unresponsive`].
+    NoReply,
+    /// The node answered, definitively, that it has no such delegate installed.
+    /// Only for a typed node answer, never for a timeout. See
+    /// [`PredecessorSecretsIo::probe_verdict`] for what this licenses.
+    NotInstalled,
 }
 
 /// A [`PredecessorSecretsIo`] that can also **register the successor delegate**,
@@ -1536,6 +1588,269 @@ where
     Ok(migrate_delegate_secrets(successor, io, predecessors, authorization, policy).await)
 }
 
+/// Durably start a successor's [`MigrationJournal`] before the app's first
+/// migration write (freenet/freenet-migrate#37).
+///
+/// Call it as soon as the app has decided this load migrates, and **before**
+/// anything — the walk, or an app's own sweep — writes migrated data to the
+/// successor. From then on an interruption at any point leaves a pending journal
+/// behind, which is how the next load knows the migration must run again. See the
+/// [`crate::journal`] module docs.
+///
+/// * No journal stored, or an unreadable one: stores a journal with every
+///   predecessor pending and returns its status.
+/// * A journal stored: returns its status and writes nothing. It is never reset,
+///   so resolutions and the interrupted-import flag survive.
+///
+/// An empty lineage stores a journal that is already complete.
+///
+/// # Errors
+///
+/// The successor's error if the journal could not be read or stored. Do not
+/// proceed with a migration write in that case: nothing durable would record it.
+pub async fn begin_migration_journal<W>(
+    successor: &mut W,
+    predecessors: &[DelegateLineageEntry],
+) -> Result<JournalStatus, W::Error>
+where
+    W: JournaledSuccessorIo,
+{
+    if let Some(bytes) = successor.load_journal().await? {
+        if let Ok(journal) = MigrationJournal::decode(&bytes) {
+            return Ok(journal.status(predecessors));
+        }
+    }
+    let journal = MigrationJournal::new_pending(predecessors);
+    successor.store_journal(&journal.encode()).await?;
+    Ok(journal.status(predecessors))
+}
+
+/// The result of [`migrate_delegate_secrets_journaled`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct JournaledMigrationReport {
+    /// What the walk did, exactly as [`migrate_delegate_secrets`] reports it.
+    pub report: DelegateMigrationReport,
+    /// The journal's completeness after this run, as stored. When
+    /// [`journal_error`](Self::journal_error) is set this is the run's own view,
+    /// which may not have been stored.
+    pub status: JournalStatus,
+    /// The first journal read or write that failed, if any. The migration itself
+    /// still ran; only its durable completeness record may be stale. A stale
+    /// journal errs towards *more* work (it can only under-report resolution), so
+    /// the app re-runs the migration on the next load.
+    pub journal_error: Option<String>,
+}
+
+/// [`migrate_delegate_secrets`], recording each predecessor's resolution in the
+/// successor's [`MigrationJournal`] (freenet/freenet-migrate#37).
+///
+/// The walk is the ordinary one — same order, same policy, same markers, same
+/// writer seam, same report. What this adds is durable bookkeeping around it:
+///
+/// 1. The journal is loaded, and started (every predecessor pending) if none is
+///    stored, before the walk writes anything.
+/// 2. Before a data-bearing predecessor's first item is written, its entry is
+///    durably flagged as an interrupted-import-in-progress.
+/// 3. After the walk each predecessor's outcome resolves its entry or counts a
+///    failed attempt (table in the [`crate::journal`] module docs), and the
+///    journal is stored.
+///
+/// The app reads the stored journal on every load with
+/// [`crate::journal_status`] and calls this again while it is incomplete. That is
+/// safe to repeat: completed predecessors are skipped by their markers, and a
+/// retried predecessor re-offers its items to a writer that must merge (see
+/// [`SuccessorSecretsIo`]).
+///
+/// Parameters are those of [`migrate_delegate_secrets`].
+pub async fn migrate_delegate_secrets_journaled<W, IO>(
+    successor: &mut W,
+    io: &mut IO,
+    predecessors: &[DelegateLineageEntry],
+    authorization: MigrationAuthorization,
+    policy: SecretSelectionPolicy,
+) -> JournaledMigrationReport
+where
+    W: JournaledSuccessorIo,
+    W::Error: core::fmt::Debug,
+    IO: PredecessorSecretsIo,
+    IO::Error: core::fmt::Debug,
+{
+    let mut journal_error: Option<String> = None;
+    let note = |slot: &mut Option<String>, what: String| {
+        if slot.is_none() {
+            *slot = Some(what);
+        }
+    };
+
+    // 1. Load, or start (exactly as `begin_migration_journal` does) before the
+    //    walk can write. A journal whose READ failed is not overwritten up front,
+    //    since we cannot see it; the run's own view (this run's resolutions,
+    //    everything else pending) is stored at the end, which can only
+    //    under-report resolution.
+    let (mut journal, start) = match successor.load_journal().await {
+        Ok(Some(bytes)) => match MigrationJournal::decode(&bytes) {
+            Ok(journal) => (journal, false),
+            Err(e) => {
+                note(
+                    &mut journal_error,
+                    format!("stored journal unreadable: {}", e.0),
+                );
+                (MigrationJournal::new_pending(predecessors), true)
+            }
+        },
+        Ok(None) => (MigrationJournal::new_pending(predecessors), true),
+        Err(e) => {
+            note(&mut journal_error, format!("journal load failed: {e:?}"));
+            (MigrationJournal::new_pending(predecessors), false)
+        }
+    };
+    if start {
+        if let Err(e) = successor.store_journal(&journal.encode()).await {
+            note(&mut journal_error, format!("journal start failed: {e:?}"));
+        }
+    }
+
+    // 2. The walk, flagging data-bearing imports as they begin.
+    let mut observer = JournalObserver {
+        journal: &mut journal,
+        error: None,
+    };
+    let mut transport = AppSideRoundTrip { io };
+    let outcome = transport
+        .walk(
+            successor,
+            predecessors,
+            &authorization,
+            &policy,
+            &mut observer,
+        )
+        .await;
+    if let Some(e) = observer.error.take() {
+        note(&mut journal_error, e);
+    }
+
+    // 3. Resolve.
+    let resolutions = resolve_outcomes(&outcome, &policy);
+    for (row, resolution) in outcome.report.predecessors.iter().zip(resolutions) {
+        journal.record(row.key(), row.generation(), resolution);
+    }
+    if let Err(e) = successor.store_journal(&journal.encode()).await {
+        note(&mut journal_error, format!("journal store failed: {e:?}"));
+    }
+
+    JournaledMigrationReport {
+        status: journal.status(predecessors),
+        report: outcome.report,
+        journal_error,
+    }
+}
+
+struct JournalObserver<'j> {
+    journal: &'j mut MigrationJournal,
+    error: Option<String>,
+}
+
+impl<W> WalkObserver<W> for JournalObserver<'_>
+where
+    W: JournaledSuccessorIo,
+    W::Error: core::fmt::Debug,
+{
+    async fn before_import(
+        &mut self,
+        successor: &mut W,
+        predecessor: &DelegateKey,
+        generation: u32,
+    ) {
+        if self.journal.mark_data_bearing(predecessor, generation) {
+            if let Err(e) = successor.store_journal(&self.journal.encode()).await {
+                if self.error.is_none() {
+                    self.error = Some(format!("journal import flag failed: {e:?}"));
+                }
+            }
+        }
+    }
+}
+
+/// Map one walk's rows to journal resolutions (`None` = still pending), newest
+/// first, per the table in the [`crate::journal`] module docs.
+fn resolve_outcomes(
+    outcome: &WalkOutcome,
+    policy: &SecretSelectionPolicy,
+) -> Vec<Option<JournalResolution>> {
+    let snapshot_policy = match policy {
+        SecretSelectionPolicy::NewestSnapshotWins
+        | SecretSelectionPolicy::NewestSnapshotWinsContinuePastUnresponsive(_) => true,
+        SecretSelectionPolicy::UnionAllGenerations(_) => false,
+    };
+    let mut resolved: Vec<Option<JournalResolution>> = Vec::new();
+    for row in &outcome.report.predecessors {
+        let key = crate::journal::key_bytes(row.key());
+        let resolution = match row {
+            PredecessorMigration::Imported { .. } => Some(JournalResolution::Imported),
+            PredecessorMigration::NoData { .. } => Some(if outcome.not_installed.contains(&key) {
+                JournalResolution::NotInstalled
+            } else {
+                JournalResolution::NoData
+            }),
+            PredecessorMigration::AlreadyMigrated { .. } => {
+                Some(if outcome.done_with_data.contains(&key) {
+                    JournalResolution::Imported
+                } else {
+                    JournalResolution::NoData
+                })
+            }
+            // Only permanent rejection may resolve an incomplete import: a retry
+            // would be refused identically, so pending would loop forever. A
+            // retryable failure, a withheld key, or a flush / marker fault is
+            // exactly what a retry fixes, so those stay pending.
+            PredecessorMigration::Incomplete { tally, failure, .. }
+                if tally.rejected > 0
+                    && tally.failed == 0
+                    && tally.withheld == 0
+                    && failure
+                        .as_ref()
+                        .is_none_or(|f| matches!(f.stage, WriterStage::Item)) =>
+            {
+                Some(JournalResolution::ImportedWithRejections {
+                    rejected: u32::try_from(tally.rejected).unwrap_or(u32::MAX),
+                })
+            }
+            // Superseded only resolves when THIS run proves why: a snapshot policy,
+            // every newer predecessor resolved, and one of them data-bearing — so
+            // it was skipped for an authoritative newer snapshot, not behind a halt
+            // (an unresponsive or failing newer one), which leaves it unexamined.
+            PredecessorMigration::Superseded { .. }
+                if snapshot_policy
+                    && resolved.iter().all(Option::is_some)
+                    && resolved.iter().flatten().any(|r| r.is_data_bearing()) =>
+            {
+                Some(JournalResolution::SupersededByAuthoritative)
+            }
+            _ => None,
+        };
+        resolved.push(resolution);
+    }
+    resolved
+}
+
+impl<S: SecretStore + ?Sized> JournaledSuccessorIo for SecretStoreIo<'_, S> {
+    fn load_journal(&mut self) -> impl Future<Output = Result<Option<Vec<u8>>, Self::Error>> {
+        core::future::ready(Ok(self.store.get_secret(MIGRATION_JOURNAL_KEY)))
+    }
+
+    fn store_journal(&mut self, journal: &[u8]) -> impl Future<Output = Result<(), Self::Error>> {
+        let ok = self.store.set_secret(MIGRATION_JOURNAL_KEY, journal);
+        core::future::ready(if ok {
+            Ok(())
+        } else {
+            Err(SecretStoreWriteFailed {
+                key: MIGRATION_JOURNAL_KEY.to_vec(),
+            })
+        })
+    }
+}
+
 /// The redesigned, sans-IO secret transport — the internal factoring of the
 /// **interim** app-side migration (plan G1.7 / G3.6).
 ///
@@ -1605,8 +1920,8 @@ pub(crate) trait SecretTransport<W: SuccessorSecretsIo> {
 /// the [`PredecessorSecretsIo`] adapter, applying each recovered secret through the
 /// [`SuccessorSecretsIo`] writer. This supersedes v1's `ReRunOldWasm` stub — there
 /// is no node re-run of old WASM here; the app ferries the export round-trip.
-struct AppSideRoundTrip<'a, IO> {
-    io: &'a mut IO,
+pub(crate) struct AppSideRoundTrip<'a, IO> {
+    pub(crate) io: &'a mut IO,
 }
 
 impl<W, IO> SecretTransport<W> for AppSideRoundTrip<'_, IO>
@@ -1623,6 +1938,76 @@ where
         authorization: &MigrationAuthorization,
         policy: &SecretSelectionPolicy,
     ) -> DelegateMigrationReport {
+        self.walk(
+            successor,
+            predecessors,
+            authorization,
+            policy,
+            &mut NoObserver,
+        )
+        .await
+        .report
+    }
+}
+
+/// Hook into the walk for the journaled entry point. The plain entry points use
+/// [`NoObserver`].
+pub(crate) trait WalkObserver<W> {
+    /// Called once per data-bearing predecessor, before its in-progress marker and
+    /// before its first item is written.
+    fn before_import(
+        &mut self,
+        successor: &mut W,
+        predecessor: &DelegateKey,
+        generation: u32,
+    ) -> impl Future<Output = ()>;
+}
+
+pub(crate) struct NoObserver;
+
+impl<W> WalkObserver<W> for NoObserver {
+    fn before_import(
+        &mut self,
+        _successor: &mut W,
+        _predecessor: &DelegateKey,
+        _generation: u32,
+    ) -> impl Future<Output = ()> {
+        core::future::ready(())
+    }
+}
+
+/// What the walk reports, plus the facts the journal needs that the public report
+/// does not carry.
+pub(crate) struct WalkOutcome {
+    pub(crate) report: DelegateMigrationReport,
+    /// Predecessors whose probe answered [`ProbeVerdict::NotInstalled`] (reported
+    /// as `NoData`).
+    pub(crate) not_installed: BTreeSet<[u8; 32]>,
+    /// Predecessors short-circuited as `AlreadyMigrated` by a data-bearing
+    /// completion marker.
+    pub(crate) done_with_data: BTreeSet<[u8; 32]>,
+}
+
+impl<IO> AppSideRoundTrip<'_, IO>
+where
+    IO: PredecessorSecretsIo,
+    IO::Error: core::fmt::Debug,
+{
+    pub(crate) async fn walk<W, O>(
+        &mut self,
+        successor: &mut W,
+        predecessors: &[DelegateLineageEntry],
+        authorization: &MigrationAuthorization,
+        policy: &SecretSelectionPolicy,
+        observer: &mut O,
+    ) -> WalkOutcome
+    where
+        W: SuccessorSecretsIo,
+        W::Error: core::fmt::Debug,
+        O: WalkObserver<W>,
+    {
+        let mut not_installed: BTreeSet<[u8; 32]> = BTreeSet::new();
+        let mut done_with_data: BTreeSet<[u8; 32]> = BTreeSet::new();
         // Interim: the app-author ack is a no-op gate — its PRESENCE authorizes
         // the migration. Gap 3's stronger variant (per-transition user consent +
         // node-recorded same-origin binding) is checked here without changing any
@@ -1696,6 +2081,9 @@ where
             };
             match marker {
                 Some(MigrationMarker::Done { had_data }) => {
+                    if had_data {
+                        done_with_data.insert(crate::journal::key_bytes(&key));
+                    }
                     if policy.data_bearing_is_authoritative(had_data) {
                         terminated = true;
                     }
@@ -1718,9 +2106,20 @@ where
             // error or a clean no-reply are both Unresponsive (error attached only
             // for the former); under NewestSnapshotWins an unknown newer state must
             // not be fallen through (would risk resurrecting deleted keys).
-            match self.io.probe_executable(&key).await {
-                Ok(true) => {}
-                Ok(false) => {
+            match self.io.probe_verdict(&key).await {
+                Ok(ProbeVerdict::Executable) => {}
+                // Definitively absent from this node, and no earlier attempt saw
+                // data from it: it holds nothing here to migrate. No completion
+                // marker — the delegate could be registered again later — and no
+                // termination: there is no newer state behind an absent delegate.
+                Ok(ProbeVerdict::NotInstalled) if !prior_saw_data => {
+                    not_installed.insert(crate::journal::key_bytes(&key));
+                    results.push(PredecessorMigration::NoData { key, generation });
+                    continue;
+                }
+                // "Not installed" contradicting an earlier attempt that saw data is
+                // not believed: keep it unresolved like a silence.
+                Ok(ProbeVerdict::NotInstalled) | Ok(ProbeVerdict::NoReply) => {
                     results.push(PredecessorMigration::Unresponsive {
                         key,
                         generation,
@@ -1758,6 +2157,13 @@ where
             // (or forge) a migration marker.
             let items: Vec<&SecretPair> = secrets.iter().filter(|(k, _)| !is_marker(k)).collect();
             let saw_data = prior_saw_data || !items.is_empty();
+
+            // A data-bearing import is about to write: let the journal (if any)
+            // record durably that this predecessor may be partially imported from
+            // here on, before the first item lands.
+            if saw_data {
+                observer.before_import(successor, &key, generation).await;
+            }
 
             // Phase 1: record intent (and the data/empty flag) BEFORE any item.
             if let Err(e) = successor
@@ -1931,8 +2337,12 @@ where
             results.push(migration);
         }
 
-        DelegateMigrationReport {
-            predecessors: results,
+        WalkOutcome {
+            report: DelegateMigrationReport {
+                predecessors: results,
+            },
+            not_installed,
+            done_with_data,
         }
     }
 }

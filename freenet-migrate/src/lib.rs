@@ -72,6 +72,7 @@ pub mod delegate;
 pub mod delegate_migrate;
 pub mod driver;
 pub mod error;
+pub mod journal;
 pub mod lineage;
 pub mod pointer;
 pub mod successor;
@@ -89,10 +90,11 @@ pub use delegate::{
     PRED_DONE_MARKER_VALUE_EMPTY, PRED_DONE_MARKER_VERSION,
 };
 pub use delegate_migrate::{
-    migrate_delegate_secrets, register_delegate_with_migration, DelegateMigrationReport,
-    ImportTally, ItemWrite, LegacyBridge, MarkerQuery, MigrationAuthorization, MigrationMarker,
-    NoCrossEntryInvariantsAck, PredecessorMigration, PredecessorSecretsIo, RecoveredSecret,
-    RegisterAndMigrateIo, RetryAdvice, SecretSelectionPolicy, SecretStoreIo,
+    begin_migration_journal, migrate_delegate_secrets, migrate_delegate_secrets_journaled,
+    register_delegate_with_migration, DelegateMigrationReport, ImportTally, ItemWrite,
+    JournaledMigrationReport, LegacyBridge, MarkerQuery, MigrationAuthorization, MigrationMarker,
+    NoCrossEntryInvariantsAck, PredecessorMigration, PredecessorSecretsIo, ProbeVerdict,
+    RecoveredSecret, RegisterAndMigrateIo, RetryAdvice, SecretSelectionPolicy, SecretStoreIo,
     SecretStoreWriteFailed, SuccessorSecretsIo, UnionAck, WriterFailure, WriterStage,
 };
 pub use driver::{
@@ -101,6 +103,11 @@ pub use driver::{
     RECOMMENDED_PROBE_TIMEOUT_MS,
 };
 pub use error::MigrateError;
+pub use journal::{
+    journal_status, JournalDecodeError, JournalEntry, JournalResolution, JournalState,
+    JournalStatus, JournaledSuccessorIo, MigrationJournal, PendingPredecessor,
+    MIGRATION_JOURNAL_KEY, MIGRATION_JOURNAL_VERSION,
+};
 pub use lineage::{ContractLineageEntry, DelegateLineageEntry, Lineage};
 pub use pointer::{
     is_canonical_field_element, is_valid_app_id_byte, parse_pointer_params, pointer_contract_id,
