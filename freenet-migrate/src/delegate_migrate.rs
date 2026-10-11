@@ -2428,6 +2428,9 @@ mod tests {
         error_on_fetch: HashSet<Vec<u8>>,
         /// force `register_successor` to fail, for the wrapper's error path.
         fail_register: bool,
+        /// keys the node definitively reports as not installed (the
+        /// `probe_verdict` override; `probe_executable` is not consulted).
+        not_installed: HashSet<Vec<u8>>,
     }
 
     #[derive(Debug, PartialEq, Eq)]
@@ -2459,6 +2462,11 @@ mod tests {
             self.error_on_fetch.insert(key.bytes().to_vec());
             self
         }
+        /// The node answers "no such delegate" for this key (a typed answer).
+        fn not_installed(mut self, key: &DelegateKey) -> Self {
+            self.not_installed.insert(key.bytes().to_vec());
+            self
+        }
         fn failing_registration(mut self) -> Self {
             self.fail_register = true;
             self
@@ -2467,6 +2475,20 @@ mod tests {
 
     impl PredecessorSecretsIo for MockIo {
         type Error = IoAbort;
+        async fn probe_verdict(
+            &mut self,
+            predecessor: &DelegateKey,
+        ) -> Result<ProbeVerdict, IoAbort> {
+            if self.not_installed.contains(predecessor.bytes()) {
+                self.probed.insert(predecessor.bytes().to_vec());
+                return Ok(ProbeVerdict::NotInstalled);
+            }
+            Ok(if self.probe_executable(predecessor).await? {
+                ProbeVerdict::Executable
+            } else {
+                ProbeVerdict::NoReply
+            })
+        }
         async fn probe_executable(&mut self, predecessor: &DelegateKey) -> Result<bool, IoAbort> {
             let k = predecessor.bytes().to_vec();
             if self.error_on_probe.contains(&k) {
@@ -5535,5 +5557,747 @@ mod tests {
             "the index must not accumulate duplicates across the retry"
         );
         assert_eq!(visible_credentials(&store).len(), 2);
+    }
+
+    // ---- the completeness journal (freenet/freenet-migrate#37) -----------------
+    //
+    // Each test below is named for a failure the in-session completeness
+    // inference produced in freenet/river#758 rounds 1-4, or for a property the
+    // journal's data-loss argument rests on.
+
+    use crate::journal::{
+        journal_status, JournalResolution, JournalState, JournalStatus, MigrationJournal,
+        MIGRATION_JOURNAL_KEY,
+    };
+
+    fn stored_status(store: &MemStore, lineage: &[DelegateLineageEntry]) -> JournalStatus {
+        journal_status(store.get_secret(MIGRATION_JOURNAL_KEY).as_deref(), lineage)
+    }
+
+    fn stored_journal(store: &MemStore) -> MigrationJournal {
+        MigrationJournal::decode(
+            &store
+                .get_secret(MIGRATION_JOURNAL_KEY)
+                .expect("journal stored"),
+        )
+        .expect("journal decodes")
+    }
+
+    fn state_of(store: &MemStore, e: &DelegateLineageEntry) -> JournalState {
+        stored_journal(store)
+            .entry(&key_of(e))
+            .expect("entry present")
+            .state
+    }
+
+    fn journaled(
+        store: &mut MemStore,
+        io: &mut MockIo,
+        lineage: &[DelegateLineageEntry],
+        policy: SecretSelectionPolicy,
+    ) -> JournaledMigrationReport {
+        block_on(migrate_delegate_secrets_journaled(
+            &mut store_io(store),
+            io,
+            lineage,
+            ack(),
+            policy,
+        ))
+    }
+
+    /// A successor writer that inspects the STORED journal at the moment of its
+    /// first item write, and can fail chosen items. It is what lets a test see
+    /// the durable state an interruption at that instant would leave behind.
+    struct InspectingWriter {
+        store: MemStore,
+        lineage: Vec<DelegateLineageEntry>,
+        status_at_first_item: Option<JournalStatus>,
+        retryable_fail: BTreeSet<Vec<u8>>,
+        permanent_fail: BTreeSet<Vec<u8>>,
+        offered: Vec<Vec<u8>>,
+    }
+
+    impl InspectingWriter {
+        fn new(lineage: &[DelegateLineageEntry]) -> Self {
+            Self {
+                store: MemStore::default(),
+                lineage: lineage.to_vec(),
+                status_at_first_item: None,
+                retryable_fail: BTreeSet::new(),
+                permanent_fail: BTreeSet::new(),
+                offered: Vec::new(),
+            }
+        }
+        fn raw(&mut self) -> SecretStoreIo<'_, MemStore> {
+            store_io(&mut self.store)
+        }
+    }
+
+    impl SuccessorSecretsIo for InspectingWriter {
+        type Error = SecretStoreWriteFailed;
+        async fn migration_marker(
+            &mut self,
+            query: &MarkerQuery<'_>,
+        ) -> Result<Option<MigrationMarker>, Self::Error> {
+            self.raw().migration_marker(query).await
+        }
+        async fn record_marker(
+            &mut self,
+            predecessor: &DelegateKey,
+            marker: MigrationMarker,
+        ) -> Result<(), Self::Error> {
+            self.raw().record_marker(predecessor, marker).await
+        }
+        async fn write_secret(&mut self, item: &RecoveredSecret<'_>) -> ItemWrite<Self::Error> {
+            self.offered.push(item.key.to_vec());
+            if self.status_at_first_item.is_none() {
+                self.status_at_first_item = Some(stored_status(&self.store, &self.lineage));
+            }
+            if self.retryable_fail.contains(item.key) {
+                return ItemWrite::retryable(SecretStoreWriteFailed {
+                    key: item.key.to_vec(),
+                });
+            }
+            if self.permanent_fail.contains(item.key) {
+                return ItemWrite::permanent(SecretStoreWriteFailed {
+                    key: item.key.to_vec(),
+                });
+            }
+            self.raw().write_secret(item).await
+        }
+    }
+
+    impl JournaledSuccessorIo for InspectingWriter {
+        async fn load_journal(&mut self) -> Result<Option<Vec<u8>>, Self::Error> {
+            self.raw().load_journal().await
+        }
+        async fn store_journal(&mut self, journal: &[u8]) -> Result<(), Self::Error> {
+            self.raw().store_journal(journal).await
+        }
+    }
+
+    /// The journal must be durable, with every predecessor pending, BEFORE the
+    /// app's first migration write — that is the whole point of `begin`.
+    #[test]
+    fn begin_stores_every_predecessor_pending_before_anything_is_written() {
+        let lineage = [entry(1, 1), entry(2, 2)];
+        let mut store = MemStore::default();
+        assert_eq!(stored_status(&store, &lineage), JournalStatus::NotStarted);
+
+        let status =
+            block_on(begin_migration_journal(&mut store_io(&mut store), &lineage)).expect("begin");
+        assert!(matches!(status, JournalStatus::Incomplete { ref pending } if pending.len() == 2));
+        assert_eq!(stored_status(&store, &lineage), status);
+        // Only the journal was written.
+        assert_eq!(store.data.len(), 1);
+    }
+
+    /// `begin` must never reset a stored journal: an interrupted-import flag or
+    /// a resolution recorded by an earlier session survives a later `begin`.
+    #[test]
+    fn begin_never_resets_an_existing_journal() {
+        let lineage = [entry(1, 1)];
+        let k = key_of(&lineage[0]);
+        let mut store = MemStore::default();
+        let mut journal = MigrationJournal::new_pending(&lineage);
+        journal.mark_data_bearing(&k, 1);
+        store.set_secret(MIGRATION_JOURNAL_KEY, &journal.encode());
+
+        let status =
+            block_on(begin_migration_journal(&mut store_io(&mut store), &lineage)).expect("begin");
+        assert!(
+            status.interrupted_import(),
+            "the import flag survived begin"
+        );
+    }
+
+    /// The tab dies after the first item of a data-bearing predecessor. The
+    /// durable state at that instant must already say "interrupted import", so
+    /// the next load re-runs instead of trusting the partial successor
+    /// (freenet/river#760: 1 of 4 rooms survived a kill at the first write).
+    #[test]
+    fn an_interrupted_write_is_already_flagged_durably_at_the_first_item() {
+        let lineage = [entry(1, 1)];
+        let mut writer = InspectingWriter::new(&lineage);
+        let mut io = MockIo::default().executable_with(
+            &key_of(&lineage[0]),
+            &[(b"room:a", b"A"), (b"room:b", b"B")],
+        );
+        block_on(migrate_delegate_secrets_journaled(
+            &mut writer,
+            &mut io,
+            &lineage,
+            ack(),
+            union(),
+        ));
+        let at_first = writer.status_at_first_item.expect("an item was written");
+        assert!(
+            at_first.interrupted_import(),
+            "the journal must flag the import before the first item lands, got {at_first:?}"
+        );
+    }
+
+    /// The same interruption, as an incomplete run: the next run re-walks the
+    /// predecessor and converges to Complete with all data present.
+    #[test]
+    fn an_interrupted_import_is_rerun_and_converges() {
+        let lineage = [entry(1, 1)];
+        let k = key_of(&lineage[0]);
+        let mut writer = InspectingWriter::new(&lineage);
+        writer.retryable_fail.insert(b"room:b".to_vec());
+        let mut io = MockIo::default().executable_with(&k, &[(b"room:a", b"A"), (b"room:b", b"B")]);
+
+        let first = block_on(migrate_delegate_secrets_journaled(
+            &mut writer,
+            &mut io,
+            &lineage,
+            ack(),
+            union(),
+        ));
+        assert!(first.status.interrupted_import());
+        assert!(!first.status.is_complete());
+        assert_eq!(
+            stored_status(&writer.store, &lineage),
+            first.status,
+            "the returned status is the stored one"
+        );
+
+        writer.retryable_fail.clear();
+        let second = block_on(migrate_delegate_secrets_journaled(
+            &mut writer,
+            &mut io,
+            &lineage,
+            ack(),
+            union(),
+        ));
+        assert!(second.status.is_complete());
+        assert_eq!(
+            writer.store.get_secret(b"room:b").as_deref(),
+            Some(&b"B"[..])
+        );
+        assert_eq!(
+            state_of(&writer.store, &lineage[0]),
+            JournalState::Resolved(JournalResolution::Imported)
+        );
+    }
+
+    /// Two generations each hold different data. Completeness requires BOTH to
+    /// resolve: one finishing must not seal the other (round 3's shared-marker
+    /// clear and round 4's "seal before V32 answered").
+    #[test]
+    fn two_generations_must_each_resolve_before_complete() {
+        let (old, new) = (entry(1, 1), entry(2, 2));
+        let lineage = [old.clone(), new.clone()];
+        let mut store = MemStore::default();
+        let mut io = MockIo::default()
+            .executable_with(&key_of(&new), &[(b"room:new", b"N")])
+            .silent_export(&key_of(&old));
+
+        let first = journaled(&mut store, &mut io, &lineage, union());
+        assert!(
+            !first.status.is_complete(),
+            "the old generation never answered"
+        );
+        assert_eq!(
+            state_of(&store, &new),
+            JournalState::Resolved(JournalResolution::Imported)
+        );
+        assert!(matches!(
+            state_of(&store, &old),
+            JournalState::Pending { attempts: 1, .. }
+        ));
+
+        // The old generation answers on a later load.
+        let mut io = MockIo::default()
+            .executable_with(&key_of(&new), &[(b"room:new", b"N")])
+            .executable_with(&key_of(&old), &[(b"room:old", b"O")]);
+        let second = journaled(&mut store, &mut io, &lineage, union());
+        assert!(second.status.is_complete());
+        assert_eq!(store.get_secret(b"room:old").as_deref(), Some(&b"O"[..]));
+        assert_eq!(store.get_secret(b"room:new").as_deref(), Some(&b"N"[..]));
+    }
+
+    /// An item the successor permanently refuses (an undecodable legacy value)
+    /// must RESOLVE the predecessor, with the count, not leave it pending: a
+    /// pending entry would re-run the whole migration on every load forever
+    /// (round 4's "wip without done" loop).
+    #[test]
+    fn a_permanently_rejected_item_converges_instead_of_looping() {
+        let lineage = [entry(1, 1)];
+        let k = key_of(&lineage[0]);
+        let mut writer = InspectingWriter::new(&lineage);
+        writer.permanent_fail.insert(b"room:corrupt".to_vec());
+        let mut io =
+            MockIo::default().executable_with(&k, &[(b"room:a", b"A"), (b"room:corrupt", b"?")]);
+
+        let run = block_on(migrate_delegate_secrets_journaled(
+            &mut writer,
+            &mut io,
+            &lineage,
+            ack(),
+            union(),
+        ));
+        assert!(matches!(
+            run.report.predecessors[0],
+            PredecessorMigration::Incomplete { .. }
+        ));
+        assert!(
+            run.status.is_complete(),
+            "permanent rejection must converge"
+        );
+        assert_eq!(
+            state_of(&writer.store, &lineage[0]),
+            JournalState::Resolved(JournalResolution::ImportedWithRejections { rejected: 1 })
+        );
+        assert_eq!(
+            writer.store.get_secret(b"room:a").as_deref(),
+            Some(&b"A"[..])
+        );
+    }
+
+    /// A rejection mixed with a RETRYABLE failure is not resolution: the retry
+    /// can still land the other item.
+    #[test]
+    fn a_rejection_alongside_a_retryable_failure_stays_pending() {
+        let lineage = [entry(1, 1)];
+        let k = key_of(&lineage[0]);
+        let mut writer = InspectingWriter::new(&lineage);
+        writer.permanent_fail.insert(b"room:corrupt".to_vec());
+        writer.retryable_fail.insert(b"room:b".to_vec());
+        let mut io =
+            MockIo::default().executable_with(&k, &[(b"room:b", b"B"), (b"room:corrupt", b"?")]);
+
+        let run = block_on(migrate_delegate_secrets_journaled(
+            &mut writer,
+            &mut io,
+            &lineage,
+            ack(),
+            union(),
+        ));
+        assert!(!run.status.is_complete());
+        assert!(run.status.interrupted_import());
+    }
+
+    /// A timed-out export must be retried on every later load and never sealed
+    /// (round 4's "timed-out fetch sealed early"). Attempts are counted, not
+    /// capped.
+    #[test]
+    fn a_timed_out_fetch_stays_pending_and_is_retried_until_it_answers() {
+        let lineage = [entry(1, 1)];
+        let k = key_of(&lineage[0]);
+        let mut store = MemStore::default();
+        for attempt in 1..=3 {
+            let mut io = MockIo::default().silent_export(&k);
+            let run = journaled(&mut store, &mut io, &lineage, union());
+            assert!(!run.status.is_complete(), "silence is never resolution");
+            assert!(io.fetched.contains(k.bytes()), "attempt {attempt} re-asked");
+            assert_eq!(
+                state_of(&store, &lineage[0]),
+                JournalState::Pending {
+                    attempts: attempt,
+                    data_bearing: false
+                }
+            );
+            assert!(
+                store.get_secret(&pred_done_marker(&k)).is_none(),
+                "no completion marker for a silence"
+            );
+        }
+        let mut io = MockIo::default().executable_with(&k, &[(b"room:a", b"A")]);
+        assert!(journaled(&mut store, &mut io, &lineage, union())
+            .status
+            .is_complete());
+        assert_eq!(store.get_secret(b"room:a").as_deref(), Some(&b"A"[..]));
+    }
+
+    /// An absent generation's instant, definitive "not installed" resolves only
+    /// THAT generation. It must not complete the migration while the generation
+    /// that actually holds the data has not answered (round 4: the not-found
+    /// door sealed before V32 replied).
+    #[test]
+    fn an_absent_generation_answering_first_cannot_complete_the_migration() {
+        let (holder, absent) = (entry(1, 1), entry(2, 2));
+        let lineage = [holder.clone(), absent.clone()];
+        let mut store = MemStore::default();
+        let mut io = MockIo::default()
+            .not_installed(&key_of(&absent))
+            .silent_export(&key_of(&holder));
+
+        let run = journaled(&mut store, &mut io, &lineage, union());
+        assert!(!run.status.is_complete());
+        assert_eq!(
+            state_of(&store, &absent),
+            JournalState::Resolved(JournalResolution::NotInstalled)
+        );
+        assert!(matches!(
+            state_of(&store, &holder),
+            JournalState::Pending { .. }
+        ));
+        assert!(
+            store
+                .get_secret(&pred_done_marker(&key_of(&absent)))
+                .is_none(),
+            "not-installed earns no completion marker"
+        );
+    }
+
+    /// Without the opt-in override, an absent predecessor is a plain silence:
+    /// pending, never resolved. The default `probe_verdict` must not invent a
+    /// "not installed" the adapter never claimed.
+    #[test]
+    fn the_default_probe_verdict_never_resolves_an_absent_predecessor() {
+        let lineage = [entry(1, 1)];
+        let mut store = MemStore::default();
+        let mut io = MockIo::default().dead(&key_of(&lineage[0]));
+        let run = journaled(&mut store, &mut io, &lineage, union());
+        assert!(matches!(
+            run.report.predecessors[0],
+            PredecessorMigration::Unresponsive { .. }
+        ));
+        assert!(!run.status.is_complete());
+    }
+
+    /// "Not installed" must not halt a NewestSnapshotWins walk: there is no newer
+    /// state behind an absent delegate to protect, and stopping there would
+    /// never reach the generation holding the data.
+    #[test]
+    fn not_installed_does_not_halt_newest_snapshot_wins() {
+        let (old, new) = (entry(1, 1), entry(2, 2));
+        let lineage = [old.clone(), new.clone()];
+        let mut store = MemStore::default();
+        let mut io = MockIo::default()
+            .not_installed(&key_of(&new))
+            .executable_with(&key_of(&old), &[(b"room:a", b"A")]);
+        let run = journaled(&mut store, &mut io, &lineage, newest());
+        assert!(matches!(
+            run.report.predecessors[0],
+            PredecessorMigration::NoData { .. }
+        ));
+        assert!(matches!(
+            run.report.predecessors[1],
+            PredecessorMigration::Imported { .. }
+        ));
+        assert!(run.status.is_complete());
+    }
+
+    /// A "not installed" answer contradicting an earlier attempt that saw data
+    /// is not believed: the predecessor stays pending rather than being written
+    /// off.
+    #[test]
+    fn not_installed_after_an_earlier_attempt_saw_data_stays_pending() {
+        let lineage = [entry(1, 1)];
+        let k = key_of(&lineage[0]);
+        let mut store = MemStore::default();
+        // An earlier run began a data-bearing import and died.
+        store.set_secret(&pred_wip_marker(&k), PRED_DONE_MARKER_VALUE_DATA);
+        let mut io = MockIo::default().not_installed(&k);
+        let run = journaled(&mut store, &mut io, &lineage, union());
+        assert!(matches!(
+            run.report.predecessors[0],
+            PredecessorMigration::Unresponsive { .. }
+        ));
+        assert!(!run.status.is_complete());
+    }
+
+    /// Under NewestSnapshotWins an older generation skipped BEHIND A HALT (an
+    /// unresponsive newer one) was never examined and must stay pending; one
+    /// skipped behind a resolved, data-bearing newer snapshot is resolved.
+    #[test]
+    fn superseded_resolves_only_behind_an_authoritative_snapshot() {
+        let (old, new) = (entry(1, 1), entry(2, 2));
+        let lineage = [old.clone(), new.clone()];
+
+        let mut store = MemStore::default();
+        let mut io = MockIo::default()
+            .dead(&key_of(&new))
+            .executable_with(&key_of(&old), &[(b"room:a", b"A")]);
+        let halted = journaled(&mut store, &mut io, &lineage, newest());
+        assert!(matches!(
+            halted.report.predecessors[1],
+            PredecessorMigration::Superseded { .. }
+        ));
+        assert!(matches!(
+            state_of(&store, &old),
+            JournalState::Pending { .. }
+        ));
+
+        let mut store = MemStore::default();
+        let mut io = MockIo::default()
+            .executable_with(&key_of(&new), &[(b"room:n", b"N")])
+            .executable_with(&key_of(&old), &[(b"room:o", b"O")]);
+        let authoritative = journaled(&mut store, &mut io, &lineage, newest());
+        assert!(authoritative.status.is_complete());
+        assert_eq!(
+            state_of(&store, &old),
+            JournalState::Resolved(JournalResolution::SupersededByAuthoritative)
+        );
+    }
+
+    /// Under Union a Superseded row only ever follows a halt, so it never
+    /// resolves — even when an earlier run resolved the newer predecessor.
+    #[test]
+    fn union_never_resolves_a_superseded_predecessor() {
+        let (old, new) = (entry(1, 1), entry(2, 2));
+        let lineage = [old.clone(), new.clone()];
+        // The newer predecessor resolved on an earlier run.
+        let mut journal = MigrationJournal::new_pending(&lineage);
+        journal.record(&key_of(&new), 2, Some(JournalResolution::Imported));
+        // This run cannot read its marker, which halts every policy.
+        let mut writer = BrokenMarkerRead {
+            journal: Some(journal.encode()),
+        };
+        let mut io = MockIo::default().executable_with(&key_of(&old), &[(b"room:o", b"O")]);
+        let run = block_on(migrate_delegate_secrets_journaled(
+            &mut writer,
+            &mut io,
+            &lineage,
+            ack(),
+            union(),
+        ));
+        assert!(matches!(
+            run.report.predecessors[1],
+            PredecessorMigration::Superseded { .. }
+        ));
+        assert!(!run.status.is_complete());
+        let after = MigrationJournal::decode(writer.journal.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            after.entry(&key_of(&new)).unwrap().state,
+            JournalState::Resolved(JournalResolution::Imported),
+            "the earlier resolution is sticky"
+        );
+        assert!(matches!(
+            after.entry(&key_of(&old)).unwrap().state,
+            JournalState::Pending { .. }
+        ));
+    }
+
+    /// A successor whose marker reads fail and whose journal is in memory only.
+    struct BrokenMarkerRead {
+        journal: Option<Vec<u8>>,
+    }
+    impl SuccessorSecretsIo for BrokenMarkerRead {
+        type Error = &'static str;
+        async fn migration_marker(
+            &mut self,
+            _query: &MarkerQuery<'_>,
+        ) -> Result<Option<MigrationMarker>, Self::Error> {
+            Err("marker read failed")
+        }
+        async fn record_marker(
+            &mut self,
+            _predecessor: &DelegateKey,
+            _marker: MigrationMarker,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+        async fn write_secret(&mut self, _item: &RecoveredSecret<'_>) -> ItemWrite<Self::Error> {
+            ItemWrite::written()
+        }
+    }
+    impl JournaledSuccessorIo for BrokenMarkerRead {
+        async fn load_journal(&mut self) -> Result<Option<Vec<u8>>, Self::Error> {
+            Ok(self.journal.clone())
+        }
+        async fn store_journal(&mut self, journal: &[u8]) -> Result<(), Self::Error> {
+            self.journal = Some(journal.to_vec());
+            Ok(())
+        }
+    }
+
+    /// Re-running on a complete journal is a no-op: nothing is re-imported and a
+    /// resolution never regresses, even if a resolved predecessor has since
+    /// gone silent. That stickiness is what makes Complete a seal — and what
+    /// makes a re-run triggered by a STALE listing harmless.
+    #[test]
+    fn a_rerun_on_a_complete_journal_changes_nothing() {
+        let (absent, holder) = (entry(1, 1), entry(2, 2));
+        let lineage = [absent.clone(), holder.clone()];
+        let mut store = MemStore::default();
+        let mut io = MockIo::default()
+            .not_installed(&key_of(&absent))
+            .executable_with(&key_of(&holder), &[(b"room:a", b"A")]);
+        assert!(journaled(&mut store, &mut io, &lineage, union())
+            .status
+            .is_complete());
+        let before = store.get_secret(MIGRATION_JOURNAL_KEY);
+
+        // The absent one is now merely silent; the holder's data was edited by
+        // the user since.
+        store.set_secret(b"room:a", b"A-edited");
+        let mut io = MockIo::default()
+            .dead(&key_of(&absent))
+            .executable_with(&key_of(&holder), &[(b"room:a", b"A")]);
+        let rerun = journaled(&mut store, &mut io, &lineage, union());
+        assert!(rerun.status.is_complete(), "a resolution never regresses");
+        assert!(
+            !io.fetched.contains(key_of(&holder).bytes()),
+            "nothing re-imported"
+        );
+        assert_eq!(
+            store.get_secret(b"room:a").as_deref(),
+            Some(&b"A-edited"[..])
+        );
+        assert_eq!(store.get_secret(MIGRATION_JOURNAL_KEY), before);
+    }
+
+    /// The user keeps using the app between an interrupted import and the
+    /// recovery run. The recovery must merge, never clobber: a value the user
+    /// changed since stays. (The crate's guarantee is that a retried predecessor
+    /// re-offers items to the writer, never-clobber here, rather than writing
+    /// around it.)
+    #[test]
+    fn recovery_after_user_activity_never_clobbers_newer_successor_data() {
+        let lineage = [entry(1, 1)];
+        let k = key_of(&lineage[0]);
+        let mut writer = InspectingWriter::new(&lineage);
+        writer.retryable_fail.insert(b"room:b".to_vec());
+        let mut io = MockIo::default().executable_with(&k, &[(b"room:a", b"A"), (b"room:b", b"B")]);
+        block_on(migrate_delegate_secrets_journaled(
+            &mut writer,
+            &mut io,
+            &lineage,
+            ack(),
+            union(),
+        ));
+
+        // Activity on the successor before the recovery load.
+        writer.store.set_secret(b"room:a", b"A-newer");
+        writer.store.set_secret(b"room:new", b"made since");
+        writer.retryable_fail.clear();
+        let recovery = block_on(migrate_delegate_secrets_journaled(
+            &mut writer,
+            &mut io,
+            &lineage,
+            ack(),
+            union(),
+        ));
+        assert!(recovery.status.is_complete());
+        assert_eq!(
+            writer.store.get_secret(b"room:a").as_deref(),
+            Some(&b"A-newer"[..])
+        );
+        assert_eq!(
+            writer.store.get_secret(b"room:b").as_deref(),
+            Some(&b"B"[..])
+        );
+        assert_eq!(
+            writer.store.get_secret(b"room:new").as_deref(),
+            Some(&b"made since"[..])
+        );
+    }
+
+    /// A predecessor's stored journal (under the reserved key) is never offered
+    /// to the successor's writer: a journal copied forward would claim a
+    /// migration that never ran in the new generation.
+    #[test]
+    fn a_predecessors_journal_is_never_imported() {
+        let lineage = [entry(1, 1)];
+        let k = key_of(&lineage[0]);
+        let mut writer = InspectingWriter::new(&lineage);
+        let mut io = MockIo::default()
+            .executable_with(&k, &[(MIGRATION_JOURNAL_KEY, b"forged"), (b"room:a", b"A")]);
+        block_on(migrate_delegate_secrets_journaled(
+            &mut writer,
+            &mut io,
+            &lineage,
+            ack(),
+            union(),
+        ));
+        assert_eq!(
+            writer.offered,
+            vec![b"room:a".to_vec()],
+            "only real items are offered"
+        );
+        let stored = writer
+            .store
+            .get_secret(MIGRATION_JOURNAL_KEY)
+            .expect("our own journal");
+        assert_ne!(stored, b"forged");
+        assert!(MigrationJournal::decode(&stored).is_ok());
+    }
+
+    /// The load-time read: nothing stored, garbage stored, a lineage entry the
+    /// journal never saw (pending), and an entry no longer in the lineage
+    /// (ignored).
+    #[test]
+    fn journal_status_reads_the_stored_bytes_conservatively() {
+        let (a, b) = (entry(1, 1), entry(2, 2));
+        assert_eq!(
+            journal_status(None, &[a.clone()]),
+            JournalStatus::NotStarted
+        );
+        let garbage = journal_status(Some(b"not cbor"), &[a.clone()]);
+        assert!(matches!(garbage, JournalStatus::Unreadable(_)));
+        assert!(
+            garbage.interrupted_import(),
+            "unreadable is treated as interrupted"
+        );
+
+        let mut only_a = MigrationJournal::new_pending(&[a.clone()]);
+        only_a.record(&key_of(&a), 1, Some(JournalResolution::NoData));
+        let bytes = only_a.encode();
+        assert!(journal_status(Some(&bytes), &[a.clone()]).is_complete());
+        assert!(
+            !journal_status(Some(&bytes), &[a.clone(), b.clone()]).is_complete(),
+            "a lineage entry the journal never saw is pending"
+        );
+        assert!(
+            journal_status(Some(&bytes), &[]).is_complete(),
+            "an entry outside the lineage is ignored"
+        );
+    }
+
+    /// Every state round-trips through the stored encoding, and a future version
+    /// reads as unreadable rather than as complete.
+    #[test]
+    fn the_journal_encoding_round_trips_and_rejects_unknown_versions() {
+        let lineage: Vec<_> = (1..=6).map(|g| entry(g, g as u8)).collect();
+        let mut journal = MigrationJournal::new_pending(&lineage);
+        let resolutions = [
+            Some(JournalResolution::Imported),
+            Some(JournalResolution::NoData),
+            Some(JournalResolution::NotInstalled),
+            Some(JournalResolution::ImportedWithRejections { rejected: 7 }),
+            Some(JournalResolution::SupersededByAuthoritative),
+            None,
+        ];
+        for (e, r) in lineage.iter().zip(resolutions) {
+            journal.record(&key_of(e), e.generation, r);
+        }
+        journal.mark_data_bearing(&key_of(&lineage[5]), 6);
+        assert_eq!(
+            MigrationJournal::decode(&journal.encode()).unwrap(),
+            journal
+        );
+
+        let mut wire = journal.encode();
+        // The version field is the first value in the CBOR map: `{"v": 1, ...}`.
+        let pos = wire.windows(2).position(|w| w == [0x61, b'v']).unwrap() + 2;
+        wire[pos] = 0x02;
+        assert!(matches!(
+            journal_status(Some(&wire), &lineage),
+            JournalStatus::Unreadable(_)
+        ));
+    }
+
+    /// A journal write that fails is reported, and the migration still ran.
+    #[test]
+    fn a_failed_journal_store_is_reported_and_the_migration_still_runs() {
+        let lineage = [entry(1, 1)];
+        let k = key_of(&lineage[0]);
+        let mut store = MemStore::default();
+        store.fail_writes_to(MIGRATION_JOURNAL_KEY);
+        let mut io = MockIo::default().executable_with(&k, &[(b"room:a", b"A")]);
+        let run = journaled(&mut store, &mut io, &lineage, union());
+        assert!(run.journal_error.is_some());
+        assert_eq!(store.get_secret(b"room:a").as_deref(), Some(&b"A"[..]));
+        assert_eq!(stored_status(&store, &lineage), JournalStatus::NotStarted);
+
+        let mut store = MemStore::default();
+        store.fail_writes_to(MIGRATION_JOURNAL_KEY);
+        assert!(
+            block_on(begin_migration_journal(&mut store_io(&mut store), &lineage)).is_err(),
+            "begin must fail loudly: nothing durable would record the migration"
+        );
     }
 }
