@@ -1683,9 +1683,10 @@ where
 /// Durably start a successor's [`MigrationJournal`] before the app's first
 /// migration write (freenet/freenet-migrate#37).
 ///
-/// Call it as soon as the app has decided this load migrates, and **before**
-/// anything — the walk, or an app's own sweep — writes migrated data to the
-/// successor, or merges it into state a later save would persist. From then on
+/// Call it on **every** load, **before** anything — the walk, or an app's own
+/// sweep — writes migrated data to the successor, or merges it into state a
+/// later save would persist, and decide whether to run the walk from its status.
+/// From then on
 /// an interruption at any point leaves a pending journal behind, which is how
 /// the next load knows the migration must run again. See the [`crate::journal`]
 /// module docs.
@@ -1698,18 +1699,23 @@ where
 /// * A corrupt journal stored: rebuilds it the same way from the markers, which
 ///   record every import that started (the app's too, see
 ///   [`note_app_import_started`]).
-/// * A readable journal stored: writes nothing (unless the lineage has entries it
-///   has never seen, which are read off their markers and added). It is never
-///   reset, so resolutions
-///   and import flags survive.
+/// * A readable journal stored: never reset, so resolutions and import flags
+///   survive. It reads the marker of each predecessor resolved as holding
+///   nothing of its data (one read each per call) and reopens one whose marker
+///   records an import under way (a flag another session's stale store
+///   overwrote). A marker that cannot be read there refuses nothing: the entry
+///   is left as stored, and the returned status counts it as an import under way
+///   for this load. Lineage entries it has never seen are read off their markers
+///   and added. It stores only if it reopened or added something.
 ///
 /// Returns the journal's status under `policy` and the successor's
 /// [`import_revision`](JournaledSuccessorIo::import_revision).
 ///
 /// # Errors
 ///
-/// The journal (or, starting one, a predecessor's marker) could not be read or
-/// stored, or the journal was written by a build with a different journal
+/// The journal (or, starting one or adding a lineage entry, a predecessor's
+/// marker) could not be read or stored, or the journal was written by a build
+/// with a different journal
 /// encoding version (which this build never overwrites). Do not proceed with a
 /// migration write: nothing durable would record it.
 pub async fn begin_migration_journal<W>(
@@ -1789,7 +1795,8 @@ fn status_with_unverified(
 ///
 /// A predecessor whose import already completed with data (its `Done` marker
 /// says so) is left alone: nothing is recorded, and the app's write is a re-merge
-/// of data already in the successor. One sealed only by a legacy marker for a
+/// of data already in the successor (unless a snapshot policy supersedes it, see
+/// Errors). One sealed only by a legacy marker for a
 /// newer generation is superseded under a snapshot policy, not imported: that is
 /// an error (do not write it). `policy` is the one the app migrates under;
 /// `predecessor` must be in the lineage it passes to the walk, or the flag is
@@ -1838,7 +1845,9 @@ where
     // not in the lineage, and a flag there would be read by nothing.
     if journal.entry(predecessor).is_none() {
         return Err(JournalError::NotImportable(
-            "the predecessor is not in the lineage the journal was begun with".to_string(),
+            "the predecessor is not in the lineage the journal was begun with (if the \
+             lineage grew, call begin_migration_journal with it first)"
+                .to_string(),
         ));
     }
     let binding = JournalBinding::new(policy, successor.import_revision());
@@ -1910,8 +1919,10 @@ pub struct JournaledMigrationReport {
     /// [`journal_error`](Self::journal_error)), so it never reads as complete.
     pub report: DelegateMigrationReport,
     /// The stored journal's completeness after this run, under the run's policy
-    /// and the successor's import revision. `None` when it is not known to be
-    /// stored: the walk was refused, or the final store failed.
+    /// and the successor's import revision, with any predecessor whose marker
+    /// could not be read to check it counted as an import under way. `None` when
+    /// it is not known to be stored: the walk was refused, or the final store
+    /// failed. Treat `None` as possibly incomplete.
     pub status: Option<JournalStatus>,
     /// The first journal failure, if any.
     ///
@@ -1941,11 +1952,13 @@ pub struct JournaledMigrationReport {
 ///    as an import started; if that store fails, the walk stops before writing
 ///    anything of it.
 /// 4. After the walk each predecessor's outcome resolves its entry or counts an
-///    unresolved attempt (table in the [`crate::journal`] module docs), and the
-///    journal is stored with read-merge-write.
+///    unresolved attempt (table in the [`crate::journal`] module docs). A pending
+///    predecessor the walk stopped short of (behind a halt) is checked against
+///    its marker, so a flag another session's stale store overwrote is
+///    restored. The journal is stored with read-merge-write.
 ///
-/// The app reads the stored journal on every load with [`crate::journal_status`]
-/// and calls this again while it is incomplete. That is safe to repeat:
+/// The app calls [`begin_migration_journal`] on every load, and this while the
+/// status is incomplete. That is safe to repeat:
 /// completed predecessors are skipped by their markers, and a retried predecessor
 /// re-offers its items to a writer that must merge (see [`SuccessorSecretsIo`]).
 ///

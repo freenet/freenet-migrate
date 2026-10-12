@@ -28,19 +28,22 @@
 //! (through [`JournaledSuccessorIo`]), so it survives a dead tab and needs no
 //! client-side storage.
 //!
-//! * [`crate::begin_migration_journal`] stores it (every predecessor pending)
-//!   **before** the app's first migration write, so an interruption at any point
-//!   afterwards leaves a pending journal behind.
+//! * [`crate::begin_migration_journal`], called on **every** load before
+//!   anything migrated is written, stores it (every predecessor pending) the
+//!   first time, so an interruption at any point afterwards leaves a pending
+//!   journal behind; on later loads it adds lineage entries it has never seen and
+//!   reopens a resolution a lost flag left wrong.
 //! * [`crate::migrate_delegate_secrets_journaled`] runs the ordinary walk,
 //!   durably flags a predecessor as *import in progress* before its first item,
 //!   and records what each predecessor resolved to.
 //! * [`crate::note_app_import_started`] lets an app that writes migrated data
 //!   **outside** the walk (River's hand-rolled sweep) raise the same flag before
 //!   its own first write.
-//! * On every load the app reads it ([`journal_status`]) and re-runs the walk
-//!   while it is incomplete. The walk is idempotent (completed predecessors are
-//!   skipped by their markers; a retried one re-offers its items to a writer that
-//!   must merge), so an extra run is cheap and safe.
+//! * On every load the app runs the walk while `begin`'s status is incomplete,
+//!   and decides from the status the last call returned. The walk is idempotent
+//!   (completed predecessors are skipped by their markers; a retried one
+//!   re-offers its items to a writer that must merge), so an extra run is cheap
+//!   and safe.
 //!
 //! Completeness is decided by **arithmetic over durable state** — every lineage
 //! entry has a resolved journal entry — never by timing. There is no quiescence
@@ -110,7 +113,13 @@
 //! before writing, so a second tab or session cannot erase
 //! a flag or a resolution the first one recorded — except inside the window
 //! between one session's re-read and its write, which a successor without
-//! compare-and-swap cannot close. Every store a walk relies on **fails closed**:
+//! compare-and-swap cannot close. A stale store there can overwrite another
+//! session's import flag, and the stored journal can then read `Complete` over a
+//! partial copy. The predecessor's marker still records the import:
+//! [`crate::begin_migration_journal`] reopens such a resolution, and the walk
+//! restores a pending entry's flag (one it reaches, or one behind a halt it
+//! stops at). So decide from the status those calls return, not from a raw
+//! [`journal_status`] read. Every store a walk relies on **fails closed**:
 //! if the journal cannot be read or established, or the import flag cannot be
 //! stored before a predecessor's first item, that predecessor is not imported
 //! this run. A journal from a different encoding version is never overwritten.
@@ -138,6 +147,11 @@
 //!   there). River's sweep and walk read the same predecessor keys.
 //! * It does not detect a predecessor whose export is itself partial: that must
 //!   be an `Err` from the app's [`crate::PredecessorSecretsIo::fetch_secrets`].
+//!   That includes the retry after an interrupted import: only an EMPTY answer
+//!   after data is refused, and a shorter one is believed and resolves
+//!   `Imported`. An app that enumerates through an index the predecessor itself
+//!   reads (and freenet/freenet-core#5857 can make that read come back empty)
+//!   must turn an unreadable index into an `Err`, never into a short list.
 //! * It cannot tell a predecessor that genuinely holds nothing from one whose
 //!   storage the node failed to read **on the first attempt**: freenet-core
 //!   reports a failed secret read as "not found" (freenet/freenet-core#5857), so
@@ -970,7 +984,10 @@ impl JournalStatus {
 
 /// The completeness of a successor whose stored journal bytes are `stored`
 /// (`None` when nothing is stored), against the lineage `predecessors`, for an
-/// app migrating under `binding`. A pure function, for the app's load path.
+/// app migrating under `binding`. A pure function: it reads no markers, so it
+/// cannot see a flag another session's stale store overwrote (see the
+/// concurrency section of the module docs). Gate on the status
+/// [`crate::begin_migration_journal`] or the walk returned, not on this.
 pub fn journal_status(
     stored: Option<&[u8]>,
     predecessors: &[DelegateLineageEntry],

@@ -3,7 +3,8 @@
 ## freenet-migrate 0.7.0
 
 **Unreleased; publish gated on #43** (River's real-node rehearsal, the #41
-marker-store conformance check, and #39 or an app override).
+marker-store conformance check, #39 or an app override, and whether this ships
+as 0.7.0 or 0.8.0).
 
 **Delegate half only.** Two features and one behaviour change:
 
@@ -136,10 +137,17 @@ of 4 rooms on every later load. Four review rounds of in-session fixes
   (`JournalError::NotImportable`) a predecessor outside the lineage, or one a
   snapshot policy supersedes, where a flag could never resolve.
 * Inside the no-compare-and-swap window between two sessions' stores, a stale
-  session can overwrite an app's flag on a predecessor resolved as holding
-  nothing, and the journal can then read `Complete` over the app's partial copy.
-  The predecessor's marker still records the import, and the next
-  `begin_migration_journal` reopens it: call `begin` on every load.
+  session can overwrite an app's flag, and the stored journal can then say no
+  import is under way over the app's partial copy (even `Complete`, if the
+  predecessor had been resolved as holding nothing). The predecessor's marker
+  still records the import: `begin_migration_journal` reopens such a resolution,
+  and the walk restores the flag on a pending entry, including one behind a halt
+  it stops at. Call `begin` on every load, and decide from the status the last
+  call returned, never from a raw `journal_status` read.
+* `begin` costs one marker read per predecessor resolved as holding nothing, per
+  call. A marker it cannot read there refuses nothing: the predecessor reads as
+  an import under way for that load, nothing is stored, and the read is retried
+  on the next.
 * `journal_status` is the app's pure load-time read: `NotStarted`, `Unreadable`,
   `Incomplete { pending, rejected_items }` (re-run the walk) or
   `Complete { rejected_items }` (nothing left to probe, durably).
@@ -232,7 +240,9 @@ own stores do not follow it today:
    as `InProgress { saw_data: true }`.
 2. Recording `InProgress` never erases a stored `Done` (keep them separate).
 3. `InProgress { saw_data: false }` never downgrades a stored
-   `InProgress { saw_data: true }`.
+   `InProgress { saw_data: true }`, including one another session records
+   between your check and your write: do both inside one delegate message, or
+   the check does not hold.
 
 Break rule 1 and a lost or corrupt journal certifies `Complete` over a partial
 copy. The crate checks rule 1 where it matters (`note_app_import_started` and a

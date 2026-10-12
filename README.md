@@ -705,11 +705,12 @@ if !begun.is_complete() {
     // `run.status` is what was stored. While it is incomplete, run again on a
     // later load.
 }
-// `interrupted_import()` of the status as STORED NOW (`run.status`, or `begun`
-// when the walk did not run, or a fresh `journal_status` read after the last
-// journal call) true means: do NOT treat the successor as everything the user
-// had. False does not mean it is: check `rejected_items()` and the pending
-// list too. Never gate on `!is_complete()`.
+// Decide from the status the LAST call returned: `run.status` (None means
+// possibly incomplete), or `begun` when the walk did not run. Not from a raw
+// `journal_status` read, which reads no markers. `interrupted_import()` true
+// means: do NOT treat the successor as everything the user had. False does not
+// mean it is: check `rejected_items()` and the pending list too. Never gate on
+// `!is_complete()`.
 ```
 
 `successor` implements `JournaledSuccessorIo`: load and store the journal bytes
@@ -732,8 +733,15 @@ and, under a snapshot policy, every predecessor finished its own migration
 before it became one (see the CHANGELOG).
 
 Compose "the successor may not be everything the user had" from: a walk in
-flight, a status not read yet, `begin_migration_journal` erring, or
-`interrupted_import()` on the status as stored now.
+flight, a status not read yet, `begin_migration_journal` erring, a walk whose
+`status` is `None`, or `interrupted_import()` on the status the last call
+returned.
+
+Per load, `begin` reads the journal once and one marker per predecessor resolved
+as holding nothing; it stores only when it reopens or adds an entry. A marker it
+cannot read refuses nothing: that predecessor reads as an import under way for
+the load, and the read is retried on the next. The walk then costs what the
+section below says.
 
 What resolves a predecessor is a table in the `journal` module docs. The short
 version: silence and "not installed" never do; a permanent rejection does, with a
@@ -770,9 +778,12 @@ pending entry with no import flag (`absent_streak` 0 if it was silent rather
 than "not installed"). Whether that blocks anything (a fresh install, say) is the
 app's rule to state, from the pending list. Inside the no-compare-and-swap window
 between two sessions' journal stores, a stale session can also overwrite an
-app's flag: `interrupted_import()` can then be false over a partial copy, and if
-the predecessor had been resolved as holding nothing, the journal can even read
-`Complete`. Its marker still records the import, and the next `begin` reopens it.
+app's flag: the stored journal can then say no import is under way over a
+partial copy, and if the predecessor had been resolved as holding nothing, it
+can even read `Complete`. Its marker still records the import. The next `begin`
+reopens such a resolution, and the walk restores the flag on a pending entry
+(one it reaches, or one behind a halt it stops at), so the status those calls
+return reports it.
 
 ### Known limitations
 
