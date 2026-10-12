@@ -14028,4 +14028,28 @@ mod tests {
             r14_reason(r, "reopened rejection, no markers");
         }
     }
+
+    /// A predecessor sealed with its data in the successor while its journal entry
+    /// is still pending (the walk's final journal store failed): an app flag is
+    /// refused as already imported, and nothing is recorded.
+    #[test]
+    fn an_app_flag_on_a_sealed_import_the_journal_missed_is_refused() {
+        let g1 = entry(1, 1);
+        let lineage = [g1];
+        let mut store = MemStore::default();
+        block_on(begin_migration_journal(
+            &mut store_io(&mut store),
+            &lineage,
+            &union(),
+        ))
+        .expect("begin");
+        store.set_secret(&pred_done_marker(&key_of(&g1)), PRED_DONE_MARKER_VALUE_DATA);
+        let before = store.data.clone();
+        let r = r12_flag(&mut store, &lineage, &key_of(&g1), &union());
+        assert!(
+            matches!(&r, Err(JournalError::NotImportable(m)) if m.contains("already completed")),
+            "{r:?}"
+        );
+        assert_eq!(store.data, before, "nothing recorded");
+    }
 }
