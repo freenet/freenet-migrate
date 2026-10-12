@@ -94,7 +94,9 @@
 //!   revision are evaluated against the app's [`JournalBinding`] on every read
 //!   and every merge, never stored as journal-wide state a stale copy could
 //!   carry back.
-//! * **Resolution is otherwise sticky.**
+//! * **Resolution is otherwise sticky.** Once resolved, an entry only ever
+//!   changes towards more of its data in the successor (`NoData` to
+//!   `Imported`, say), never back to pending.
 //!
 //! # Concurrency and failure
 //!
@@ -121,6 +123,11 @@
 //!   there). River's sweep and walk read the same predecessor keys.
 //! * It does not detect a predecessor whose export is itself partial: that must
 //!   be an `Err` from the app's [`crate::PredecessorSecretsIo::fetch_secrets`].
+//! * It cannot tell a predecessor that genuinely holds nothing from one whose
+//!   storage the node failed to read **on the first attempt**: freenet-core
+//!   reports a failed secret read as "not found" (freenet/freenet-core#5857), so
+//!   the export is empty and the predecessor resolves `NoData`. Only once an
+//!   attempt has seen data is a later "nothing" refused.
 //! * It does not bind a journal to the successor it is stored in. Store it under
 //!   a key the predecessor adapter never offers for import
 //!   ([`crate::SecretStoreIo`] uses the reserved [`MIGRATION_JOURNAL_KEY`]).
@@ -290,8 +297,9 @@ impl PolicyFamily {
 /// `SupersededByAuthoritative` under the Union family, an
 /// `ImportedWithRejections` under a higher import revision. Every read and every
 /// merge is evaluated against the binding, so a stale stored copy cannot bring
-/// such a resolution back.
+/// such a resolution back. Build it with [`JournalBinding::new`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct JournalBinding {
     /// The selection policy family.
     pub policy: PolicyFamily,

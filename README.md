@@ -692,22 +692,23 @@ state (freenet/river#760). Store a `MigrationJournal` in the successor instead:
 // `load_journal` must answer Err (not None) for a read that timed out.
 let binding = JournalBinding::new(&policy, successor.import_revision());
 let stored = successor.load_journal().await?;
-let status = journal_status(stored.as_deref(), DELEGATE_LINEAGE, &binding);
-if !status.is_complete() {
+if !journal_status(stored.as_deref(), DELEGATE_LINEAGE, &binding).is_complete() {
     // Durable intent BEFORE the first migration write (yours or the walk's).
-    // An Err means: do not write anything migrated this load.
-    begin_migration_journal(&mut successor, DELEGATE_LINEAGE, &policy).await?;
-    // Writing migrated data yourself, outside the walk? Flag it first, and
-    // skip the write if this errs:
+    // An Err means: do not write anything migrated this load. On a first load
+    // after upgrading, its status (not the one above) knows about a partial copy
+    // an earlier plain walk left behind.
+    let begun = begin_migration_journal(&mut successor, DELEGATE_LINEAGE, &policy).await?;
+    // Writing migrated data yourself, outside the walk? Flag it first, once you
+    // hold data read from the predecessor, and skip the write if this errs:
     // note_app_import_started(&mut successor, &predecessor, generation).await?;
     let run = migrate_delegate_secrets_journaled(
         &mut successor, &mut io, DELEGATE_LINEAGE, authz, policy,
     ).await;
-    // `run.status` is what was stored (None if it could not be). While it is
-    // incomplete, run again on a later load.
+    // `run.status` is what was stored (None if it could not be). Gate "is the
+    // successor everything the user had?" on its `interrupted_import()` (or, if
+    // None, on `begun`'s), never on `!is_complete()`. While it is incomplete,
+    // run again on a later load.
 }
-// Gate "is the successor everything the user had?" on
-// `status.interrupted_import()`, not on `!is_complete()`.
 ```
 
 `successor` implements `JournaledSuccessorIo`: load and store the journal bytes
@@ -729,7 +730,9 @@ tell a definitive "not installed" from silence. That makes each such probe
 immediate, and lets `JournalStatus::pending_all_absent(n)` tell you that every
 remaining predecessor has answered "not installed" `n` times in a row, if you
 want to run the walk less often. Treat that as a rate limit, never a seal:
-"not installed" can also mean the node failed to read the delegate.
+"not installed" can also mean the node failed to read the delegate. The crate
+keeps no clock, so a cadence is the app's to count (loads, say, kept in its own
+successor state).
 
 ### Known limitations
 
@@ -804,26 +807,31 @@ Targets current stdlib **0.8.x**.
 is no longer absence ([#19]). See [Upgrading to 0.6.0](#upgrading-to-060) and the
 CHANGELOG.
 
-**Unreleased: 0.7.0**, additive on the **delegate** half — the new
+**Unreleased: 0.7.0**, on the **delegate** half: the new
 `NewestSnapshotWinsContinuePastUnresponsive` policy variant ([#14]) and the
-opt-in completeness journal ([#37]). No adopter below needs a code change:
-every known adopter constructs `SecretSelectionPolicy` rather than exhaustively
-matching it, the new `WriterStage::JournalFlag` variant joins a
-`#[non_exhaustive]` enum, and the journal and `probe_verdict` are new API with
-defaults. Adopting either is optional per app.
+opt-in completeness journal ([#37]), both optional per app, plus one behaviour
+change every adopter of the delegate walk gets. A predecessor that exports
+nothing although an earlier attempt saw data is now reported `Unresponsive`
+instead of being sealed as done (see the CHANGELOG before upgrading). Nothing
+needs a code change to compile: every known adopter constructs
+`SecretSelectionPolicy` rather than exhaustively matching it, the new
+`WriterStage::JournalFlag` variant joins a `#[non_exhaustive]` enum, and the
+journal and `probe_verdict` are new API with defaults.
 
 ### Adopters
 
 The adoption tracked by
 [freenet/river#398](https://github.com/freenet/river/issues/398) has landed.
-Five apps now use the crate, and both halves have adopters.
+Six apps now use the crate, and both halves have adopters. Pins as of
+2026-10-11:
 
 | App | `freenet-migrate` | `freenet-migrate-build` | Migrates |
 |-----|-------------------|-------------------------|----------|
-| [River](https://github.com/freenet/river) | 0.5 | 0.2 | delegate + contract |
-| [Delta](https://github.com/freenet/delta) | 0.5.0 | none | delegate + contract |
+| [River](https://github.com/freenet/river) | 0.5 (UI), 0.6 (`riverctl`) | 0.2 | delegate + contract |
+| [Delta](https://github.com/freenet/delta) | 0.6 | none | delegate + contract |
 | [ghostkeys](https://github.com/freenet/ghostkeys) | 0.5.0 | none | delegate |
-| [Atlas](https://github.com/freenet/atlas) | 0.5.0 | 0.2.0 | contract |
+| [Atlas](https://github.com/freenet/atlas) | 0.6 | 0.2.0 | contract |
+| [Harvest](https://github.com/freenet/harvest) | 0.6 | 0.2 | delegate + contract |
 | [freenet-git](https://github.com/freenet/freenet-git) | none | 0.2.0 | contract (registry codegen) |
 
 River and Delta each run the crate alongside the hand-rolled sweep they

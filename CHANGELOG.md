@@ -2,7 +2,7 @@
 
 ## freenet-migrate 0.7.0
 
-**Additive, delegate half only.** Two features:
+**Delegate half only.** Two features and one behaviour change:
 
 * `SecretSelectionPolicy::NewestSnapshotWinsContinuePastUnresponsive`
   ([#14](https://github.com/freenet/freenet-migrate/issues/14)), below.
@@ -10,14 +10,20 @@
   ([#37](https://github.com/freenet/freenet-migrate/issues/37)), so an app knows
   on every load whether every predecessor has been dealt with. See "Durable,
   verifiable migration completeness" below.
+* **Behaviour change, for every adopter of the delegate walk:** a predecessor
+  that exports nothing although an earlier attempt saw data in it is no longer
+  sealed as done. See "An empty answer after data is a silence" below; read it
+  before upgrading if your app keys anything off the walk's `Done` markers or
+  relies on the walk halting.
 
 The minor version bump (not a patch) is the conventional pre-1.0 signal for new
 public enum variants. `SecretSelectionPolicy` was not `#[non_exhaustive]` before
 this release (it is now), so an external exhaustive `match` over it, though none
 is known to exist, would need a new arm; that is technically breaking.
 `WriterStage::JournalFlag` joins an enum that was already `#[non_exhaustive]`.
-No known adopter's code needs to change: every one constructs the policy rather
-than matching it exhaustively, and the journal is new API.
+No known adopter's code needs to change to compile: every one constructs the
+policy rather than matching it exhaustively, and the journal is new API. The
+behaviour change above is the one thing to audit.
 
 **Upgrading from 0.5.** 0.6.0 (the contract half: silence is no longer absence)
 sits between, and is breaking on the contract half. Read "Upgrading to 0.6.0" in
@@ -89,8 +95,9 @@ and
 
 ### Durable, verifiable migration completeness ([#37](https://github.com/freenet/freenet-migrate/issues/37))
 
-**Additive and opt-in.** Every existing entry point, trait method and report
-behaves exactly as before; adopters that do not call the new API see no change.
+**Opt-in.** Apps that do not call the journal API get nothing new from this
+section. (The walk's one behaviour change, which every adopter gets, is in its own
+section below.)
 
 **The problem.** The walk was already durable *within* a predecessor (in-progress
 marker before the first item, done marker after the flush). What nothing recorded
@@ -157,14 +164,6 @@ The rules the data-loss argument rests on:
 
 The new `WriterStage::JournalFlag` names a failed import-flag store.
 
-**Behaviour change in the plain walk: an empty export after data was seen is a
-silence.** A predecessor an earlier attempt saw data in (its `InProgress`
-marker says so) that now exports nothing is reported `Unresponsive` and keeps
-its in-progress marker, instead of being sealed `Done { had_data: true }` with
-the interrupted attempt's missing items never asked for again. A frozen
-predecessor does not lose data, so the empty answer is the fault: freenet-core
-reports a secret it failed to read the same way as one that is not there.
-
 **`ProbeVerdict` and `PredecessorSecretsIo::probe_verdict`.** A new default trait
 method with a third answer, `NotInstalled`, for an adapter whose transport can tell
 "this node has no such delegate" from silence (a typed node error, never a
@@ -176,6 +175,38 @@ every policy); the only difference is the journal's absent streak.
 **`SecretStoreIo`** implements `JournaledSuccessorIo`, storing the journal under
 `MIGRATION_JOURNAL_KEY`, inside the crate's reserved namespace (filtered from
 every export). Its `import_revision` is 0.
+
+### An empty answer after data is a silence (behaviour change, every adopter)
+
+A predecessor whose in-progress marker says an earlier attempt saw data, and
+which now exports nothing, is reported `Unresponsive` (with
+`PredecessorMigration::exported_nothing_after_data()` true) and keeps its
+in-progress marker. Before, it was sealed `Done { had_data: true }`, and the
+interrupted attempt's missing items were never asked for again.
+`import_predecessor_secrets_once` likewise returns `Incomplete` with zero counts
+instead of sealing.
+
+**Why.** A frozen predecessor does not lose data, so the empty answer is the
+fault: freenet-core reports a secret it failed to read the same way as one that
+is not there (freenet/freenet-core#5857).
+
+**What changes for an adopter.**
+
+* **No data is dropped.** What was a silent seal is now a retry on every run.
+* **A predecessor that really did become empty is retried forever.** That
+  includes one an old-version tab emptied, so "frozen" is an assumption your app
+  must actually hold.
+* **Termination follows each policy's rule for an unresponsive predecessor, with
+  the earlier data as evidence:**
+  * `NewestSnapshotWins` and `...ContinuePastUnresponsive` stop there.
+  * `UnionAllGenerations` goes on to older generations, as for any unresponsive
+    predecessor, and a never-clobber writer may then keep an older generation's
+    value for a key the newer one also holds.
+* **If your app relied on the walk halting there, or keyed anything off the
+  predecessor's `Done` marker** (promoting staged records when it is written,
+  say), check `exported_nothing_after_data()`.
+* **Seals written by earlier releases stay as they are.** A predecessor already
+  sealed `Done { had_data: true }` over a partial copy cannot be told apart.
 
 ## freenet-migrate 0.6.0
 

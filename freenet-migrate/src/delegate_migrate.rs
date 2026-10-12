@@ -99,11 +99,12 @@
 //!         Err(..)              => record WriterUnavailable; STOP
 //!         Ok(Some(Done { .. })) => { record AlreadyMigrated; maybe stop }
 //!         Ok(in_progress_or_none) => {
-//!             match io.probe_executable(predecessor).await {    // G1.8 preflight
-//!                 Ok(false) | Err(_) => { record Unresponsive; maybe stop }
-//!                 Ok(true) => {
+//!             match io.probe_verdict(predecessor).await {       // G1.8 preflight
+//!                 NoReply | NotInstalled | Err(_) => { record Unresponsive; maybe stop }
+//!                 Executable => {
 //!                     // Err (incl. a silent export) => record Unresponsive; maybe stop
 //!                     let secrets = io.fetch_secrets(predecessor).await?;
+//!                     // nothing, after an earlier attempt saw data => Unresponsive
 //!                     successor.record_marker(InProgress { saw_data }).await?;
 //!                     for item in secrets minus reserved markers minus withheld {
 //!                         successor.write_secret(item).await   // the APP's import path
@@ -137,7 +138,7 @@
 //! |---|---|---|---|
 //! | `Imported` / data-bearing `Incomplete` / data-bearing `AlreadyMigrated` | stop (authoritative snapshot) | stop (authoritative snapshot) | continue |
 //! | `NoData` / empty `Incomplete` | continue | continue | continue |
-//! | `Unresponsive` | stop (unknown newer state) | continue (opted into the rollback risk — freenet/freenet-migrate#14) | continue |
+//! | `Unresponsive` | stop (unknown newer state) | continue (opted into the rollback risk — freenet/freenet-migrate#14), unless an earlier attempt saw data | continue |
 //! | `WriterUnavailable` | stop | stop | stop (successor-side bookkeeping is broken) |
 //!
 //! A data-bearing predecessor is authoritative under either `NewestSnapshotWins`
@@ -645,8 +646,9 @@ pub trait RegisterAndMigrateIo: PredecessorSecretsIo {
 pub enum MigrationMarker {
     /// An import from this predecessor started and did not complete. `saw_data`
     /// records whether *any* attempt so far saw real secrets, so the data/empty
-    /// decision is **sticky-data** across retries (a data-then-empty retry keeps
-    /// its data flag; an empty-then-data retry upgrades to data).
+    /// decision is **sticky-data** across retries: an empty-then-data retry
+    /// upgrades to data, and a data-then-empty retry is not believed at all (it is
+    /// reported `Unresponsive` and the marker stays, so a later run asks again).
     InProgress {
         /// Whether any attempt so far saw at least one real secret.
         saw_data: bool,
@@ -1263,11 +1265,15 @@ pub enum PredecessorMigration {
         generation: u32,
     },
     /// **G1.8**: the predecessor could not be confirmed executable — the preflight
-    /// got no reply, or a probe/fetch round-trip errored (the error is stringified
-    /// into `error`). Its data may exist but cannot be auto-migrated. The app MUST
-    /// surface this and MUST NOT treat the migration as a fresh install
-    /// (freenet/river#204). See [`PredecessorSecretsIo::probe_executable`] for the
-    /// registration/availability dependency this rests on.
+    /// got no reply or answered "not installed", or a probe/fetch round-trip
+    /// errored (the error is stringified into `error`) — or it exported nothing
+    /// although an earlier attempt saw data in it (see
+    /// [`exported_nothing_after_data`](Self::exported_nothing_after_data): the
+    /// successor may then hold a partial copy of it). Its data may exist but cannot
+    /// be auto-migrated now. The app MUST surface this and MUST NOT treat the
+    /// migration as a fresh install (freenet/river#204). See
+    /// [`PredecessorSecretsIo::probe_executable`] for the registration/availability
+    /// dependency this rests on.
     Unresponsive {
         /// The predecessor delegate key.
         key: DelegateKey,
@@ -1329,7 +1335,27 @@ pub enum PredecessorMigration {
     },
 }
 
+/// The `Unresponsive` error the walk reports for a predecessor that exported
+/// nothing although an earlier attempt saw data in it.
+const EXPORTED_NOTHING_AFTER_DATA: &str = "exported nothing, but an earlier attempt saw data";
+
 impl PredecessorMigration {
+    /// Whether this is a predecessor that exported nothing although an earlier
+    /// attempt saw data in it (its in-progress marker, or a migration journal,
+    /// says so). Reported [`Unresponsive`](Self::Unresponsive) and never sealed,
+    /// because a frozen predecessor does not lose data: the empty answer is the
+    /// fault. Unlike an ordinary silence, the successor may hold a **partial
+    /// copy** of this predecessor right now. Under `UnionAllGenerations` the walk
+    /// still goes on to older generations, as for any unresponsive predecessor;
+    /// an app that relies on halting there must check this.
+    pub fn exported_nothing_after_data(&self) -> bool {
+        matches!(
+            self,
+            PredecessorMigration::Unresponsive { error: Some(e), .. }
+                if e == EXPORTED_NOTHING_AFTER_DATA
+        )
+    }
+
     /// The predecessor delegate key this outcome is for.
     pub fn key(&self) -> &DelegateKey {
         match self {
@@ -2487,7 +2513,7 @@ where
                 results.push(PredecessorMigration::Unresponsive {
                     key,
                     generation,
-                    error: Some("exported nothing, but an earlier attempt saw data".to_string()),
+                    error: Some(EXPORTED_NOTHING_AFTER_DATA.to_string()),
                 });
                 terminated = policy.unresponsive_terminates(prior_saw_data);
                 continue;
@@ -8049,11 +8075,8 @@ mod tests {
         ));
         assert!(store.has_secret(b"room:o"));
         // A plain-walk adopter sees why, and that it is worth retrying.
-        assert!(matches!(
-            &report.predecessors[0],
-            PredecessorMigration::Unresponsive { error: Some(e), .. }
-                if e.contains("earlier attempt saw data")
-        ));
+        assert!(report.predecessors[0].exported_nothing_after_data());
+        assert!(!report.predecessors[1].exported_nothing_after_data());
         assert!(report.retry_may_help());
         assert!(!report.is_complete());
     }
