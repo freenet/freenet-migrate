@@ -777,9 +777,15 @@ impl MigrationJournal {
                 state: JournalState::fresh(),
             });
         let ours = match (entry.state, outcome) {
-            // An import with rejections keeps the count its import saw.
+            // An import with rejections keeps the count its import saw, and
+            // the count an earlier resolution of it (another session's,
+            // brought in by a re-read) carries.
             (
-                JournalState::Pending { items_seen, .. },
+                JournalState::Pending { items_seen, .. }
+                | JournalState::Resolved(JournalResolution::ImportedWithRejections {
+                    items_seen,
+                    ..
+                }),
                 RunOutcome::Resolved(JournalResolution::ImportedWithRejections {
                     rejected,
                     revision,
@@ -917,14 +923,29 @@ fn merge_states(older: JournalState, newer: JournalState) -> JournalState {
     match (older, newer) {
         (Resolved(a), Resolved(b)) => match (a, b) {
             (
-                JournalResolution::ImportedWithRejections { revision: ra, .. },
-                JournalResolution::ImportedWithRejections { revision: rb, .. },
+                JournalResolution::ImportedWithRejections {
+                    revision: ra,
+                    items_seen: ia,
+                    ..
+                },
+                JournalResolution::ImportedWithRejections {
+                    revision: rb,
+                    items_seen: ib,
+                    ..
+                },
             ) => {
-                if rb >= ra {
-                    Resolved(b)
-                } else {
-                    Resolved(a)
-                }
+                // The higher revision wins; the count only rises (#44).
+                let JournalResolution::ImportedWithRejections {
+                    rejected, revision, ..
+                } = (if rb >= ra { b } else { a })
+                else {
+                    unreachable!()
+                };
+                Resolved(JournalResolution::ImportedWithRejections {
+                    rejected,
+                    revision,
+                    items_seen: ia.max(ib),
+                })
             }
             _ if completeness_rank(b) > completeness_rank(a) => Resolved(b),
             _ => Resolved(a),

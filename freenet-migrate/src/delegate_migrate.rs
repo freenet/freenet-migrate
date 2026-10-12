@@ -6844,6 +6844,9 @@ mod tests {
         inject_at_first_item: Option<Vec<u8>>,
         /// Stored over the journal at the first marker read.
         inject_at_first_marker_read: Option<Vec<u8>>,
+        /// Marker reads that pass before `inject_at_first_marker_read` fires (the
+        /// walk's own read of a predecessor comes after `begin`'s).
+        marker_reads_before_inject: usize,
         revision: u32,
     }
 
@@ -6869,6 +6872,7 @@ mod tests {
                 none_on_load_number: None,
                 inject_at_first_item: None,
                 inject_at_first_marker_read: None,
+                marker_reads_before_inject: 0,
                 revision: 0,
             }
         }
@@ -6899,8 +6903,10 @@ mod tests {
         ) -> Result<Option<MigrationMarker>, Self::Error> {
             let status = stored_status(&self.store, &self.lineage);
             self.status_at_marker_reads.push(status);
-            if let Some(bytes) = self.inject_at_first_marker_read.take() {
-                self.store.set_secret(MIGRATION_JOURNAL_KEY, &bytes);
+            if self.status_at_marker_reads.len() > self.marker_reads_before_inject {
+                if let Some(bytes) = self.inject_at_first_marker_read.take() {
+                    self.store.set_secret(MIGRATION_JOURNAL_KEY, &bytes);
+                }
             }
             if self.fail_marker_read.contains(query.predecessor.bytes()) {
                 return Err(SecretStoreWriteFailed {
@@ -15269,5 +15275,205 @@ mod tests {
             .status
             .expect("stored");
         assert!(status.is_complete(), "{status:?}");
+    }
+
+    // ---- fm47b probes (testing lens, re-review) ---------------------------------
+
+    /// The journal as another session left it: `key` flagged with `n` items seen.
+    fn their_flagged_journal(
+        lineage: &[DelegateLineageEntry],
+        key: &DelegateKey,
+        generation: u32,
+        n: u32,
+    ) -> Vec<u8> {
+        let mut theirs = MigrationJournal::new_pending(lineage);
+        theirs.mark_import_started(key, generation);
+        theirs.note_items_seen(key, n);
+        theirs.encode()
+    }
+
+    /// The re-read check does not depend on the marker having recorded data: the
+    /// other session stored its count and flag, but its marker is not there yet when
+    /// this run reads it (`prior_saw_data` is false). A short export must still not
+    /// be sealed.
+    #[test]
+    fn b1_a_count_stored_mid_run_holds_a_first_attempt_with_no_marker() {
+        let g1 = entry(1, 1);
+        let lineage = [g1];
+        let k = key_of(&g1);
+        let mut w = InspectingWriter::new(&lineage);
+        w.inject_at_first_marker_read = Some(their_flagged_journal(&lineage, &k, 1, 3));
+        w.marker_reads_before_inject = lineage.len();
+        let run = w.run(
+            &mut MockIo::default().executable_with(&k, &[(b"room:a", b"A")]),
+            union(),
+        );
+        assert!(
+            run.report.predecessors[0].exported_fewer_after_data(),
+            "{run:?}"
+        );
+        assert!(!w.store.has_secret(b"room:a"), "a short export was written");
+        assert!(!run.status.expect("stored").is_complete());
+    }
+
+    /// The mid-run hold terminates (or not) the walk exactly as the earlier hold
+    /// does, and says which counts it compared.
+    #[test]
+    fn b2_the_mid_run_hold_follows_the_policy_and_names_both_counts() {
+        let (old, new) = (entry(1, 1), entry(2, 2));
+        let lineage = [old, new];
+        let (ko, kn) = (key_of(&old), key_of(&new));
+        let io = || {
+            MockIo::default()
+                .executable_with(&kn, &[(b"room:n", b"N")])
+                .executable_with(&ko, &[(b"room:o", b"O")])
+        };
+        for (policy, older_imported) in [
+            (union(), true),
+            (
+                SecretSelectionPolicy::NewestSnapshotWinsContinuePastUnresponsive(
+                    RollbackRiskAck::i_understand_continuing_past_silence_can_roll_back(),
+                ),
+                false,
+            ),
+        ] {
+            let mut w = InspectingWriter::new(&lineage);
+            w.inject_at_first_marker_read = Some(their_flagged_journal(&lineage, &kn, 2, 3));
+            w.marker_reads_before_inject = lineage.len();
+            let run = w.run(&mut io(), policy);
+            match &run.report.predecessors[0] {
+                PredecessorMigration::Unresponsive { error: Some(e), .. } => {
+                    assert!(e.ends_with(": 1 of 3"), "{e}")
+                }
+                other => panic!("{other:?}"),
+            }
+            assert_eq!(
+                w.store.has_secret(b"room:o"),
+                older_imported,
+                "older generation"
+            );
+            assert!(!w.store.has_secret(b"room:n"));
+        }
+    }
+
+    /// Distinct means distinct KEYS: one key exported twice with different values
+    /// is one item, so a later export listing it once is not short.
+    #[test]
+    fn b3_a_key_listed_twice_with_different_values_counts_once() {
+        let g1 = entry(1, 1);
+        let lineage = [g1];
+        let k = key_of(&g1);
+        let mut w = InspectingWriter::new(&lineage);
+        w.retryable_fail.insert(b"room:b".to_vec());
+        let _ = w.run(
+            &mut MockIo::default().executable_with(
+                &k,
+                &[(b"room:a", b"A1"), (b"room:a", b"A2"), (b"room:b", b"B")],
+            ),
+            union(),
+        );
+        assert!(matches!(
+            state_of(&w.store, &g1),
+            JournalState::Pending { items_seen: 2, .. }
+        ));
+        w.retryable_fail.clear();
+        let status = w
+            .run(
+                &mut MockIo::default()
+                    .executable_with(&k, &[(b"room:a", b"A2"), (b"room:b", b"B")]),
+                union(),
+            )
+            .status
+            .expect("stored");
+        assert!(status.is_complete(), "{status:?}");
+    }
+
+    /// Two sessions resolve one predecessor with rejections at the same revision,
+    /// having seen different counts: the merge keeps the larger, whichever side is
+    /// newer (the count only rises, #44).
+    #[test]
+    fn b4_merging_two_rejection_resolutions_keeps_the_larger_count() {
+        let e = entry(1, 1);
+        let k = key_of(&e);
+        let resolved_with = |n: u32| {
+            let mut j = MigrationJournal::new_pending(&[e]);
+            j.mark_import_started(&k, 1);
+            j.note_items_seen(&k, n);
+            j.record(
+                &k,
+                1,
+                resolved(JournalResolution::ImportedWithRejections {
+                    rejected: 1,
+                    revision: 0,
+                    items_seen: 0,
+                }),
+            );
+            j
+        };
+        let mut reopened = union_binding();
+        reopened.import_revision = 1;
+        for (ours_n, theirs_n) in [(2, 3), (3, 2)] {
+            let mut ours = resolved_with(ours_n);
+            ours.merge_stored(&resolved_with(theirs_n), Some(&union_binding()));
+            match ours.status(&[e], &reopened) {
+                JournalStatus::Incomplete { pending, .. } => {
+                    assert_eq!(pending[0].items_seen, 3, "ours {ours_n}, theirs {theirs_n}")
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+
+    /// `record` keeps the larger of the pending count and the resolution's own.
+    #[test]
+    fn b5_record_keeps_the_larger_of_the_two_rejection_counts() {
+        let e = entry(1, 1);
+        let k = key_of(&e);
+        for (pending_n, resolved_n) in [(5, 2), (2, 5)] {
+            let mut j = MigrationJournal::new_pending(&[e]);
+            j.mark_import_started(&k, 1);
+            j.note_items_seen(&k, pending_n);
+            j.record(
+                &k,
+                1,
+                resolved(JournalResolution::ImportedWithRejections {
+                    rejected: 1,
+                    revision: 0,
+                    items_seen: resolved_n,
+                }),
+            );
+            assert!(matches!(
+                j.entry(&k).map(|e| e.state),
+                Some(JournalState::Resolved(
+                    JournalResolution::ImportedWithRejections { items_seen: 5, .. }
+                ))
+            ));
+        }
+    }
+
+    /// A walk recording a rejection resolution over one another session already
+    /// stored (brought in by its re-read) keeps that resolution's count.
+    #[test]
+    fn recording_a_rejection_over_a_stored_one_keeps_its_count() {
+        let g1 = entry(1, 1);
+        let k = key_of(&g1);
+        let mut j = MigrationJournal::new_pending(&[g1]);
+        j.mark_import_started(&k, 1);
+        j.note_items_seen(&k, 3);
+        let iwr = |seen| {
+            resolved(JournalResolution::ImportedWithRejections {
+                rejected: 1,
+                revision: 1,
+                items_seen: seen,
+            })
+        };
+        j.record(&k, 1, iwr(0));
+        j.record(&k, 1, iwr(0));
+        assert!(matches!(
+            j.entry(&k).map(|e| e.state),
+            Some(JournalState::Resolved(
+                JournalResolution::ImportedWithRejections { items_seen: 3, .. }
+            ))
+        ));
     }
 }
