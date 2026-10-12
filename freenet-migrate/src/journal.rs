@@ -1084,6 +1084,25 @@ pub trait JournaledSuccessorIo: SuccessorSecretsIo {
     }
 }
 
+/// What [`crate::note_app_import_started`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AppImport {
+    /// The import is flagged, in the journal and as the predecessor's in-progress
+    /// marker: write the data.
+    Flagged,
+    /// Its import already completed (its `Done` marker records data, or the
+    /// journal resolves it with data, which an import with rejections at the
+    /// current revision is): nothing was recorded, and the walk will not offer it
+    /// again. Its data is in the successor as far as the crate knows, but that can
+    /// be partial: a short export (#44), a write an old tab made to it during a
+    /// rollout, or the items an import path rejected. Writing it again fills such
+    /// a gap, and also brings back any key the user deleted since. So an app whose
+    /// merge cannot resurrect a deleted key (ranked tombstones, say) may write it
+    /// again, unflagged; any other app skips it.
+    AlreadyImported,
+}
+
 /// Why a journal operation could not proceed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -1095,12 +1114,11 @@ pub enum JournalError {
     /// version. This build never overwrites it.
     ForeignVersion(u64),
     /// [`crate::note_app_import_started`] was asked to flag a predecessor the app
-    /// must not write from now: one not in the lineage the app passed, one whose
-    /// import already completed, one a newer generation's data supersedes under a
-    /// snapshot policy, or, under plain `NewestSnapshotWins`, one behind a newer
-    /// generation that has not answered that it holds nothing (that one clears
-    /// once it does, and never if it never does). Skip it on this call; the
-    /// reason is in the string.
+    /// must not write from now: one not in the lineage the app passed, one a newer
+    /// generation's data supersedes under a snapshot policy, or, under plain
+    /// `NewestSnapshotWins`, one behind a newer generation that has not answered
+    /// that it holds nothing (that one clears once it does, and never if it never
+    /// does). Skip it on this call; the reason is in the string.
     NotImportable(String),
 }
 

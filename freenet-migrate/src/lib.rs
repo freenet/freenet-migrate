@@ -110,9 +110,10 @@ pub use driver::{
 };
 pub use error::MigrateError;
 pub use journal::{
-    journal_status, ImportFlag, JournalBinding, JournalDecodeError, JournalEntry, JournalError,
-    JournalResolution, JournalState, JournalStatus, JournaledSuccessorIo, MigrationJournal,
-    PendingPredecessor, PolicyFamily, MIGRATION_JOURNAL_KEY, MIGRATION_JOURNAL_VERSION,
+    journal_status, AppImport, ImportFlag, JournalBinding, JournalDecodeError, JournalEntry,
+    JournalError, JournalResolution, JournalState, JournalStatus, JournaledSuccessorIo,
+    MigrationJournal, PendingPredecessor, PolicyFamily, MIGRATION_JOURNAL_KEY,
+    MIGRATION_JOURNAL_VERSION,
 };
 pub use lineage::{ContractLineageEntry, DelegateLineageEntry, Lineage};
 pub use pointer::{

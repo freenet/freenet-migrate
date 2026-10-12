@@ -1798,10 +1798,13 @@ fn status_with_unverified(
 /// [`JournalStatus::interrupted_import`] reports that the successor may hold a
 /// partial copy.
 ///
-/// A predecessor whose import already completed (its `Done` marker records data,
-/// or the journal resolves it with its data) is refused, with nothing recorded:
-/// its data is in the successor, and writing it again could bring back keys the
-/// user deleted since. The walk does not offer it again either.
+/// Returns [`AppImport::Flagged`](crate::AppImport::Flagged) when it recorded the
+/// flag: write the data. For a predecessor whose import already completed (its
+/// `Done` marker records data, or the journal resolves it with its data) it
+/// records nothing and returns
+/// [`AppImport::AlreadyImported`](crate::AppImport::AlreadyImported): the walk will
+/// not offer it again, and whether to write it again (filling a gap, or bringing
+/// back a key deleted since) is the app's call, set out on that variant.
 ///
 /// Under a snapshot policy this holds the app to what the walk would import,
 /// with one gap: under `NewestSnapshotWinsContinuePastUnresponsive` it refuses
@@ -1827,26 +1830,20 @@ fn status_with_unverified(
 /// nothing. The last clears once that generation answers "nothing" (its empty
 /// seal); if it never answers, it never clears, and the walk halts there too.
 /// Treat every `Err` alike: skip this predecessor now, and try again on a later
-/// load.
+/// load. Under a snapshot policy, skip every older one for this load too: the
+/// walk does not go past a newer generation it has not dealt with.
 pub async fn note_app_import_started<W>(
     successor: &mut W,
     predecessors: &[DelegateLineageEntry],
     predecessor: &DelegateKey,
     policy: &SecretSelectionPolicy,
-) -> Result<(), JournalError>
+) -> Result<crate::journal::AppImport, JournalError>
 where
     W: JournaledSuccessorIo,
     W::Error: core::fmt::Debug,
 {
     let begin_first =
         |why: &str| JournalError::Successor(format!("{why}; call begin_migration_journal first"));
-    let already_imported = || {
-        JournalError::NotImportable(
-            "its import already completed: its data is in the successor, and writing it \
-             again could bring back keys deleted since"
-                .to_string(),
-        )
-    };
     let Some(generation) = predecessors
         .iter()
         .find(|e| lineage_key(e) == *predecessor)
@@ -1942,13 +1939,13 @@ where
     journal.rebind(&binding);
     // Already imported, as the journal records it under this binding (an import
     // with rejections at the current revision has no `Done` marker): the walk does
-    // not offer it again, and neither may the app, or a key deleted since comes
-    // back.
+    // not offer it again. Nothing is recorded; whether to write it again is the
+    // app's call (see `AppImport::AlreadyImported`).
     if matches!(
         journal.entry(predecessor).map(|e| e.state),
         Some(JournalState::Resolved(r)) if r.is_data_bearing()
     ) {
-        return Err(already_imported());
+        return Ok(crate::journal::AppImport::AlreadyImported);
     }
     let query = MarkerQuery {
         predecessor,
@@ -1978,7 +1975,7 @@ where
                     .to_string(),
             ));
         }
-        return Err(already_imported());
+        return Ok(crate::journal::AppImport::AlreadyImported);
     }
     // The journal first: a kill before the marker leaves the flag, which the walk
     // honours on its own; the other order would leave a journal still reading the
@@ -1993,7 +1990,9 @@ where
     // The marker must read back as recorded (the `migration_marker` contract), or
     // a lost journal would strand what the app is about to write.
     match successor.migration_marker(&query).await {
-        Ok(Some(MigrationMarker::InProgress { saw_data: true })) => Ok(()),
+        Ok(Some(MigrationMarker::InProgress { saw_data: true })) => {
+            Ok(crate::journal::AppImport::Flagged)
+        }
         other => Err(JournalError::Successor(format!(
             "the marker store reads {other:?} after recording an in-progress data marker \
              (see the SuccessorSecretsIo::migration_marker contract)"
@@ -3351,6 +3350,7 @@ mod tests {
         done_marker, import_predecessor_secrets_once, pred_done_marker, pred_wip_marker,
         predecessor_done_marker, PredecessorImportOutcome, PRED_DONE_MARKER_KEY_PREFIX,
     };
+    use crate::AppImport;
     use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
     // ---- test successor store -------------------------------------------------
@@ -8998,8 +8998,8 @@ mod tests {
         ));
     }
 
-    /// An app flag on an already imported predecessor is refused (writing it again
-    /// could bring back keys deleted since) and changes nothing.
+    /// An app flag on an already imported predecessor is reported as such (the app
+    /// decides whether to write it again) and changes nothing.
     #[test]
     fn an_app_flag_does_not_reopen_an_imported_predecessor() {
         let lineage = [entry(1, 1)];
@@ -9014,7 +9014,7 @@ mod tests {
                 &k,
                 &union(),
             )),
-            Err(JournalError::NotImportable(_))
+            Ok(AppImport::AlreadyImported)
         ));
         assert!(stored_status(&store, &lineage).is_complete());
     }
@@ -9320,7 +9320,7 @@ mod tests {
                 &k,
                 &union(),
             )),
-            Err(JournalError::NotImportable(_))
+            Ok(AppImport::AlreadyImported)
         ));
         assert_eq!(store.get_secret(MIGRATION_JOURNAL_KEY), journal_before);
         assert!(stored_status(&store, &lineage).is_complete());
@@ -9674,7 +9674,7 @@ mod tests {
         let before = writer.markers_recorded.len();
         assert!(matches!(
             block_on(note_app_import_started(&mut writer, &lineage, &k, &union())),
-            Err(JournalError::NotImportable(_))
+            Ok(AppImport::AlreadyImported)
         ));
         assert_eq!(writer.markers_recorded.len(), before);
     }
@@ -12091,8 +12091,8 @@ mod tests {
             &newest(),
         ));
         assert!(
-            matches!(&r, Err(JournalError::NotImportable(m)) if m.contains("already completed")),
-            "a completed own-generation import is refused as already imported: {r:?}"
+            matches!(r, Ok(AppImport::AlreadyImported)),
+            "a completed own-generation import is reported as already imported: {r:?}"
         );
         assert_eq!(store.get_secret(MIGRATION_JOURNAL_KEY), before);
         // (b) a newer NoData resolution does not supersede an older generation
@@ -13362,7 +13362,7 @@ mod tests {
         lineage: &[DelegateLineageEntry],
         k: &DelegateKey,
         policy: &SecretSelectionPolicy,
-    ) -> Result<(), JournalError> {
+    ) -> Result<AppImport, JournalError> {
         block_on(note_app_import_started(
             &mut store_io(store),
             lineage,
@@ -13809,11 +13809,11 @@ mod tests {
     }
 
     /// A predecessor resolved as imported with rejections at the current revision
-    /// has no `Done` marker; an app flag on it is still refused as already
+    /// has no `Done` marker; an app flag on it is still reported as already
     /// imported (the walk does not offer it again either), and nothing is
     /// recorded. A higher revision reopens it, and then the flag is taken.
     #[test]
-    fn an_app_flag_on_an_import_with_rejections_at_the_current_revision_is_refused() {
+    fn an_app_flag_on_an_import_with_rejections_at_the_current_revision_is_already_imported() {
         let g1 = entry(1, 1);
         let lineage = [g1];
         let mut w = InspectingWriter::new(&lineage);
@@ -13835,10 +13835,7 @@ mod tests {
             &key_of(&g1),
             &union(),
         ));
-        assert!(
-            matches!(&r, Err(JournalError::NotImportable(m)) if m.contains("already completed")),
-            "{r:?}"
-        );
+        assert!(matches!(r, Ok(AppImport::AlreadyImported)), "{r:?}");
         assert_eq!(
             (
                 w.store.get_secret(MIGRATION_JOURNAL_KEY),
@@ -13863,7 +13860,7 @@ mod tests {
     /// the data checks. These probes therefore make every other newer generation
     /// known-empty and assert the refusal REASON is the data, under both snapshot
     /// policies, for every way the guard can learn a newer generation holds data.
-    fn r14_reason(r: Result<(), JournalError>, ctx: &str) {
+    fn r14_reason(r: Result<AppImport, JournalError>, ctx: &str) {
         match r {
             Err(JournalError::NotImportable(m)) => assert!(
                 m.contains("authoritative snapshot"),
@@ -14038,9 +14035,9 @@ mod tests {
 
     /// A predecessor sealed with its data in the successor while its journal entry
     /// is still pending (the walk's final journal store failed): an app flag is
-    /// refused as already imported, and nothing is recorded.
+    /// reported as already imported, and nothing is recorded.
     #[test]
-    fn an_app_flag_on_a_sealed_import_the_journal_missed_is_refused() {
+    fn an_app_flag_on_a_sealed_import_the_journal_missed_is_already_imported() {
         let g1 = entry(1, 1);
         let lineage = [g1];
         let mut store = MemStore::default();
@@ -14053,10 +14050,7 @@ mod tests {
         store.set_secret(&pred_done_marker(&key_of(&g1)), PRED_DONE_MARKER_VALUE_DATA);
         let before = store.data.clone();
         let r = r12_flag(&mut store, &lineage, &key_of(&g1), &union());
-        assert!(
-            matches!(&r, Err(JournalError::NotImportable(m)) if m.contains("already completed")),
-            "{r:?}"
-        );
+        assert!(matches!(r, Ok(AppImport::AlreadyImported)), "{r:?}");
         assert_eq!(store.data, before, "nothing recorded");
     }
 }
