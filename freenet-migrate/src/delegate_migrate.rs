@@ -3358,6 +3358,18 @@ mod tests {
         predecessor_done_marker, PredecessorImportOutcome, PRED_DONE_MARKER_KEY_PREFIX,
     };
     use crate::AppImport;
+
+    /// A test-only pin: an `Ok` from `note_app_import_started` that the test treats
+    /// as "flagged, write it" must BE `AppImport::Flagged`, not merely `Ok`.
+    trait ExpectFlagged {
+        fn expect_flagged(self, why: &str);
+    }
+    impl ExpectFlagged for Result<AppImport, JournalError> {
+        #[track_caller]
+        fn expect_flagged(self, why: &str) {
+            assert_eq!(self.expect(why), AppImport::Flagged, "{why}");
+        }
+    }
     use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
     // ---- test successor store -------------------------------------------------
@@ -7816,7 +7828,7 @@ mod tests {
             &k,
             &union(),
         ))
-        .expect("flag");
+        .expect_flagged("flag");
         assert!(stored_status(&store, &lineage).interrupted_import());
         let mut io = MockIo::default().executable_with(&k, &[(b"room:a", b"A")]);
         assert!(complete(&journaled(&mut store, &mut io, &lineage, union())));
@@ -8274,7 +8286,7 @@ mod tests {
             &k,
             &union(),
         ))
-        .expect("flag");
+        .expect_flagged("flag");
         let run = journaled(
             &mut store,
             &mut MockIo::default().executable_with(&k, &[]),
@@ -8698,7 +8710,7 @@ mod tests {
             &k,
             &union(),
         ))
-        .expect("flag");
+        .expect_flagged("flag");
         let mut io = MockIo::default().executable_with(&k, &[(b"room:a", b"A")]);
         let run = journaled(&mut store, &mut io, &lineage, union());
         assert!(io.fetched.contains(k.bytes()), "asked again");
@@ -8731,7 +8743,7 @@ mod tests {
             &key_of(&new),
             &policy(),
         ))
-        .expect("flag");
+        .expect_flagged("flag");
         store.set_secret(b"room:b", b"new");
         let mut io = MockIo::default()
             .dead(&key_of(&new))
@@ -9102,7 +9114,7 @@ mod tests {
             &k,
             &union(),
         ))
-        .expect("flag");
+        .expect_flagged("flag");
         store.set_secret(MIGRATION_JOURNAL_KEY, b"\xa1\x61v\x01garbage");
         let run = journaled(
             &mut store,
@@ -9246,7 +9258,7 @@ mod tests {
                 &k,
                 &union(),
             ))
-            .expect("flag");
+            .expect_flagged("flag");
             store.set_secret(b"room:a", b"A");
             let mut store = if corrupt {
                 store.set_secret(MIGRATION_JOURNAL_KEY, b"\xa1\x61v\x01garbage");
@@ -9301,7 +9313,8 @@ mod tests {
         let mut io = MockIo::default().executable_with(&k, &[(b"room:a", b"A"), (b"room:x", b"?")]);
         assert!(complete(&writer.run(&mut io, union())));
         writer.revision = 1;
-        block_on(note_app_import_started(&mut writer, &lineage, &k, &union())).expect("flag");
+        block_on(note_app_import_started(&mut writer, &lineage, &k, &union()))
+            .expect_flagged("flag");
         let status = journal_status(
             writer.store.get_secret(MIGRATION_JOURNAL_KEY).as_deref(),
             &lineage,
@@ -9743,7 +9756,7 @@ mod tests {
             &k3,
             &union(),
         ))
-        .expect("flag");
+        .expect_flagged("flag");
         assert!(
             stored_status(&store, &lineage).interrupted_import(),
             "{:?}",
@@ -9819,7 +9832,7 @@ mod tests {
             &k,
             &union(),
         ))
-        .expect("flag");
+        .expect_flagged("flag");
         assert!(stored_status(&store, &lineage).interrupted_import());
     }
 
@@ -9915,7 +9928,7 @@ mod tests {
             &key_of(&g7),
             &newest(),
         ))
-        .expect("flag");
+        .expect_flagged("flag");
         assert!(stored_status(&store, &lineage).interrupted_import());
     }
 
@@ -10350,7 +10363,7 @@ mod tests {
             &k3,
             &union(),
         ))
-        .expect("flag");
+        .expect_flagged("flag");
         // The app writes one of two rooms, then the tab dies.
         store.set_secret(b"room:old1", b"O1");
         assert!(stored_status(&store, &lineage).interrupted_import());
@@ -11371,7 +11384,7 @@ mod tests {
             &k3,
             &union(),
         ))
-        .expect("flag under Union");
+        .expect_flagged("flag under Union");
         assert!(stored_status(&store, &lineage).interrupted_import());
     }
 
@@ -11643,9 +11656,10 @@ mod tests {
         let k = key_of(&lineage[0]);
         let mut w = InspectingWriter::new(&lineage);
         block_on(begin_migration_journal(&mut w, &lineage, &union())).expect("begin");
-        block_on(note_app_import_started(&mut w, &lineage, &k, &union())).expect("flag");
+        block_on(note_app_import_started(&mut w, &lineage, &k, &union())).expect_flagged("flag");
         let before = w.journal_stores;
-        block_on(note_app_import_started(&mut w, &lineage, &k, &union())).expect("flag again");
+        block_on(note_app_import_started(&mut w, &lineage, &k, &union()))
+            .expect_flagged("flag again");
         assert_eq!(w.journal_stores, before);
     }
 
@@ -11691,7 +11705,7 @@ mod tests {
             &k,
             &union(),
         ))
-        .expect("flag");
+        .expect_flagged("flag");
         store.set_secret(b"room:a", b"A");
         // Tab B, which read the journal before A's flag, stores its stale view.
         store.set_secret(MIGRATION_JOURNAL_KEY, &stale);
@@ -11767,7 +11781,7 @@ mod tests {
             &key_of(&g1),
             &union(),
         ))
-        .expect("flag under Union");
+        .expect_flagged("flag under Union");
     }
 
     // ---- round-9 probes ---------------------------------------------------------
@@ -12131,7 +12145,7 @@ mod tests {
             &key_of(&g1),
             &newest(),
         ))
-        .expect("a newer EMPTY generation does not supersede");
+        .expect_flagged("a newer EMPTY generation does not supersede");
         assert!(stored_status(&store, &lineage).interrupted_import());
         // (c) a newer rejection-resolved generation holds data and does supersede
         let mut store = MemStore::default();
@@ -12914,7 +12928,7 @@ mod tests {
             &key_of(&x),
             &union(),
         ))
-        .expect("owed under Union");
+        .expect_flagged("owed under Union");
     }
 
     /// An entry the start could not check, re-read successfully after the walk and
@@ -13268,7 +13282,7 @@ mod tests {
             if policy.unresponsive_terminates(false) {
                 assert!(matches!(r, Err(JournalError::NotImportable(_))), "{r:?}");
             } else {
-                r.expect("the continue-past policy imports past a silent newer generation");
+                r.expect_flagged("the continue-past policy imports past a silent newer generation");
             }
             let mut store = MemStore::default();
             block_on(begin_migration_journal(
@@ -13294,7 +13308,7 @@ mod tests {
                 &key_of(&g1),
                 &union(),
             ))
-            .expect("owed under Union");
+            .expect_flagged("owed under Union");
         }
     }
 
@@ -13329,7 +13343,7 @@ mod tests {
             &key_of(&a1),
             &union(),
         ))
-        .expect("accepted");
+        .expect_flagged("accepted");
         assert!(matches!(
             state_of(&store, &a1),
             JournalState::Pending {
@@ -13398,7 +13412,7 @@ mod tests {
             ))
             .expect("begin");
             let stale = store.get_secret(MIGRATION_JOURNAL_KEY).unwrap();
-            r12_flag(&mut store, &lineage, &key_of(&g2), &make()).expect("flag g2");
+            r12_flag(&mut store, &lineage, &key_of(&g2), &make()).expect_flagged("flag g2");
             store.set_secret(MIGRATION_JOURNAL_KEY, &stale);
             let before = (
                 store.get_secret(MIGRATION_JOURNAL_KEY),
@@ -13442,7 +13456,7 @@ mod tests {
             &pred_done_marker(&key_of(&g2)),
             PRED_DONE_MARKER_VALUE_EMPTY,
         );
-        r12_flag(&mut store, &lineage, &key_of(&g1), &newest()).expect("not superseded");
+        r12_flag(&mut store, &lineage, &key_of(&g1), &newest()).expect_flagged("not superseded");
     }
 
     /// A newer generation imported with permanent rejections, reopened by a higher
@@ -13578,7 +13592,8 @@ mod tests {
                     // (flagged under the continue-past policy, which imports past a
                     // newer generation that has not answered)
                     1 => {
-                        r12_flag(&mut store, &lineage, &key_of(&g1), &r10_cpu()).expect("g1");
+                        r12_flag(&mut store, &lineage, &key_of(&g1), &r10_cpu())
+                            .expect_flagged("g1");
                     }
                     // only its marker records data
                     _ => {
@@ -13589,7 +13604,7 @@ mod tests {
                     }
                 }
                 r12_flag(&mut store, &lineage, &key_of(&g2), &make())
-                    .expect("the newest generation is never superseded by an older one");
+                    .expect_flagged("the newest generation is never superseded by an older one");
                 assert!(matches!(
                     state_of(&store, &g2),
                     JournalState::Pending {
@@ -13625,7 +13640,7 @@ mod tests {
                     "{r:?}"
                 );
             } else {
-                r.expect("a newer generation that saw nothing supersedes nothing");
+                r.expect_flagged("a newer generation that saw nothing supersedes nothing");
             }
         }
     }
@@ -13689,7 +13704,7 @@ mod tests {
             &newest(),
         ))
         .expect("begin");
-        r12_flag(&mut store, &[g1, g2], &key_of(&g1), &r10_cpu()).expect("accepted");
+        r12_flag(&mut store, &[g1, g2], &key_of(&g1), &r10_cpu()).expect_flagged("accepted");
         let r = r12_flag(&mut store, &[g1, g2], &key_of(&g1), &newest());
         assert!(
             matches!(&r, Err(JournalError::NotImportable(m)) if m.contains("has not answered")),
@@ -13745,7 +13760,7 @@ mod tests {
                             );
                         } else {
                             r12_flag(&mut store, &lineage, &key_of(&h), &r10_cpu())
-                                .expect("holder");
+                                .expect_flagged("holder");
                         }
                         let r = r12_flag(&mut store, &lineage, &key_of(&g1), &make());
                         assert!(
@@ -13773,7 +13788,7 @@ mod tests {
             &key_of(&g2),
             &newest(),
         ))
-        .expect("g2");
+        .expect_flagged("g2");
         w.fail_marker_read.insert(key_of(&g2).bytes().to_vec());
         let r = block_on(note_app_import_started(
             &mut w,
@@ -13803,7 +13818,7 @@ mod tests {
         );
         let mut contradicted = store.clone();
         let mut unsealed = store.clone();
-        r12_flag(&mut store, &lineage, &key_of(&g1), &newest()).expect("accepted");
+        r12_flag(&mut store, &lineage, &key_of(&g1), &newest()).expect_flagged("accepted");
         contradicted.set_secret(&pred_wip_marker(&key_of(&g2)), PRED_DONE_MARKER_VALUE_DATA);
         // The reason matters: plain NSW would also refuse this as "has not answered"
         // if the data arm were broken, which would hide it.
@@ -13864,7 +13879,7 @@ mod tests {
             &key_of(&g1),
             &union(),
         ))
-        .expect("reopened by the higher revision");
+        .expect_flagged("reopened by the higher revision");
     }
 
     // ---- round-14 probes --------------------------------------------------------
@@ -13947,7 +13962,8 @@ mod tests {
                         match source {
                             2 => {
                                 // a journal flag with no marker behind it
-                                r12_flag(&mut store, &lineage, &hk, &r10_cpu()).expect("holder");
+                                r12_flag(&mut store, &lineage, &hk, &r10_cpu())
+                                    .expect_flagged("holder");
                                 store.data.remove(&pred_wip_marker(&hk));
                             }
                             3 => {
@@ -14159,5 +14175,272 @@ mod tests {
             r15_already_completed(&r, name);
             assert_eq!(store.data, before, "{name}: nothing recorded");
         }
+    }
+
+    // ---- round-16 probes ----------------------------------------------------------
+
+    /// A fresh flag returns `Flagged` (not `AlreadyImported`) over every marker
+    /// state the predecessor can already be in, under every policy, and records
+    /// the flag in the journal and as a data-bearing in-progress marker. Before
+    /// this, a flag over an EMPTY in-progress marker (an import that saw nothing
+    /// and died) could return the wrong variant with every test green: an app
+    /// that skips `AlreadyImported` would then never write data the journal now
+    /// says is being written.
+    #[test]
+    fn r16_p1_a_fresh_flag_returns_flagged_over_every_prior_marker_state() {
+        for (name, make) in [
+            ("union", union as fn() -> SecretSelectionPolicy),
+            ("nsw", newest),
+            ("nsw_cpu", r10_cpu),
+        ] {
+            for prior in ["none", "wip_empty", "wip_data", "done_empty"] {
+                let g1 = entry(1, 1);
+                let lineage = [g1];
+                let k = key_of(&g1);
+                let mut store = MemStore::default();
+                match prior {
+                    "wip_empty" => {
+                        store.set_secret(&pred_wip_marker(&k), PRED_DONE_MARKER_VALUE_EMPTY);
+                    }
+                    "wip_data" => {
+                        store.set_secret(&pred_wip_marker(&k), PRED_DONE_MARKER_VALUE_DATA);
+                    }
+                    "done_empty" => {
+                        store.set_secret(&pred_done_marker(&k), PRED_DONE_MARKER_VALUE_EMPTY);
+                    }
+                    _ => {}
+                }
+                block_on(begin_migration_journal(
+                    &mut store_io(&mut store),
+                    &lineage,
+                    &make(),
+                ))
+                .expect("begin");
+                let r = r12_flag(&mut store, &lineage, &k, &make());
+                assert_eq!(
+                    r.as_ref().ok(),
+                    Some(&AppImport::Flagged),
+                    "{name}/{prior}: {r:?}"
+                );
+                assert_eq!(
+                    store.get_secret(&pred_wip_marker(&k)).as_deref(),
+                    Some(PRED_DONE_MARKER_VALUE_DATA),
+                    "{name}/{prior}: data-bearing in-progress marker"
+                );
+                assert!(
+                    stored_status(&store, &lineage).interrupted_import(),
+                    "{name}/{prior}"
+                );
+            }
+        }
+    }
+
+    /// A legacy `done:<n>` seal for the predecessor's OWN generation is its own
+    /// seal (`AlreadyImported`, nothing recorded), under every policy, with the
+    /// journal entry still pending; a legacy seal for a NEWER generation is a
+    /// supersession (`NotImportable`) under the snapshot policies and the
+    /// predecessor's own seal under Union. The pre-existing legacy tests only
+    /// pin the `Err` side, so a change that turned the own-generation legacy
+    /// seal into `NotImportable` (an app then never re-fills a short export from
+    /// a pre-journal build's import) passed.
+    #[test]
+    fn r16_p2_a_legacy_seal_for_the_own_generation_is_already_imported_one_above_is_not() {
+        for (name, make) in [
+            ("union", union as fn() -> SecretSelectionPolicy),
+            ("nsw", newest),
+            ("nsw_cpu", r10_cpu),
+        ] {
+            for seal_gen in [3u32, 4, 7] {
+                let g3 = entry(3, 3);
+                let lineage = [g3];
+                let k = key_of(&g3);
+                let mut store = MemStore::default();
+                block_on(begin_migration_journal(
+                    &mut store_io(&mut store),
+                    &lineage,
+                    &make(),
+                ))
+                .expect("begin");
+                // The journal missed the seal (written after `begin`, or its store failed).
+                store.set_secret(&done_marker(seal_gen), b"1");
+                let before = store.data.clone();
+                let r = r12_flag(&mut store, &lineage, &k, &make());
+                match (name == "union", seal_gen == 3) {
+                    (_, true) => r15_already_completed(&r, &format!("{name} seal {seal_gen}")),
+                    // Union: a legacy seal for another generation seals nothing here.
+                    (true, false) => {
+                        assert_eq!(
+                            r.as_ref().ok(),
+                            Some(&AppImport::Flagged),
+                            "{name} seal {seal_gen}: {r:?}"
+                        );
+                        continue;
+                    }
+                    (false, false) => assert!(
+                        matches!(&r, Err(JournalError::NotImportable(m)) if m.contains("legacy seal")),
+                        "{name} seal {seal_gen}: {r:?}"
+                    ),
+                }
+                assert_eq!(
+                    store.data, before,
+                    "{name} seal {seal_gen}: nothing recorded"
+                );
+            }
+        }
+    }
+
+    /// The "rejections at the current revision" completed import, under EVERY
+    /// policy (the pin above is Union only): `AlreadyImported`, nothing recorded; a
+    /// higher revision reopens the rejection and the flag is `Flagged`.
+    #[test]
+    fn r16_p3_an_import_with_rejections_is_already_imported_under_every_policy() {
+        for (name, make) in [
+            ("union", union as fn() -> SecretSelectionPolicy),
+            ("nsw", newest),
+            ("nsw_cpu", r10_cpu),
+        ] {
+            let g1 = entry(1, 1);
+            let lineage = [g1];
+            let mut w = InspectingWriter::new(&lineage);
+            w.permanent_fail.insert(b"room:x".to_vec());
+            let mut io = MockIo::default()
+                .executable_with(&key_of(&g1), &[(b"room:x", b"X"), (b"room:y", b"Y")]);
+            let _ = w.run(&mut io, make());
+            assert!(
+                matches!(
+                    state_of(&w.store, &g1),
+                    JournalState::Resolved(JournalResolution::ImportedWithRejections { .. })
+                ),
+                "{name}"
+            );
+            let before = w.store.data.clone();
+            let r = block_on(note_app_import_started(
+                &mut w,
+                &lineage,
+                &key_of(&g1),
+                &make(),
+            ));
+            r15_already_completed(&r, name);
+            assert_eq!(w.store.data, before, "{name}: nothing recorded");
+            w.revision = 1;
+            block_on(note_app_import_started(
+                &mut w,
+                &lineage,
+                &key_of(&g1),
+                &make(),
+            ))
+            .expect_flagged(name);
+        }
+    }
+
+    /// A legacy `done:5` seal sits above a two-generation lineage. Under both
+    /// snapshot policies the newest listed generation (g4) is superseded by it
+    /// (`legacy seal`), and so is g3 (under the continue-past policy the legacy
+    /// branch is the only thing that refuses it; plain NewestSnapshotWins refuses
+    /// it earlier, as behind a generation that has not answered). Every existing
+    /// legacy-refusal pin used a one-entry lineage, so a legacy refusal that only
+    /// fires for `predecessors.len() == 1` passed, and an app would be told
+    /// `AlreadyImported` (re-merge it) for a generation a newer one supersedes.
+    #[test]
+    fn r16_p4_a_legacy_seal_above_a_longer_lineage_refuses_every_listed_generation() {
+        for (name, make) in [
+            ("nsw", newest as fn() -> SecretSelectionPolicy),
+            ("nsw_cpu", r10_cpu),
+        ] {
+            let (g3, g4) = (entry(3, 3), entry(4, 4));
+            let lineage = [g3, g4];
+            let mut store = MemStore::default();
+            block_on(begin_migration_journal(
+                &mut store_io(&mut store),
+                &lineage,
+                &make(),
+            ))
+            .expect("begin");
+            store.set_secret(&done_marker(5), b"1");
+            let before = store.data.clone();
+            for g in [g4, g3] {
+                let r = r12_flag(&mut store, &lineage, &key_of(&g), &make());
+                assert!(
+                    matches!(&r, Err(JournalError::NotImportable(_))),
+                    "{name} g{}: {r:?}",
+                    g.generation
+                );
+                if g.generation == 4 || name == "nsw_cpu" {
+                    assert!(
+                        matches!(&r, Err(JournalError::NotImportable(m)) if m.contains("legacy seal")),
+                        "{name} g{}: {r:?}",
+                        g.generation
+                    );
+                }
+            }
+            assert_eq!(store.data, before, "{name}: nothing recorded");
+        }
+    }
+
+    /// A read-back fault after the flag was recorded is a store fault
+    /// (`JournalError::Successor`), never a `NotImportable` verdict about the
+    /// predecessor: the two are told apart by variant, and the existing pins use
+    /// `.is_err()` for these paths, so reclassifying either passed.
+    #[test]
+    fn r16_p5_a_marker_store_fault_is_a_successor_error_not_a_refusal() {
+        // read-back read fails
+        let e = entry(1, 1);
+        let mut w = Quirky::default();
+        let mut io = MockIo::default().executable_with(&key_of(&e), &[]);
+        run_q(&mut w, &mut io, &[e], union());
+        w.fail_reads_after_record = true;
+        w.recorded = false;
+        let r = block_on(note_app_import_started(&mut w, &[e], &key_of(&e), &union()));
+        assert!(matches!(r, Err(JournalError::Successor(_))), "{r:?}");
+        // read-back reads a dropped data flag
+        let e = entry(1, 1);
+        let mut w = Quirky::default();
+        let mut io = MockIo::default().executable_with(&key_of(&e), &[]);
+        run_q(&mut w, &mut io, &[e], union());
+        let f = entry(2, 2);
+        block_on(begin_migration_journal(&mut w, &[e, f], &union())).unwrap();
+        w.drop_data_flag = true;
+        let r = block_on(note_app_import_started(
+            &mut w,
+            &[e, f],
+            &key_of(&f),
+            &union(),
+        ));
+        assert!(matches!(r, Err(JournalError::Successor(_))), "{r:?}");
+    }
+
+    /// Another session completes the predecessor's import (with rejections: no
+    /// `Done` marker) after this call loaded the journal: the store's re-read
+    /// brings that resolution in, and the call reports `AlreadyImported` without
+    /// recording a marker.
+    #[test]
+    fn a_completion_brought_in_by_the_flags_own_store_is_already_imported() {
+        let g1 = entry(1, 1);
+        let lineage = [g1];
+        let k = key_of(&g1);
+        let mut w = InspectingWriter::new(&lineage);
+        block_on(begin_migration_journal(&mut w, &lineage, &union())).expect("begin");
+        let mut theirs = MigrationJournal::new_pending(&lineage);
+        theirs.record(
+            &k,
+            1,
+            RunOutcome::Resolved(JournalResolution::ImportedWithRejections {
+                rejected: 1,
+                revision: 0,
+            }),
+        );
+        w.inject_at_first_marker_read = Some(theirs.encode());
+        let markers_before = w.markers_recorded.len();
+        let r = block_on(note_app_import_started(&mut w, &lineage, &k, &union()));
+        assert!(matches!(r, Ok(AppImport::AlreadyImported)), "{r:?}");
+        assert_eq!(
+            w.markers_recorded.len(),
+            markers_before,
+            "no marker recorded"
+        );
+        assert!(matches!(
+            state_of(&w.store, &g1),
+            JournalState::Resolved(JournalResolution::ImportedWithRejections { .. })
+        ));
     }
 }
