@@ -15211,12 +15211,14 @@ mod tests {
         let k = key_of(&g1);
         let mut w = InspectingWriter::new(&lineage);
         block_on(begin_migration_journal(&mut w, &lineage, &union())).expect("begin");
+        // This session's own count matches the short export, so nothing it does
+        // raises it: only the re-read before the first item sees the other's.
         let _ = block_on(note_app_import_started(
             &mut w,
             &lineage,
             &k,
             &union(),
-            None,
+            Some(1),
         ))
         .expect("flag");
         w.store.set_secret(b"room:a", b"A");
