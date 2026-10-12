@@ -556,9 +556,11 @@ pub enum PredecessorImportOutcome {
     /// written (idempotent re-run, no resurrection).
     AlreadyMigrated,
     /// At least one `set_secret` write failed (or the completion marker could
-    /// not be written). The completion marker was deliberately withheld, so the
-    /// migration is left in its in-progress state and a retry re-runs it. A
-    /// failed write is never counted as imported.
+    /// not be written), or — with every count zero — the predecessor exported
+    /// nothing although an earlier attempt saw data, which is not believed. The
+    /// completion marker was deliberately withheld, so the migration is left in
+    /// its in-progress state and a retry re-runs it. A failed write is never
+    /// counted as imported.
     Incomplete {
         /// Secrets successfully written on this attempt.
         imported: usize,
@@ -638,17 +640,30 @@ pub fn import_predecessor_secrets_once<S: SecretStore + ?Sized>(
     // The data/empty decision is **sticky-data** across a retry: a predecessor is
     // sealed data-bearing if ANY attempt saw real data. A surviving WIP marker
     // from an earlier (Incomplete) attempt carries that attempt's flag; this
-    // attempt ORs its own observation onto it. So BOTH retry directions are safe —
-    // data-then-empty keeps its data flag, and empty-then-data upgrades to data —
-    // and neither can seal the marker "empty" while data was imported, which would
-    // make NewestSnapshotWins misclassify NoData and fall through to older
-    // generations (resurrection). First attempt: just this call's observation.
+    // attempt ORs its own observation onto it, so empty-then-data upgrades to
+    // data and the marker can never be sealed "empty" while data was imported
+    // (which would make NewestSnapshotWins misclassify NoData and fall through to
+    // older generations: resurrection). First attempt: just this call's
+    // observation.
     let wip_marker = pred_wip_marker(predecessor);
     let current_had_data = secrets.iter().any(|(k, _)| !is_marker(k));
-    let had_data = match store.get_secret(&wip_marker) {
-        Some(flag) => (flag != PRED_DONE_MARKER_VALUE_EMPTY) || current_had_data,
-        None => current_had_data,
-    };
+    let prior_saw_data = store
+        .get_secret(&wip_marker)
+        .is_some_and(|flag| flag != PRED_DONE_MARKER_VALUE_EMPTY);
+    // Data-then-empty is NOT sealed. A frozen predecessor does not lose data, so
+    // an empty export after an attempt that saw data is the fault (freenet-core
+    // reports a secret it failed to read the same way as one that is absent).
+    // Sealing would leave the interrupted attempt's missing keys unasked forever;
+    // instead nothing is written and the in-progress marker stays for a retry,
+    // as `migrate_delegate_secrets` does.
+    if prior_saw_data && !current_had_data {
+        return PredecessorImportOutcome::Incomplete {
+            imported: 0,
+            skipped: 0,
+            failed: 0,
+        };
+    }
+    let had_data = prior_saw_data || current_had_data;
     let marker_value = if had_data {
         PRED_DONE_MARKER_VALUE_DATA
     } else {
@@ -1663,12 +1678,12 @@ mod tests {
     }
 
     #[test]
-    fn import_predecessor_retry_preserves_data_flag_after_incomplete() {
+    fn import_predecessor_data_then_empty_retry_is_not_sealed() {
         // P1 retry-flip (exact Codex order): attempt 1 is data-bearing but a write
-        // FAILS (Incomplete); the retry's re-export is EMPTY. The completion marker
-        // must stay DATA-bearing (preserved from the WIP marker written on attempt
-        // 1), NOT flip to empty — otherwise the predecessor would lose its
-        // NewestSnapshotWins authority on a later re-run.
+        // FAILS (Incomplete); the retry's re-export is EMPTY. That must neither
+        // flip the predecessor to empty (it would lose its NewestSnapshotWins
+        // authority) nor seal it over the missing key (freenet/freenet-migrate#38):
+        // it stays in progress until the data comes back.
         let key = dk(2);
         let mut store = MemStore::default();
         store.fail_writes_to(b"x");
@@ -1684,10 +1699,31 @@ mod tests {
             "no done marker yet"
         );
 
-        // Retry with an EMPTY re-export (the old delegate lost its data meanwhile).
+        // Retry with an EMPTY re-export: not believed (a frozen predecessor does
+        // not lose data; a failed read looks the same). Nothing is sealed, and the
+        // in-progress data flag survives.
         let retry = import_predecessor_secrets_once(&mut store, &key, &[]);
-        assert!(matches!(retry, PredecessorImportOutcome::Imported { .. }));
-        assert!(predecessor_already_migrated(&store, &key));
+        assert_eq!(
+            retry,
+            PredecessorImportOutcome::Incomplete {
+                imported: 0,
+                skipped: 0,
+                failed: 0
+            }
+        );
+        assert!(
+            !predecessor_already_migrated(&store, &key),
+            "an empty answer must not seal over the missing `x`"
+        );
+
+        // The data comes back: it imports, and the seal is data-bearing.
+        store.stop_failing();
+        let again =
+            import_predecessor_secrets_once(&mut store, &key, &[(b"x".to_vec(), b"vx".to_vec())]);
+        assert!(matches!(
+            again,
+            PredecessorImportOutcome::Imported { imported: 1, .. }
+        ));
         assert_eq!(
             predecessor_migration_had_data(&store, &key),
             Some(true),

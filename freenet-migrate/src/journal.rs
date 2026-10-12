@@ -107,8 +107,10 @@
 //! if the journal cannot be read or established, or the import flag cannot be
 //! stored before a predecessor's first item, that predecessor is not imported
 //! this run. A journal from a different encoding version is never overwritten.
-//! A corrupt one is replaced by a pessimistic one: every predecessor pending,
-//! with an import [`Suspected`](ImportFlag::Suspected) until it resolves.
+//! A corrupt one is rebuilt from the migration markers, which record every
+//! import that started (the app's too: [`crate::note_app_import_started`] writes
+//! the predecessor's in-progress marker), so nothing it said about a partial copy
+//! is lost.
 //!
 //! # What this does not do
 //!
@@ -189,29 +191,22 @@ impl JournalResolution {
 pub enum ImportFlag {
     /// No import from it is known to have started.
     None,
-    /// The journal that would have said was corrupt and has been replaced, so an
-    /// import may have started; nothing records whether it did. Cleared by any
-    /// resolution.
-    Suspected,
     /// An import from it started and has not completed: the walk's own, an
     /// earlier plain walk's (its in-progress marker survives), or the app's,
-    /// announced with [`crate::note_app_import_started`]. Cleared only by a
-    /// resolution that puts its data in the successor. A predecessor that had
-    /// data when the import started and answers "nothing" now is not believed.
+    /// announced with [`crate::note_app_import_started`]. Every one of these is
+    /// also recorded in the predecessor's in-progress migration marker, so a
+    /// corrupt journal is rebuilt with it.
+    ///
+    /// Cleared only by a resolution that puts the predecessor's data in the
+    /// successor. A predecessor that held data when the import started and
+    /// answers "nothing" now is not believed: the walk treats the answer as a
+    /// silence, and the entry stays pending.
     Started,
 }
 
 impl ImportFlag {
-    fn rank(self) -> u8 {
-        match self {
-            ImportFlag::None => 0,
-            ImportFlag::Suspected => 1,
-            ImportFlag::Started => 2,
-        }
-    }
-
     fn max(self, other: Self) -> Self {
-        if other.rank() > self.rank() {
+        if other == ImportFlag::Started {
             other
         } else {
             self
@@ -230,6 +225,11 @@ pub enum JournalState {
         /// Whether its items may be **partially** written to the successor right
         /// now.
         import: ImportFlag,
+        /// Items permanently rejected by the resolution this entry was reopened
+        /// from (a higher [`import_revision`](JournaledSuccessorIo::import_revision)
+        /// reopens an [`ImportedWithRejections`](JournalResolution::ImportedWithRejections)),
+        /// still not in the successor. `0` otherwise.
+        rejected: u32,
         /// How many consecutive journaled walks that examined it found it
         /// definitively not installed on the node
         /// ([`crate::ProbeVerdict::NotInstalled`]). Reset by any other unresolved
@@ -247,6 +247,7 @@ impl JournalState {
             attempts: 0,
             import: ImportFlag::None,
             absent_streak: 0,
+            rejected: 0,
         }
     }
 }
@@ -320,8 +321,9 @@ impl JournalBinding {
 /// * A resolution putting the data in the successor beats a pending entry. One
 ///   that does not beats a pending entry unless an import from it
 ///   [`Started`](ImportFlag::Started).
-/// * Between two pending entries, the stronger import flag and the larger
-///   attempt count win; the absent streak is the newer observation's.
+/// * Between two pending entries, the import flag is `Started` if either is,
+///   attempts and rejection counts take the maximum, and the absent streak is
+///   the newer observation's.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct MigrationJournal {
     entries: BTreeMap<[u8; 32], JournalEntry>,
@@ -354,7 +356,7 @@ struct WireEntry {
     /// 5 = superseded by authoritative. (3 is retired and rejected.)
     state: u8,
     attempts: u32,
-    /// 0 = none, 1 = suspected, 2 = started.
+    /// 0 = none, 1 = started.
     import: u8,
     absent_streak: u32,
     rejected: u32,
@@ -411,21 +413,6 @@ impl MigrationJournal {
         journal
     }
 
-    /// The journal that replaces a corrupt one: every predecessor pending, with
-    /// an import [`Suspected`](ImportFlag::Suspected), because the corrupt one may
-    /// have recorded one and nothing can tell which.
-    pub(crate) fn pessimistic(predecessors: &[DelegateLineageEntry]) -> Self {
-        let mut journal = Self::new_pending(predecessors);
-        for entry in journal.entries.values_mut() {
-            entry.state = JournalState::Pending {
-                attempts: 0,
-                import: ImportFlag::Suspected,
-                absent_streak: 0,
-            };
-        }
-        journal
-    }
-
     /// The state recorded for `predecessor`, if the journal has an entry for it.
     /// This is the stored state; [`status`](Self::status) is what applies under a
     /// binding.
@@ -453,36 +440,35 @@ impl MigrationJournal {
         let mut pending = Vec::new();
         let mut rejected = 0u32;
         for e in predecessors {
-            // The last recorded rejection count, whether or not the resolution
-            // still holds: a reopened rejection is still data that is not there.
-            if let Some(JournalEntry {
-                state:
-                    JournalState::Resolved(JournalResolution::ImportedWithRejections {
-                        rejected: n,
-                        ..
-                    }),
-                ..
-            }) = self.entries.get(&e.delegate_key)
-            {
-                rejected = rejected.saturating_add(*n);
-            }
-            let (attempts, import, absent_streak) =
-                match self.effective_state(&e.delegate_key, binding) {
-                    Some(JournalState::Resolved(_)) => continue,
-                    Some(JournalState::Pending {
+            match self.effective_state(&e.delegate_key, binding) {
+                Some(JournalState::Resolved(r)) => {
+                    if let JournalResolution::ImportedWithRejections { rejected: n, .. } = r {
+                        rejected = rejected.saturating_add(n);
+                    }
+                }
+                Some(JournalState::Pending {
+                    attempts,
+                    import,
+                    absent_streak,
+                    rejected: n,
+                }) => {
+                    rejected = rejected.saturating_add(n);
+                    pending.push(PendingPredecessor {
+                        key: lineage_key(e),
+                        generation: e.generation,
                         attempts,
                         import,
                         absent_streak,
-                    }) => (attempts, import, absent_streak),
-                    None => (0, ImportFlag::None, 0),
-                };
-            pending.push(PendingPredecessor {
-                key: lineage_key(e),
-                generation: e.generation,
-                attempts,
-                import,
-                absent_streak,
-            });
+                    });
+                }
+                None => pending.push(PendingPredecessor {
+                    key: lineage_key(e),
+                    generation: e.generation,
+                    attempts: 0,
+                    import: ImportFlag::None,
+                    absent_streak: 0,
+                }),
+            }
         }
         if pending.is_empty() {
             JournalStatus::Complete {
@@ -532,10 +518,12 @@ impl MigrationJournal {
                             attempts,
                             import,
                             absent_streak,
+                            rejected,
                         } => {
                             w.attempts = attempts;
-                            w.import = import.rank();
+                            w.import = u8::from(import == ImportFlag::Started);
                             w.absent_streak = absent_streak;
+                            w.rejected = rejected;
                         }
                         JournalState::Resolved(JournalResolution::Imported) => w.state = 1,
                         JournalState::Resolved(JournalResolution::NoData) => w.state = 2,
@@ -586,8 +574,7 @@ impl MigrationJournal {
                     attempts: w.attempts,
                     import: match w.import {
                         0 => ImportFlag::None,
-                        1 => ImportFlag::Suspected,
-                        2 => ImportFlag::Started,
+                        1 => ImportFlag::Started,
                         other => {
                             return Err(JournalDecodeError::Corrupt(format!(
                                 "unknown import flag {other}"
@@ -595,6 +582,7 @@ impl MigrationJournal {
                         }
                     },
                     absent_streak: w.absent_streak,
+                    rejected: w.rejected,
                 },
                 1 => JournalState::Resolved(JournalResolution::Imported),
                 2 => JournalState::Resolved(JournalResolution::NoData),
@@ -652,6 +640,7 @@ impl MigrationJournal {
                     attempts: 0,
                     import: ImportFlag::Started,
                     absent_streak: 0,
+                    rejected: 0,
                 };
                 true
             }
@@ -681,6 +670,7 @@ impl MigrationJournal {
                     attempts,
                     import,
                     absent_streak,
+                    rejected,
                 },
                 RunOutcome::Unresolved { absent },
             ) => JournalState::Pending {
@@ -691,6 +681,7 @@ impl MigrationJournal {
                 } else {
                     0
                 },
+                rejected,
             },
             (current, _) => current,
         };
@@ -738,12 +729,17 @@ fn effective(state: JournalState, binding: &JournalBinding) -> JournalState {
             JournalState::fresh()
         }
         // Reopened so the fixed import path retries the rejected items. The rest of
-        // its data is already in the successor, so no partial import is implied.
-        JournalState::Resolved(JournalResolution::ImportedWithRejections { revision, .. })
-            if revision < binding.import_revision =>
-        {
-            JournalState::fresh()
-        }
+        // its data is already in the successor, so no partial import is implied;
+        // the rejected items are still missing, so their count carries over.
+        JournalState::Resolved(JournalResolution::ImportedWithRejections {
+            revision,
+            rejected,
+        }) if revision < binding.import_revision => JournalState::Pending {
+            attempts: 0,
+            import: ImportFlag::None,
+            absent_streak: 0,
+            rejected,
+        },
         other => other,
     }
 }
@@ -781,9 +777,9 @@ fn completeness_rank(r: JournalResolution) -> u8 {
 ///   that does not (`NoData`, `SupersededByAuthoritative`) beats a pending entry
 ///   unless an import from it [`Started`](ImportFlag::Started): data was seen, so
 ///   "nothing" is not believed and the entry stays pending.
-/// * Between two pending entries: the import flag takes the stronger, attempts
-///   the maximum, and the absent streak the newer observation's (a silence
-///   resets it).
+/// * Between two pending entries: the import flag is `Started` if either is,
+///   attempts and rejection counts take the maximum, and the absent streak the
+///   newer observation's (a silence resets it).
 fn merge_states(older: JournalState, newer: JournalState) -> JournalState {
     use JournalState::{Pending, Resolved};
     match (older, newer) {
@@ -812,17 +808,20 @@ fn merge_states(older: JournalState, newer: JournalState) -> JournalState {
             Pending {
                 attempts: a1,
                 import: f1,
+                rejected: r1,
                 ..
             },
             Pending {
                 attempts: a2,
                 import: f2,
                 absent_streak,
+                rejected: r2,
             },
         ) => Pending {
             attempts: a1.max(a2),
             import: f1.max(f2),
             absent_streak,
+            rejected: r1.max(r2),
         },
     }
 }
@@ -859,11 +858,12 @@ pub struct PendingPredecessor {
 #[non_exhaustive]
 pub enum JournalStatus {
     /// No journal is stored: a journaled migration has never begun on this
-    /// successor.
+    /// successor. An earlier plain walk may still have left a partial copy:
+    /// [`crate::begin_migration_journal`] returns the status that accounts for it.
     NotStarted,
     /// A journal is stored but cannot be decoded. Treat as incomplete and as a
     /// possibly interrupted import. [`crate::migrate_delegate_secrets_journaled`]
-    /// replaces a corrupt one pessimistically and never touches one from a
+    /// rebuilds a corrupt one from the migration markers and never touches one from a
     /// different encoding version.
     Unreadable(JournalDecodeError),
     /// Every predecessor in the lineage is resolved. There is nothing to probe.
@@ -878,8 +878,9 @@ pub enum JournalStatus {
         /// The unresolved predecessors, in lineage order.
         pending: Vec<PendingPredecessor>,
         /// Items the successor's import path permanently refused, as last
-        /// recorded (including predecessors reopened by a higher import
-        /// revision). Non-zero means data the user had is not in the successor.
+        /// recorded, including those of predecessors a higher import revision
+        /// reopened that have not been re-imported yet. Non-zero means data the
+        /// user had is not in the successor.
         rejected_items: u32,
     },
 }
@@ -901,9 +902,9 @@ impl JournalStatus {
     }
 
     /// Whether the successor may hold a **partial** copy of some predecessor's
-    /// data right now: an import from it started (or may have, after a corrupt
-    /// journal) and has not been resolved. While this is true, do not treat the
-    /// successor's contents as everything the user had.
+    /// data right now: an import from it [`Started`](ImportFlag::Started) and has
+    /// not been resolved. While this is true, do not treat the successor's
+    /// contents as everything the user had.
     ///
     /// Use this, not `!is_complete()`, to gate such decisions: a predecessor
     /// that is simply not installed on this node keeps the journal incomplete
@@ -916,7 +917,7 @@ impl JournalStatus {
         match self {
             JournalStatus::Unreadable(_) => true,
             JournalStatus::Incomplete { pending, .. } => {
-                pending.iter().any(|p| p.import != ImportFlag::None)
+                pending.iter().any(|p| p.import == ImportFlag::Started)
             }
             _ => false,
         }
