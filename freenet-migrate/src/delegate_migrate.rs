@@ -878,6 +878,15 @@ pub trait SuccessorSecretsIo {
 
     /// The recorded migration state for `query.predecessor`, if any.
     ///
+    /// When both a `Done` and an `InProgress` marker are stored, `Done` wins —
+    /// with one exception every implementation must honour: an
+    /// `InProgress { saw_data: true }` beside a `Done { had_data: false }` reads
+    /// as `InProgress { saw_data: true }`. The walk never writes that pair (its
+    /// data flag is sticky); it means an import started after the empty seal
+    /// ([`crate::note_app_import_started`], or a walk re-asking a predecessor a
+    /// journal knows holds data), so the empty seal is wrong. Reading it as done
+    /// would let a lost journal seal that import's missing items away.
+    ///
     /// `Err` aborts this predecessor with
     /// [`PredecessorMigration::WriterUnavailable`] and stops the walk under every
     /// policy: without a marker read the crate cannot tell migrated from
@@ -889,9 +898,19 @@ pub trait SuccessorSecretsIo {
 
     /// Persist `marker` for `predecessor`.
     ///
-    /// Called twice per imported predecessor: [`MigrationMarker::InProgress`]
-    /// before the first item, [`MigrationMarker::Done`] only after every item and
-    /// the flush succeeded.
+    /// The walk calls it twice per imported predecessor:
+    /// [`MigrationMarker::InProgress`] before the first item,
+    /// [`MigrationMarker::Done`] only after every item and the flush succeeded.
+    /// [`crate::note_app_import_started`] also records
+    /// `InProgress { saw_data: true }`, possibly while a `Done { had_data: false }`
+    /// is stored. Two rules for every implementation:
+    ///
+    /// * Recording `InProgress` must not erase a stored `Done` (keep them as
+    ///   separate records): see [`migration_marker`](Self::migration_marker) for
+    ///   how the pair reads back.
+    /// * `InProgress { saw_data: false }` must not downgrade a stored
+    ///   `InProgress { saw_data: true }`: another session may have recorded it
+    ///   since this walk read the marker.
     ///
     /// **Markers must be durable when this returns, not batched.**
     /// [`flush_predecessor`](Self::flush_predecessor) is specified as flushing what
@@ -1032,7 +1051,10 @@ impl<S: SecretStore + ?Sized> SuccessorSecretsIo for SecretStoreIo<'_, S> {
         query: &MarkerQuery<'_>,
     ) -> impl Future<Output = Result<Option<MigrationMarker>, Self::Error>> {
         let done = pred_done_marker(query.predecessor);
-        let marker = if let Some(value) = self.store.get_secret(&done) {
+        let marker = if crate::delegate::empty_seal_contradicted(self.store, query.predecessor) {
+            // An import started after an empty seal: the seal is wrong.
+            Some(MigrationMarker::InProgress { saw_data: true })
+        } else if let Some(value) = self.store.get_secret(&done) {
             // An unrecognized value is treated conservatively as data-bearing.
             Some(MigrationMarker::Done {
                 had_data: value != PRED_DONE_MARKER_VALUE_EMPTY,
@@ -1067,6 +1089,16 @@ impl<S: SecretStore + ?Sized> SuccessorSecretsIo for SecretStoreIo<'_, S> {
             MigrationMarker::InProgress { saw_data } => (pred_wip_marker(predecessor), saw_data),
             MigrationMarker::Done { had_data } => (pred_done_marker(predecessor), had_data),
         };
+        // Sticky data: an in-progress marker that saw data is never downgraded
+        // (another session may have recorded it since this walk read the marker).
+        if matches!(marker, MigrationMarker::InProgress { saw_data: false })
+            && self
+                .store
+                .get_secret(&key)
+                .is_some_and(|v| v != PRED_DONE_MARKER_VALUE_EMPTY)
+        {
+            return core::future::ready(Ok(()));
+        }
         let value = if data {
             PRED_DONE_MARKER_VALUE_DATA
         } else {
@@ -1668,7 +1700,26 @@ where
 {
     let binding = JournalBinding::new(policy, successor.import_revision());
     let mut journal = match start_journal(successor, predecessors, policy).await? {
-        Started::Existing(journal) => return Ok(journal.status(predecessors, &binding)),
+        Started::Existing(journal) => {
+            // Lineage entries the stored journal has never seen (the lineage grew)
+            // are read off their markers, as a fresh journal's are.
+            let unseen: Vec<DelegateLineageEntry> = predecessors
+                .iter()
+                .filter(|e| {
+                    journal
+                        .entry(&DelegateKey::new(
+                            e.delegate_key,
+                            CodeHash::new(e.code_hash),
+                        ))
+                        .is_none()
+                })
+                .copied()
+                .collect();
+            if unseen.is_empty() {
+                return Ok(journal.status(predecessors, &binding));
+            }
+            fresh_journal(successor, &unseen, policy).await?
+        }
         Started::New(journal) => journal,
     };
     store_merged(
@@ -1686,25 +1737,35 @@ where
 /// from it **outside** the walk (River's hand-rolled sweep), or merges it into
 /// state a later save would persist. Call it only once the app holds data read
 /// from the predecessor: a predecessor flagged this way that then answers
-/// "nothing" is not believed.
+/// "nothing" is not believed. Once per predecessor per session is enough; each
+/// call costs a journal load, a marker read and a marker write.
 ///
 /// Records it twice: in the journal, and as the predecessor's in-progress
 /// migration marker (`InProgress { saw_data: true }`), exactly as the walk does
 /// before its own first item. So the walk treats the predecessor as known to
-/// hold data, and a corrupt journal is rebuilt with the flag. Until a journaled
-/// walk resolves the predecessor as imported, [`JournalStatus::interrupted_import`]
-/// reports that the successor may hold a partial copy.
+/// hold data, and a lost or corrupt journal is rebuilt with the flag (see the
+/// marker contract on [`SuccessorSecretsIo::migration_marker`]). Until a
+/// journaled walk resolves the predecessor as imported,
+/// [`JournalStatus::interrupted_import`] reports that the successor may hold a
+/// partial copy.
+///
+/// A predecessor whose import already completed with data (its `Done` marker
+/// says so) is left alone: nothing is recorded, and the app's write is a re-merge
+/// of data already in the successor. `policy` is the one the app migrates under;
+/// `predecessor` must be in the lineage it passes to the walk, or the flag is
+/// recorded where nothing reads it.
 ///
 /// # Errors
 ///
 /// No journal is stored (call [`begin_migration_journal`] first), it cannot be
-/// read, is corrupt or from a different encoding version, or the flag or the
-/// marker could not be stored. Do not write: a kill mid-write would leave a
-/// partial copy nothing records.
+/// read, is corrupt or from a different encoding version, the marker cannot be
+/// read, or the flag or the marker could not be stored. Do not write: a kill
+/// mid-write would leave a partial copy nothing records.
 pub async fn note_app_import_started<W>(
     successor: &mut W,
     predecessor: &DelegateKey,
     generation: u32,
+    policy: &SecretSelectionPolicy,
 ) -> Result<(), JournalError>
 where
     W: JournaledSuccessorIo,
@@ -1729,12 +1790,26 @@ where
         // Starting one here would skip `begin`'s marker seeding.
         None => return Err(begin_first("no journal is stored")),
     };
+    let query = MarkerQuery {
+        predecessor,
+        generation,
+        legacy_bridge: policy.legacy_bridge(),
+    };
+    let marker = successor
+        .migration_marker(&query)
+        .await
+        .map_err(|e| JournalError::Successor(format!("marker read failed: {e:?}")))?;
+    if matches!(marker, Some(MigrationMarker::Done { had_data: true })) {
+        return Ok(());
+    }
     successor
         .record_marker(predecessor, MigrationMarker::InProgress { saw_data: true })
         .await
         .map_err(|e| JournalError::Successor(format!("in-progress marker failed: {e:?}")))?;
+    let binding = JournalBinding::new(policy, successor.import_revision());
+    journal.rebind(&binding);
     if journal.mark_import_started(predecessor, generation) {
-        store_merged(successor, &mut journal, None, None).await?;
+        store_merged(successor, &mut journal, Some(&binding), None).await?;
     }
     Ok(())
 }
@@ -1920,13 +1995,14 @@ where
     }
 }
 
-/// The journal a successor with none (or a corrupt one) stored starts from:
-/// every predecessor pending, with an import [`Started`](crate::ImportFlag::Started)
-/// where a surviving [`MigrationMarker::InProgress`] says an import saw data and
-/// did not finish — an earlier plain walk's, a journaled walk's, or the app's
-/// (see [`note_app_import_started`]). That is the state of a successor adopting
-/// the journal after an interrupted [`migrate_delegate_secrets`] run, and all a
-/// corrupt journal said about partial copies.
+/// The journal a successor with none (or a corrupt one) stored starts from, read
+/// off the migration markers: a predecessor with a `Done` marker resolved as the
+/// walk resolves `AlreadyMigrated`; one whose marker says an import saw data and
+/// did not finish (an earlier plain walk's, a journaled walk's, or the app's, see
+/// [`note_app_import_started`]) pending with an import
+/// [`Started`](crate::ImportFlag::Started); the rest pending. That is the state of
+/// a successor adopting the journal after [`migrate_delegate_secrets`] runs, and
+/// all a corrupt journal said about partial copies.
 async fn fresh_journal<W>(
     successor: &mut W,
     predecessors: &[DelegateLineageEntry],
@@ -1950,6 +2026,17 @@ where
             Ok(Some(MigrationMarker::InProgress { saw_data: true })) => {
                 journal.mark_import_started(&key, e.generation);
             }
+            // A completion an earlier (plain) walk sealed, resolved as the walk
+            // would resolve its `AlreadyMigrated`, so nothing treats it as owed.
+            Ok(Some(MigrationMarker::Done { had_data })) => journal.record(
+                &key,
+                e.generation,
+                RunOutcome::Resolved(if had_data {
+                    JournalResolution::Imported
+                } else {
+                    JournalResolution::NoData
+                }),
+            ),
             Ok(_) => {}
             Err(err) => {
                 return Err(JournalError::Successor(format!(
@@ -6442,13 +6529,12 @@ mod tests {
                 ..
             }
         ));
-        assert!(matches!(
+        // The older generation the plain walk sealed empty is resolved from its
+        // marker, not owed again.
+        assert_eq!(
             state_of(&writer.store, &lineage[0]),
-            JournalState::Pending {
-                import: ImportFlag::None,
-                ..
-            }
-        ));
+            JournalState::Resolved(JournalResolution::NoData)
+        );
     }
 
     /// If the journal cannot even be started, the walk does not run at all.
@@ -7129,7 +7215,13 @@ mod tests {
             &union(),
         ))
         .expect("begin");
-        block_on(note_app_import_started(&mut store_io(&mut store), &k, 1)).expect("flag");
+        block_on(note_app_import_started(
+            &mut store_io(&mut store),
+            &k,
+            1,
+            &union(),
+        ))
+        .expect("flag");
         assert!(stored_status(&store, &lineage).interrupted_import());
         let mut io = MockIo::default().executable_with(&k, &[(b"room:a", b"A")]);
         assert!(complete(&journaled(&mut store, &mut io, &lineage, union())));
@@ -7578,7 +7670,13 @@ mod tests {
             &union(),
         ))
         .expect("begin");
-        block_on(note_app_import_started(&mut store_io(&mut store), &k, 1)).expect("flag");
+        block_on(note_app_import_started(
+            &mut store_io(&mut store),
+            &k,
+            1,
+            &union(),
+        ))
+        .expect("flag");
         let run = journaled(
             &mut store,
             &mut MockIo::default().executable_with(&k, &[]),
@@ -7599,13 +7697,13 @@ mod tests {
         let mut w = InspectingWriter::new(&lineage);
         block_on(begin_migration_journal(&mut w, &lineage, &union())).unwrap();
         w.fail_journal_store_number = Some(w.journal_stores + 1);
-        assert!(block_on(note_app_import_started(&mut w, &k, 1)).is_err());
+        assert!(block_on(note_app_import_started(&mut w, &k, 1, &union())).is_err());
 
         let mut w = InspectingWriter::new(&lineage);
         block_on(begin_migration_journal(&mut w, &lineage, &union())).unwrap();
         let before = w.store.get_secret(MIGRATION_JOURNAL_KEY);
         w.fail_journal_load = true;
-        assert!(block_on(note_app_import_started(&mut w, &k, 1)).is_err());
+        assert!(block_on(note_app_import_started(&mut w, &k, 1, &union())).is_err());
         assert_eq!(w.store.get_secret(MIGRATION_JOURNAL_KEY), before);
 
         // The re-read before the store fails.
@@ -7613,7 +7711,7 @@ mod tests {
         block_on(begin_migration_journal(&mut w, &lineage, &union())).unwrap();
         let before = w.store.get_secret(MIGRATION_JOURNAL_KEY);
         w.fail_journal_load_number = Some(w.journal_loads + 2);
-        assert!(block_on(note_app_import_started(&mut w, &k, 1)).is_err());
+        assert!(block_on(note_app_import_started(&mut w, &k, 1, &union())).is_err());
         assert_eq!(w.store.get_secret(MIGRATION_JOURNAL_KEY), before);
 
         let mut wire = MigrationJournal::new_pending(&lineage).encode();
@@ -7622,14 +7720,25 @@ mod tests {
         let mut store = MemStore::default();
         store.set_secret(MIGRATION_JOURNAL_KEY, &wire);
         assert_eq!(
-            block_on(note_app_import_started(&mut store_io(&mut store), &k, 1)),
+            block_on(note_app_import_started(
+                &mut store_io(&mut store),
+                &k,
+                1,
+                &union()
+            )),
             Err(JournalError::ForeignVersion(2))
         );
         assert_eq!(store.get_secret(MIGRATION_JOURNAL_KEY), Some(wire));
 
         let mut store = MemStore::default();
         store.set_secret(MIGRATION_JOURNAL_KEY, b"\xa1\x61v\x01garbage");
-        assert!(block_on(note_app_import_started(&mut store_io(&mut store), &k, 1)).is_err());
+        assert!(block_on(note_app_import_started(
+            &mut store_io(&mut store),
+            &k,
+            1,
+            &union()
+        ))
+        .is_err());
         assert_eq!(
             store.get_secret(MIGRATION_JOURNAL_KEY).as_deref(),
             Some(&b"\xa1\x61v\x01garbage"[..])
@@ -7985,7 +8094,13 @@ mod tests {
             store.get_secret(&pred_done_marker(&k)).as_deref(),
             Some(PRED_DONE_MARKER_VALUE_EMPTY)
         );
-        block_on(note_app_import_started(&mut store_io(&mut store), &k, 1)).expect("flag");
+        block_on(note_app_import_started(
+            &mut store_io(&mut store),
+            &k,
+            1,
+            &union(),
+        ))
+        .expect("flag");
         let mut io = MockIo::default().executable_with(&k, &[(b"room:a", b"A")]);
         let run = journaled(&mut store, &mut io, &lineage, union());
         assert!(io.fetched.contains(k.bytes()), "asked again");
@@ -8016,6 +8131,7 @@ mod tests {
             &mut store_io(&mut store),
             &key_of(&new),
             2,
+            &policy(),
         ))
         .expect("flag");
         store.set_secret(b"room:b", b"new");
@@ -8144,7 +8260,8 @@ mod tests {
         assert!(block_on(note_app_import_started(
             &mut store_io(&mut store),
             &key_of(&lineage[0]),
-            1
+            1,
+            &union()
         ))
         .is_err());
         assert!(store.get_secret(MIGRATION_JOURNAL_KEY).is_none());
@@ -8298,7 +8415,13 @@ mod tests {
         let mut store = MemStore::default();
         let mut io = MockIo::default().executable_with(&k, &[(b"room:a", b"A")]);
         assert!(complete(&journaled(&mut store, &mut io, &lineage, union())));
-        block_on(note_app_import_started(&mut store_io(&mut store), &k, 1)).expect("flag");
+        block_on(note_app_import_started(
+            &mut store_io(&mut store),
+            &k,
+            1,
+            &union(),
+        ))
+        .expect("flag");
         assert!(stored_status(&store, &lineage).is_complete());
     }
 
@@ -8372,7 +8495,13 @@ mod tests {
             &union(),
         ))
         .expect("begin");
-        block_on(note_app_import_started(&mut store_io(&mut store), &k, 1)).expect("flag");
+        block_on(note_app_import_started(
+            &mut store_io(&mut store),
+            &k,
+            1,
+            &union(),
+        ))
+        .expect("flag");
         store.set_secret(MIGRATION_JOURNAL_KEY, b"\xa1\x61v\x01garbage");
         let run = journaled(
             &mut store,

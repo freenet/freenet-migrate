@@ -691,13 +691,31 @@ pub fn import_predecessor_secrets_once<S: SecretStore + ?Sized>(
 }
 
 /// Whether a completed migration from `predecessor` is already recorded (its
-/// delegate-key completion marker is present). Lets the migration driver skip a
+/// delegate-key completion marker is present, and not contradicted — see
+/// [`empty_seal_contradicted`]). Lets the migration driver skip a
 /// preflight/fetch round-trip for an already-migrated predecessor.
 pub(crate) fn predecessor_already_migrated<S: SecretStore + ?Sized>(
     store: &S,
     predecessor: &DelegateKey,
 ) -> bool {
-    store.has_secret(&pred_done_marker(predecessor))
+    store.has_secret(&pred_done_marker(predecessor)) && !empty_seal_contradicted(store, predecessor)
+}
+
+/// Whether `predecessor` carries an EMPTY completion marker AND an in-progress
+/// marker that saw data. A walk never writes that pair (its data flag is sticky),
+/// so it means an import was started after the empty seal — by the app
+/// ([`crate::note_app_import_started`]) or by a walk re-asking a predecessor a
+/// journal knows holds data. The empty seal is then wrong, and the predecessor
+/// reads as in progress, never as done.
+pub(crate) fn empty_seal_contradicted<S: SecretStore + ?Sized>(
+    store: &S,
+    predecessor: &DelegateKey,
+) -> bool {
+    store.get_secret(&pred_done_marker(predecessor)).as_deref()
+        == Some(PRED_DONE_MARKER_VALUE_EMPTY)
+        && store
+            .get_secret(&pred_wip_marker(predecessor))
+            .is_some_and(|v| v != PRED_DONE_MARKER_VALUE_EMPTY)
 }
 
 /// Reconstruct a completed predecessor migration's data/empty state from its
@@ -712,10 +730,16 @@ pub(crate) fn predecessor_already_migrated<S: SecretStore + ?Sized>(
 /// Public so an implementer of the marker contract — a node-side copy-forward, or
 /// an app implementing [`crate::SuccessorSecretsIo`] over its own storage — can read
 /// back the same data/empty flag [`predecessor_done_marker`] writes.
+///
+/// An empty completion marker beside an in-progress marker that saw data reads as
+/// `None`: the empty seal was contradicted by an import started after it.
 pub fn predecessor_migration_had_data<S: SecretStore + ?Sized>(
     store: &S,
     predecessor: &DelegateKey,
 ) -> Option<bool> {
+    if empty_seal_contradicted(store, predecessor) {
+        return None;
+    }
     store
         .get_secret(&pred_done_marker(predecessor))
         .map(|v| v != PRED_DONE_MARKER_VALUE_EMPTY)
