@@ -148,9 +148,11 @@ of 4 rooms on every later load. Four review rounds of in-session fixes
   call. A marker it cannot read there refuses nothing: the predecessor reads as
   an import under way for that load, nothing is stored, and the read is retried
   on the next.
-* `journal_status` is the app's pure load-time read: `NotStarted`, `Unreadable`,
+* `JournalStatus` is `NotStarted`, `Unreadable`,
   `Incomplete { pending, rejected_items }` (re-run the walk) or
-  `Complete { rejected_items }` (nothing left to probe, durably).
+  `Complete { rejected_items }` (nothing left to probe). Decide from the one
+  `begin` or the walk returned; `journal_status` is a pure read of stored bytes
+  that reads no markers.
   `interrupted_import()` says the successor may hold a partial copy right now.
   True means "do not treat the successor as everything the user had"; false
   does not mean it is (a silent predecessor, or `rejected_items() > 0`, still
@@ -175,7 +177,10 @@ key beginning with `\0freenet-migrate-journal/` is never exported or imported.
 * **your `fetch_secrets` fails loudly.** A resolution is as permanent as a `Done`
   marker, so an export that can come back partial without an `Err` (one that
   silently skips what it cannot read, or a sub-request whose timeout reads as
-  "nothing", as in freenet/delta#100) gets a partial import certified complete;
+  "nothing", as in freenet/delta#100) gets a partial import certified complete.
+  That includes a shorter answer on the retry after an interrupted import (only
+  an empty one is refused, #44), and an index the predecessor reads for itself
+  that a failed read (freenet-core#5857) turns into a short list;
 * **your successor store is durable** (a page-memory marker store cannot hold a
   journal);
 * **your marker store follows the new contract** below;

@@ -29,7 +29,7 @@
 //! client-side storage.
 //!
 //! * [`crate::begin_migration_journal`], called on **every** load before
-//!   anything migrated is written, stores it (every predecessor pending) the
+//!   anything migrated is written, stores it (read off the migration markers) the
 //!   first time, so an interruption at any point afterwards leaves a pending
 //!   journal behind; on later loads it adds lineage entries it has never seen and
 //!   reopens a resolution a lost flag left wrong.
@@ -112,10 +112,11 @@
 //! stored journal is re-read and merged (the rules are on [`MigrationJournal`])
 //! before writing, so a second tab or session cannot erase
 //! a flag or a resolution the first one recorded — except inside the window
-//! between one session's re-read and its write, which a successor without
-//! compare-and-swap cannot close. A stale store there can overwrite another
-//! session's import flag, and the stored journal can then read `Complete` over a
-//! partial copy. The predecessor's marker still records the import:
+//! between one session's reads and its write, which a successor without
+//! compare-and-swap cannot close. For a walk that window runs from its marker
+//! reads to its final store. A stale store there can overwrite another session's
+//! import flag, and the stored journal can then read `Complete` over a partial
+//! copy. The predecessor's marker still records the import:
 //! [`crate::begin_migration_journal`] reopens such a resolution, and the walk
 //! restores a pending entry's flag (one it reaches, or one behind a halt it
 //! stops at). So decide from the status those calls return, not from a raw
@@ -151,7 +152,10 @@
 //!   after data is refused, and a shorter one is believed and resolves
 //!   `Imported`. An app that enumerates through an index the predecessor itself
 //!   reads (and freenet/freenet-core#5857 can make that read come back empty)
-//!   must turn an unreadable index into an `Err`, never into a short list.
+//!   must not let an unreadable index become a short list. For a predecessor
+//!   already deployed, an index read that failed may look exactly like an
+//!   absent index; cross-check it (an index absent while keys it should list
+//!   are present is an `Err`).
 //! * It cannot tell a predecessor that genuinely holds nothing from one whose
 //!   storage the node failed to read **on the first attempt**: freenet-core
 //!   reports a failed secret read as "not found" (freenet/freenet-core#5857), so
@@ -765,8 +769,10 @@ fn effective(state: JournalState, binding: &JournalBinding) -> JournalState {
             JournalState::fresh()
         }
         // Reopened so the fixed import path retries the rejected items. The rest of
-        // its data is already in the successor, so no partial import is implied;
-        // the rejected items are still missing, so their count carries over.
+        // its data is already in the successor, so the journal flags no partial
+        // import; the rejected items are still missing, so their count carries
+        // over. (Its in-progress marker survives, so once such an entry resolves
+        // without its data, `begin` reads that marker as an import under way.)
         JournalState::Resolved(JournalResolution::ImportedWithRejections {
             revision,
             rejected,

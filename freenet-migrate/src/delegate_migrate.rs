@@ -1691,11 +1691,12 @@ where
 /// the next load knows the migration must run again. See the [`crate::journal`]
 /// module docs.
 ///
-/// * Nothing stored: stores a journal with every predecessor pending, flagging
-///   an import [`Started`](crate::ImportFlag::Started) for any predecessor an
-///   earlier plain walk left mid-import (a surviving
-///   [`MigrationMarker::InProgress`] that saw data). This reads one marker per
-///   predecessor, once.
+/// * Nothing stored: stores a journal read off the markers. A predecessor with
+///   a `Done` marker is resolved by it, one an earlier plain walk left mid-import
+///   (a surviving [`MigrationMarker::InProgress`] that saw data) is flagged as an
+///   import [`Started`](crate::ImportFlag::Started), and the rest are pending.
+///   This reads one marker per predecessor (two behind a legacy seal), and a
+///   marker that cannot be read refuses the start.
 /// * A corrupt journal stored: rebuilds it the same way from the markers, which
 ///   record every import that started (the app's too, see
 ///   [`note_app_import_started`]).
@@ -1781,8 +1782,10 @@ fn status_with_unverified(
 /// from the predecessor: a predecessor flagged this way that then answers
 /// "nothing" is not believed. Under a snapshot policy, do not flag a generation
 /// the policy supersedes (an older one behind the newest that holds data): it
-/// can then never resolve, and [`JournalStatus::interrupted_import`] stays true. Once per predecessor per session is enough; each
-/// call costs a journal load, a marker read and a marker write.
+/// can then never resolve, and [`JournalStatus::interrupted_import`] stays true.
+/// Once per predecessor per session is enough; each call costs two journal loads,
+/// a journal store, two marker reads (three behind a legacy seal) and a marker
+/// write.
 ///
 /// Records it twice: in the journal, and as the predecessor's in-progress
 /// migration marker (`InProgress { saw_data: true }`), exactly as the walk does
@@ -2230,9 +2233,10 @@ where
                 // successor, contradicted by its marker (an import started since,
                 // whose journal flag another session's store overwrote): reopen it.
                 // Only such entries are read, one marker each per call. A read
-                // that fails refuses nothing (one stuck marker must not stop every
-                // other predecessor migrating); the entry is left as stored and
-                // reported unverified.
+                // that fails refuses nothing (a stuck marker on an older
+                // predecessor must not stop the newer ones migrating; the walk
+                // itself still halts at a pending one it cannot read); the entry is
+                // left as stored and reported unverified.
                 let mut reopened = false;
                 let mut checks = MarkerChecks::default();
                 for e in predecessors {
@@ -12117,7 +12121,6 @@ mod tests {
         w.store
             .set_secret(&pred_wip_marker(&key_of(&g3)), PRED_DONE_MARKER_VALUE_DATA);
         let r = block_on(begin_migration_journal(&mut w, &[g3], &newest()));
-        eprintln!("P8 {:?}", r.as_ref().map(|s| s.interrupted_import()));
         assert!(
             matches!(r.as_ref().map(|s| s.interrupted_import()), Ok(true)),
             "{r:?}"

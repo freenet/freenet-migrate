@@ -702,7 +702,8 @@ if !begun.is_complete() {
     let run = migrate_delegate_secrets_journaled(
         &mut successor, &mut io, DELEGATE_LINEAGE, authz, policy,
     ).await;
-    // `run.status` is what was stored. While it is incomplete, run again on a
+    // `run.status` is the stored journal's status (plus any marker it could not
+    // read, as an import under way). While it is incomplete, run again on a
     // later load.
 }
 // Decide from the status the LAST call returned: `run.status` (None means
@@ -726,7 +727,9 @@ Drive the journal calls one at a time within a session.
 
 **Do not adopt the journal unless** your `fetch_secrets` fails loudly (a
 resolution is as permanent as a `Done` marker, so an export that can come back
-partial without an `Err` gets a partial import certified complete), your
+partial without an `Err` gets a partial import certified complete; that includes
+a shorter answer on a retry, and an index a failed read turns into a short
+list), your
 successor store is durable, your marker store follows the contract, your
 predecessors are frozen, no older build of your app walks the same successor,
 and, under a snapshot policy, every predecessor finished its own migration
@@ -737,11 +740,13 @@ flight, a status not read yet, `begin_migration_journal` erring, a walk whose
 `status` is `None`, or `interrupted_import()` on the status the last call
 returned.
 
-Per load, `begin` reads the journal once and one marker per predecessor resolved
-as holding nothing; it stores only when it reopens or adds an entry. A marker it
-cannot read refuses nothing: that predecessor reads as an import under way for
-the load, and the read is retried on the next. The walk then costs what the
-section below says.
+Per load, `begin` reads the journal and one marker per predecessor resolved as
+holding nothing; it stores only when it reopens or adds an entry. A marker it
+cannot read there refuses nothing: that predecessor reads as an import under way
+for the load, and the read is retried on the next. (Starting a journal, or adding
+a lineage entry, still refuses until that predecessor's marker reads; and the
+walk halts at a pending predecessor whose marker it cannot read.) The walk then
+costs what the section below says.
 
 What resolves a predecessor is a table in the `journal` module docs. The short
 version: silence and "not installed" never do; a permanent rejection does, with a
@@ -767,10 +772,12 @@ started from that never answers with data again (it was unregistered, it really
 did become empty, or a snapshot policy later superseded it, which under
 `NewestSnapshotWinsContinuePastUnresponsive` follows from an ordinary transient
 silence of the newest generation while an older one was being imported; a
-rejection reopened by a higher `import_revision` counts too, once a walk has
-re-asked it) is never resolved, and the crate has no call to abandon
+rejection reopened by a higher `import_revision` that a snapshot policy then
+supersedes counts too) is never resolved, and so is a predecessor whose marker
+can never be read; the crate has no call to abandon
 it yet ([#39](https://github.com/freenet/freenet-migrate/issues/39)). An app that
-gates something on `interrupted_import()` must be able to live with that.
+gates something on `interrupted_import()` must be able to live with that, with
+an override that ignores the flag rather than one that resolves an entry.
 
 Nor does `interrupted_import()` cover a predecessor that has never answered: it
 may hold everything the user had, with nothing partially written. It shows as a

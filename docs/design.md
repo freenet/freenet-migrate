@@ -205,7 +205,8 @@ reaches predecessors, not the node) and is retired.
 **Completeness across predecessors (0.7.0, #37).** The two-phase marker makes
 one predecessor's import durable. Whether *every* predecessor has been dealt with
 is a separate durable record, the `MigrationJournal`, stored in the successor
-through `JournaledSuccessorIo` and read on every load (see the `journal` module
+through `JournaledSuccessorIo`, with `begin_migration_journal` called on every
+load (see the `journal` module
 docs for the resolution table). It composes with the hand-off above: a node-side
 copy-forward that writes `predecessor_done_marker`s makes the journaled walk see
 `AlreadyMigrated`, which resolves from the marker's `had_data`, so every
