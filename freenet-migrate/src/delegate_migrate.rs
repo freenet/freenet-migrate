@@ -8304,4 +8304,104 @@ mod tests {
             Err(JournalDecodeError::Corrupt(_))
         ));
     }
+
+    /// A journal's started import outweighs an in-progress marker that saw no
+    /// data (an empty attempt whose marker a later import did not overwrite).
+    #[test]
+    fn a_journal_flag_outweighs_an_empty_in_progress_marker() {
+        let lineage = [entry(1, 1)];
+        let k = key_of(&lineage[0]);
+        let mut store = MemStore::default();
+        let mut journal = MigrationJournal::new_pending(&lineage);
+        journal.mark_import_started(&k, 1);
+        put_journal(&mut store, &journal);
+        store.set_secret(&pred_wip_marker(&k), PRED_DONE_MARKER_VALUE_EMPTY);
+        let run = journaled(
+            &mut store,
+            &mut MockIo::default().executable_with(&k, &[]),
+            &lineage,
+            union(),
+        );
+        assert!(matches!(
+            run.report.predecessors[0],
+            PredecessorMigration::Unresponsive { .. }
+        ));
+        assert!(store.get_secret(&pred_done_marker(&k)).is_none());
+    }
+
+    /// The app's flag is also its predecessor's in-progress marker, so it survives
+    /// a corrupt journal: the rebuilt journal still refuses an empty answer.
+    #[test]
+    fn an_app_flag_survives_a_corrupt_journal() {
+        let lineage = [entry(1, 1)];
+        let k = key_of(&lineage[0]);
+        let mut store = MemStore::default();
+        block_on(begin_migration_journal(
+            &mut store_io(&mut store),
+            &lineage,
+            &union(),
+        ))
+        .expect("begin");
+        block_on(note_app_import_started(&mut store_io(&mut store), &k, 1)).expect("flag");
+        store.set_secret(MIGRATION_JOURNAL_KEY, b"\xa1\x61v\x01garbage");
+        let run = journaled(
+            &mut store,
+            &mut MockIo::default().executable_with(&k, &[]),
+            &lineage,
+            union(),
+        );
+        assert!(!complete(&run));
+        assert!(interrupted(&run));
+        assert!(store.get_secret(&pred_done_marker(&k)).is_none());
+    }
+
+    /// A corrupt journal found at the re-read is rebuilt from the markers even for
+    /// predecessors this walk never examined (behind a snapshot policy's halt).
+    #[test]
+    fn a_corrupt_reread_is_rebuilt_for_unexamined_predecessors_too() {
+        let (g1, g2) = (entry(1, 1), entry(2, 2));
+        let lineage = [g1, g2];
+        let mut writer = InspectingWriter::new(&lineage);
+        block_on(begin_migration_journal(&mut writer, &lineage, &newest())).expect("begin");
+        // Another session's import from g1 started meanwhile.
+        writer
+            .store
+            .set_secret(&pred_wip_marker(&key_of(&g1)), PRED_DONE_MARKER_VALUE_DATA);
+        writer.inject_at_first_item = Some(b"\xa1\x61v\x01garbage".to_vec());
+        let mut io = MockIo::default()
+            .executable_with(&key_of(&g2), &[(b"room:2", b"2")])
+            .executable_with(&key_of(&g1), &[(b"room:1", b"1")]);
+        let run = writer.run(&mut io, newest());
+        assert!(matches!(
+            run.report.predecessors[1],
+            PredecessorMigration::Superseded { .. }
+        ));
+        assert!(matches!(
+            state_of(&writer.store, &g1),
+            JournalState::Pending {
+                import: ImportFlag::Started,
+                ..
+            }
+        ));
+    }
+
+    /// Merging keeps the larger rejection count of two pending entries.
+    #[test]
+    fn a_merge_keeps_a_reopened_rejection_count() {
+        let lineage = [entry(1, 1)];
+        let k = key_of(&lineage[0]);
+        let mut stored = MigrationJournal::new_pending(&lineage);
+        stored.record(
+            &k,
+            1,
+            resolved(JournalResolution::ImportedWithRejections {
+                rejected: 3,
+                revision: 0,
+            }),
+        );
+        let mut ours = MigrationJournal::new_pending(&lineage);
+        let rev1 = JournalBinding::new(&union(), 1);
+        ours.merge_stored(&stored, Some(&rev1));
+        assert_eq!(ours.status(&lineage, &rev1).rejected_items(), 3);
+    }
 }
