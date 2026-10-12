@@ -1084,9 +1084,11 @@ pub trait JournaledSuccessorIo: SuccessorSecretsIo {
     }
 }
 
-/// What [`crate::note_app_import_started`] did.
+/// What [`crate::note_app_import_started`] did. Decide the write from it; treat a
+/// variant this build does not know as "do not write".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
+#[must_use = "decide whether to write the predecessor's data from this"]
 pub enum AppImport {
     /// The import is flagged, in the journal and as the predecessor's in-progress
     /// marker: write the data.
@@ -1094,12 +1096,18 @@ pub enum AppImport {
     /// Its import already completed (its `Done` marker records data, or the
     /// journal resolves it with data, which an import with rejections at the
     /// current revision is): nothing was recorded, and the walk will not offer it
-    /// again. Its data is in the successor as far as the crate knows, but that can
-    /// be partial: a short export (#44), a write an old tab made to it during a
-    /// rollout, or the items an import path rejected. Writing it again fills such
-    /// a gap, and also brings back any key the user deleted since. So an app whose
-    /// merge cannot resurrect a deleted key (ranked tombstones, say) may write it
-    /// again, unflagged; any other app skips it.
+    /// again (until a higher import revision reopens a rejection). As far as the
+    /// crate knows its data is in the successor, but that can be partial, or
+    /// missing altogether: a short export (#44), a write an old tab made to it
+    /// during a rollout, the items an import path rejected, or a legacy
+    /// generation-keyed seal that never covered this data. Writing it again
+    /// (unflagged) fills such a gap, and also brings back any key the user deleted
+    /// since. Skipping it leaves the gap for good, and no status reports it. So an
+    /// app whose merge cannot resurrect a deleted key (ranked tombstones, say)
+    /// writes it again; an app that can tolerate a resurrected key should too; any
+    /// other skips it, and should at least log that it did. (Under the
+    /// continue-past snapshot policy a write here can also land ahead of a newer
+    /// generation that has not answered yet, as the walk's own can.)
     AlreadyImported,
 }
 

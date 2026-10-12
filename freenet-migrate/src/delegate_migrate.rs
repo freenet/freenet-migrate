@@ -1821,8 +1821,8 @@ fn status_with_unverified(
 /// leave a partial copy nothing records.
 ///
 /// [`JournalError::NotImportable`]: do not write from the predecessor on this
-/// call. It is not in `predecessors`; its import already completed; a snapshot
-/// policy supersedes it, because a newer generation holds data (the journal
+/// call. It is not in `predecessors` (permanent: check the app's lineage); a
+/// snapshot policy supersedes it, because a newer generation holds data (the journal
 /// shows it resolved with data, an import from it under way, or a rejection a
 /// higher revision reopened; or its own marker records data) or only a legacy
 /// seal for a newer generation covers this one; or, under plain
@@ -1982,6 +1982,13 @@ where
     // predecessor resolved.
     if journal.mark_import_started(predecessor, generation) {
         store_merged(successor, &mut journal, Some(&binding), None).await?;
+        // The store's re-read can bring in another session's resolution of it.
+        if matches!(
+            journal.entry(predecessor).map(|e| e.state),
+            Some(JournalState::Resolved(r)) if r.is_data_bearing()
+        ) {
+            return Ok(crate::journal::AppImport::AlreadyImported);
+        }
     }
     successor
         .record_marker(predecessor, MigrationMarker::InProgress { saw_data: true })
