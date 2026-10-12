@@ -11149,4 +11149,263 @@ mod tests {
         assert!(!crate::is_reserved_key(b"room:a"));
         assert!(!crate::is_reserved_key(b"\0freenet-migrat"));
     }
+
+    // -- round 8 probes (testing lens) ------------------------------------------------
+
+    fn r8_merge(older: JournalResolution, newer: JournalResolution) -> JournalState {
+        let e = entry(1, 1);
+        let k = key_of(&e);
+        let mut ours = MigrationJournal::new_pending(&[e]);
+        ours.record(&k, 1, resolved(newer));
+        let mut theirs = MigrationJournal::new_pending(&[e]);
+        theirs.record(&k, 1, resolved(older));
+        ours.merge_stored(&theirs, None);
+        ours.entry(&k).unwrap().state
+    }
+
+    #[test]
+    fn r8_data_bearing_resolutions_outrank_non_data_in_both_merge_orders() {
+        use JournalResolution::*;
+        let iwr = ImportedWithRejections {
+            rejected: 1,
+            revision: 1,
+        };
+        for non_data in [NoData, SupersededByAuthoritative] {
+            for data in [iwr, Imported] {
+                assert_eq!(
+                    r8_merge(non_data, data),
+                    JournalState::Resolved(data),
+                    "{non_data:?} then {data:?}"
+                );
+                assert_eq!(
+                    r8_merge(data, non_data),
+                    JournalState::Resolved(data),
+                    "{data:?} then {non_data:?}"
+                );
+            }
+        }
+        assert_eq!(r8_merge(iwr, Imported), JournalState::Resolved(Imported));
+        assert_eq!(r8_merge(Imported, iwr), JournalState::Resolved(Imported));
+    }
+
+    #[test]
+    fn r8_the_higher_rejection_revision_wins_in_both_merge_orders() {
+        use JournalResolution::*;
+        let lo = ImportedWithRejections {
+            rejected: 5,
+            revision: 2,
+        };
+        let hi = ImportedWithRejections {
+            rejected: 2,
+            revision: 3,
+        };
+        assert_eq!(r8_merge(lo, hi), JournalState::Resolved(hi));
+        assert_eq!(r8_merge(hi, lo), JournalState::Resolved(hi));
+    }
+
+    #[test]
+    fn r8_rejected_items_sum_over_resolved_and_reopened_predecessors() {
+        use JournalResolution::*;
+        let (e1, e2, e3) = (entry(1, 1), entry(2, 2), entry(3, 3));
+        let lineage = [e1, e2, e3];
+        let mut j = MigrationJournal::new_pending(&lineage);
+        j.record(
+            &key_of(&e1),
+            1,
+            resolved(ImportedWithRejections {
+                rejected: 5,
+                revision: 1,
+            }),
+        );
+        j.record(
+            &key_of(&e2),
+            2,
+            resolved(ImportedWithRejections {
+                rejected: 3,
+                revision: 0,
+            }),
+        );
+        // e3 stays pending with no rejections (a silent predecessor).
+        let b = JournalBinding {
+            policy: crate::journal::PolicyFamily::Union,
+            import_revision: 1,
+        };
+        // e1 resolved (5), e2 reopened (3), e3 pending (0): the later pending must not erase the sum.
+        assert_eq!(j.status(&lineage, &b).rejected_items(), 8);
+        assert_eq!(j.status(&[e3, e1, e2], &b).rejected_items(), 8);
+    }
+
+    #[test]
+    fn r8_an_older_build_really_does_not_rewalk_a_rejection_resolved_predecessor() {
+        let lineage = [entry(1, 1)];
+        let k = key_of(&lineage[0]);
+        let mut writer = InspectingWriter::new(&lineage);
+        writer.permanent_fail.insert(b"room:x".to_vec());
+        writer.revision = 1;
+        let mut io = MockIo::default().executable_with(&k, &[(b"room:a", b"A"), (b"room:x", b"?")]);
+        assert!(complete(&writer.run(&mut io, union())));
+        let offered = writer.offered.len();
+        writer.revision = 0;
+        writer.run(&mut io, union());
+        assert_eq!(
+            writer.offered.len(),
+            offered,
+            "the older build re-offered items"
+        );
+    }
+
+    /// An empty in-progress marker behind a legacy seal is not a partial copy.
+    #[test]
+    fn r8_an_empty_wip_behind_a_legacy_seal_is_superseded_not_started() {
+        let (g3, g4) = (entry(3, 3), entry(4, 4));
+        let lineage = [g3, g4];
+        let mut store = MemStore::default();
+        store.set_secret(&done_marker(5), b"1");
+        store.set_secret(&pred_wip_marker(&key_of(&g3)), PRED_DONE_MARKER_VALUE_EMPTY);
+        block_on(begin_migration_journal(
+            &mut store_io(&mut store),
+            &lineage,
+            &newest(),
+        ))
+        .expect("begin");
+        assert_eq!(
+            state_of(&store, &g3),
+            JournalState::Resolved(JournalResolution::SupersededByAuthoritative)
+        );
+    }
+
+    /// The legacy seal sits at generation + 1 (not further away): still refused.
+    #[test]
+    fn r8_an_app_flag_behind_a_seal_one_generation_up_is_refused() {
+        let g3 = entry(3, 3);
+        let k3 = key_of(&g3);
+        let mut store = MemStore::default();
+        store.set_secret(&done_marker(4), b"1");
+        block_on(begin_migration_journal(
+            &mut store_io(&mut store),
+            &[g3],
+            &newest(),
+        ))
+        .expect("begin");
+        assert!(block_on(note_app_import_started(
+            &mut store_io(&mut store),
+            &k3,
+            3,
+            &newest()
+        ))
+        .is_err());
+        assert!(!store.has_secret(&pred_wip_marker(&k3)));
+    }
+
+    /// A failed SECOND exact read in the rebuild must not drop the partial-copy flag
+    /// (the first one saw the in-progress data marker).
+    #[test]
+    fn r8_a_failed_second_exact_read_does_not_drop_a_started_import() {
+        struct FailSecondExact {
+            store: MemStore,
+            exact_reads: usize,
+        }
+        impl SuccessorSecretsIo for FailSecondExact {
+            type Error = SecretStoreWriteFailed;
+            async fn migration_marker(
+                &mut self,
+                q: &MarkerQuery<'_>,
+            ) -> Result<Option<MigrationMarker>, Self::Error> {
+                if q.legacy_bridge == LegacyBridge::ExactGenerationOnly {
+                    self.exact_reads += 1;
+                    if self.exact_reads >= 2 {
+                        return Err(SecretStoreWriteFailed {
+                            key: b"exact".to_vec(),
+                        });
+                    }
+                }
+                store_io(&mut self.store).migration_marker(q).await
+            }
+            async fn record_marker(
+                &mut self,
+                p: &DelegateKey,
+                m: MigrationMarker,
+            ) -> Result<(), Self::Error> {
+                store_io(&mut self.store).record_marker(p, m).await
+            }
+            async fn write_secret(&mut self, i: &RecoveredSecret<'_>) -> ItemWrite<Self::Error> {
+                store_io(&mut self.store).write_secret(i).await
+            }
+        }
+        impl JournaledSuccessorIo for FailSecondExact {
+            async fn load_journal(&mut self) -> Result<Option<Vec<u8>>, Self::Error> {
+                Ok(self.store.get_secret(MIGRATION_JOURNAL_KEY))
+            }
+            async fn store_journal(&mut self, j: &[u8]) -> Result<(), Self::Error> {
+                self.store.set_secret(MIGRATION_JOURNAL_KEY, j);
+                Ok(())
+            }
+        }
+        let (g3, g5) = (entry(3, 3), entry(5, 5));
+        let lineage = [g3, g5];
+        let mut w = FailSecondExact {
+            store: MemStore::default(),
+            exact_reads: 0,
+        };
+        w.store.set_secret(&done_marker(5), b"1");
+        w.store
+            .set_secret(&pred_wip_marker(&key_of(&g3)), PRED_DONE_MARKER_VALUE_DATA);
+        let r = block_on(begin_migration_journal(&mut w, &lineage, &newest()));
+        let flagged = matches!(r.as_ref().map(|s| s.interrupted_import()), Ok(true)) || r.is_err();
+        assert!(
+            flagged,
+            "a possible partial copy was silently unflagged: {r:?}"
+        );
+    }
+
+    /// A flag that is already durable costs no further journal store.
+    #[test]
+    fn r8_an_already_durable_flag_costs_no_further_journal_store() {
+        let lineage = [entry(1, 1)];
+        let k = key_of(&lineage[0]);
+        let mut w = InspectingWriter::new(&lineage);
+        w.retryable_fail.insert(b"room:x".to_vec());
+        let mut io = MockIo::default().executable_with(&k, &[(b"room:a", b"A"), (b"room:x", b"?")]);
+        w.run(&mut io, union());
+        assert!(stored_status(&w.store, &lineage).interrupted_import());
+        let before = w.journal_stores;
+        w.retryable_fail.clear();
+        let run = w.run(&mut io, union());
+        assert!(complete(&run), "{:?}", run.status);
+        assert_eq!(
+            w.journal_stores - before,
+            1,
+            "only the final resolution is stored"
+        );
+    }
+
+    #[test]
+    fn r8_repeating_the_app_flag_stores_the_journal_once() {
+        let lineage = [entry(1, 1)];
+        let k = key_of(&lineage[0]);
+        let mut w = InspectingWriter::new(&lineage);
+        block_on(begin_migration_journal(&mut w, &lineage, &union())).expect("begin");
+        block_on(note_app_import_started(&mut w, &k, 1, &union())).expect("flag");
+        let before = w.journal_stores;
+        block_on(note_app_import_started(&mut w, &k, 1, &union())).expect("flag again");
+        assert_eq!(w.journal_stores, before);
+    }
+
+    /// A journal that turns corrupt between the walk's start and its flag store is
+    /// rebuilt from the markers there too, not left to veto the import.
+    #[test]
+    fn r8_a_journal_corrupted_before_the_flag_store_is_rebuilt() {
+        let lineage = [entry(1, 1)];
+        let k = key_of(&lineage[0]);
+        let mut w = InspectingWriter::new(&lineage);
+        // A started import from an earlier session, so the flag is stored before the probe.
+        w.store
+            .set_secret(&pred_wip_marker(&k), PRED_DONE_MARKER_VALUE_DATA);
+        put_journal(&mut w.store, &MigrationJournal::new_pending(&lineage));
+        w.inject_at_first_marker_read = Some(b"garbage".to_vec());
+        let mut io = MockIo::default().executable_with(&k, &[(b"room:a", b"A")]);
+        let run = w.run(&mut io, union());
+        assert!(complete(&run), "{:?} {:?}", run.status, run.journal_error);
+        assert!(w.store.has_secret(b"room:a"));
+    }
 }
