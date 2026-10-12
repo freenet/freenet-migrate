@@ -287,6 +287,12 @@ pub enum JournalState {
         /// outcome. Information for the app's own policy; it never resolves the
         /// entry.
         absent_streak: u32,
+        /// The most items an attempt that started an import from it has seen it
+        /// export (the walk's own count, or one the app passed to
+        /// [`crate::note_app_import_started`]); `0` when none was counted. A frozen
+        /// predecessor does not lose items, so a later export with fewer is not
+        /// believed: the walk treats it as a silence (#44).
+        items_seen: u32,
     },
     /// Resolved.
     Resolved(JournalResolution),
@@ -299,6 +305,7 @@ impl JournalState {
             import: ImportFlag::None,
             absent_streak: 0,
             rejected: 0,
+            items_seen: 0,
         }
     }
 }
@@ -416,6 +423,9 @@ struct WireEntry {
     absent_streak: u32,
     rejected: u32,
     revision: u32,
+    /// Pending entries only; absent (0) in a journal written before #44.
+    #[serde(default)]
+    items_seen: u32,
 }
 
 /// Fixed-size byte strings as CBOR byte strings (not 32-element integer arrays).
@@ -506,6 +516,7 @@ impl MigrationJournal {
                     import,
                     absent_streak,
                     rejected: n,
+                    items_seen,
                 }) => {
                     rejected = rejected.saturating_add(n);
                     pending.push(PendingPredecessor {
@@ -514,6 +525,7 @@ impl MigrationJournal {
                         attempts,
                         import,
                         absent_streak,
+                        items_seen,
                     });
                 }
                 None => pending.push(PendingPredecessor {
@@ -522,6 +534,7 @@ impl MigrationJournal {
                     attempts: 0,
                     import: ImportFlag::None,
                     absent_streak: 0,
+                    items_seen: 0,
                 }),
             }
         }
@@ -567,6 +580,7 @@ impl MigrationJournal {
                         absent_streak: 0,
                         rejected: 0,
                         revision: 0,
+                        items_seen: 0,
                     };
                     match e.state {
                         JournalState::Pending {
@@ -574,7 +588,9 @@ impl MigrationJournal {
                             import,
                             absent_streak,
                             rejected,
+                            items_seen,
                         } => {
+                            w.items_seen = items_seen;
                             w.attempts = attempts;
                             w.import = u8::from(import == ImportFlag::Started);
                             w.absent_streak = absent_streak;
@@ -638,6 +654,7 @@ impl MigrationJournal {
                     },
                     absent_streak: w.absent_streak,
                     rejected: w.rejected,
+                    items_seen: w.items_seen,
                 },
                 1 => JournalState::Resolved(JournalResolution::Imported),
                 2 => JournalState::Resolved(JournalResolution::NoData),
@@ -696,10 +713,41 @@ impl MigrationJournal {
                     import: ImportFlag::Started,
                     absent_streak: 0,
                     rejected: 0,
+                    items_seen: 0,
                 };
                 true
             }
             JournalState::Resolved(_) => false,
+        }
+    }
+
+    /// The most items an attempt that started an import from `predecessor` has
+    /// seen it export, as this journal records it (`0` when none was counted, or
+    /// it is not pending).
+    pub(crate) fn items_seen(&self, predecessor: &DelegateKey) -> u32 {
+        match self.entry(predecessor).map(|e| e.state) {
+            Some(JournalState::Pending { items_seen, .. }) => items_seen,
+            _ => 0,
+        }
+    }
+
+    /// Raise `predecessor`'s [`items_seen`](JournalState::Pending::items_seen) to
+    /// `items` on a pending entry whose import has started. Whether it changed.
+    pub(crate) fn note_items_seen(&mut self, predecessor: &DelegateKey, items: u32) -> bool {
+        match self
+            .entries
+            .get_mut(&key_bytes(predecessor))
+            .map(|e| &mut e.state)
+        {
+            Some(JournalState::Pending {
+                import: ImportFlag::Started,
+                items_seen,
+                ..
+            }) if *items_seen < items => {
+                *items_seen = items;
+                true
+            }
+            _ => false,
         }
     }
 
@@ -726,6 +774,7 @@ impl MigrationJournal {
                     import,
                     absent_streak,
                     rejected,
+                    items_seen,
                 },
                 RunOutcome::Unresolved { absent },
             ) => JournalState::Pending {
@@ -737,6 +786,7 @@ impl MigrationJournal {
                     0
                 },
                 rejected,
+                items_seen,
             },
             (current, _) => current,
         };
@@ -796,6 +846,7 @@ fn effective(state: JournalState, binding: &JournalBinding) -> JournalState {
             import: ImportFlag::None,
             absent_streak: 0,
             rejected,
+            items_seen: 0,
         },
         other => other,
     }
@@ -866,6 +917,7 @@ fn merge_states(older: JournalState, newer: JournalState) -> JournalState {
                 attempts: a1,
                 import: f1,
                 rejected: r1,
+                items_seen: i1,
                 ..
             },
             Pending {
@@ -873,12 +925,14 @@ fn merge_states(older: JournalState, newer: JournalState) -> JournalState {
                 import: f2,
                 absent_streak,
                 rejected: r2,
+                items_seen: i2,
             },
         ) => Pending {
             attempts: a1.max(a2),
             import: f1.max(f2),
             absent_streak,
             rejected: r1.max(r2),
+            items_seen: i1.max(i2),
         },
     }
 }
@@ -909,6 +963,9 @@ pub struct PendingPredecessor {
     /// How many consecutive journaled walks that examined it found it
     /// definitively not installed.
     pub absent_streak: u32,
+    /// The most items an attempt that started an import from it has seen it
+    /// export (`0` when none was counted).
+    pub items_seen: u32,
 }
 
 /// Completeness of a successor's migration, as its stored journal records it.
