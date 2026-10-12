@@ -2139,6 +2139,13 @@ fn resolve_outcomes(
     outcomes
 }
 
+/// One limit: [`SecretStore::get_secret`] answers `None` both for an absent key
+/// and, on a node that cannot read it, for a present one (freenet-core reports a
+/// failed secret read as "not found", freenet/freenet-core#5857). So
+/// `load_journal` here cannot return the `Err` the trait asks for on a failed
+/// read, and a journal the node failed to read is started afresh. Every predecessor
+/// is then pending again (rebuilt from the markers), so nothing is sealed by it,
+/// but resolutions and counts the unreadable journal held are lost.
 impl<S: SecretStore + ?Sized> JournaledSuccessorIo for SecretStoreIo<'_, S> {
     fn load_journal(&mut self) -> impl Future<Output = Result<Option<Vec<u8>>, Self::Error>> {
         core::future::ready(Ok(self.store.get_secret(MIGRATION_JOURNAL_KEY)))

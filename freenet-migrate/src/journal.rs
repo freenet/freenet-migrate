@@ -143,7 +143,9 @@ use crate::lineage::DelegateLineageEntry;
 
 /// Version of the stored journal encoding. A journal with a different version
 /// reads as [`JournalStatus::Unreadable`] and is never overwritten by a build
-/// that cannot read it.
+/// that cannot read it. Bump it for ANY change to the stored form, including an
+/// added field: a build that decodes a same-version journal it does not fully
+/// understand drops what it does not know when it stores it again.
 pub const MIGRATION_JOURNAL_VERSION: u8 = 1;
 
 /// Storage key [`crate::SecretStoreIo`] uses for the journal, inside the crate's
@@ -207,7 +209,9 @@ pub enum ImportFlag {
     /// Cleared only by a resolution that puts the predecessor's data in the
     /// successor. A predecessor that held data when the import started and
     /// answers "nothing" now is not believed: the walk treats the answer as a
-    /// silence, and the entry stays pending.
+    /// silence, and the entry stays pending. So does one a snapshot policy then
+    /// supersedes: the successor still holds part of it, and
+    /// [`JournalStatus::interrupted_import`] keeps saying so.
     Started,
 }
 
