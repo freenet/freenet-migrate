@@ -14936,4 +14936,334 @@ mod tests {
         assert!(!c.note_items_seen(&k, 4));
         assert_eq!(c.items_seen(&k), 0);
     }
+
+    // ---- fm47 probes -------------------------------------------------------------
+
+    fn pending_of(
+        store: &MemStore,
+        lineage: &[DelegateLineageEntry],
+    ) -> Vec<crate::journal::PendingPredecessor> {
+        match stored_status(store, lineage) {
+            JournalStatus::Incomplete { pending, .. } => pending,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// A larger export than the recorded count is made durable BEFORE its first
+    /// item is written (a kill mid-import must not leave the old, smaller count).
+    #[test]
+    fn p1_a_larger_export_raises_the_stored_count_before_the_first_write() {
+        let g1 = entry(1, 1);
+        let lineage = [g1];
+        let k = key_of(&g1);
+        let mut w = InspectingWriter::new(&lineage);
+        w.retryable_fail.insert(b"room:b".to_vec());
+        let two: &[(&[u8], &[u8])] = &[(b"room:a", b"A"), (b"room:b", b"B")];
+        let _ = w.run(&mut MockIo::default().executable_with(&k, two), union());
+        assert_eq!(pending_of(&w.store, &lineage)[0].items_seen, 2);
+        w.status_at_first_item = None;
+        let three: &[(&[u8], &[u8])] = &[(b"room:a", b"A"), (b"room:b", b"B"), (b"room:c", b"C")];
+        let _ = w.run(&mut MockIo::default().executable_with(&k, three), union());
+        match w.status_at_first_item.clone().expect("first item") {
+            JournalStatus::Incomplete { pending, .. } => assert_eq!(pending[0].items_seen, 3),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// An app that re-flags (already flagged) with a count has it recorded.
+    #[test]
+    fn p2_a_count_on_an_already_flagged_predecessor_is_recorded() {
+        let g1 = entry(1, 1);
+        let lineage = [g1];
+        let k = key_of(&g1);
+        let mut w = InspectingWriter::new(&lineage);
+        block_on(begin_migration_journal(&mut w, &lineage, &union())).expect("begin");
+        block_on(note_app_import_started(
+            &mut w,
+            &lineage,
+            &k,
+            &union(),
+            None,
+        ))
+        .expect_flagged("flag");
+        assert_eq!(pending_of(&w.store, &lineage)[0].items_seen, 0);
+        block_on(note_app_import_started(
+            &mut w,
+            &lineage,
+            &k,
+            &union(),
+            Some(3),
+        ))
+        .expect_flagged("flag");
+        assert_eq!(pending_of(&w.store, &lineage)[0].items_seen, 3);
+    }
+
+    /// A smaller or equal count costs no journal store.
+    #[test]
+    fn p3_a_smaller_count_costs_no_store() {
+        let g1 = entry(1, 1);
+        let lineage = [g1];
+        let k = key_of(&g1);
+        let mut w = InspectingWriter::new(&lineage);
+        block_on(begin_migration_journal(&mut w, &lineage, &union())).expect("begin");
+        block_on(note_app_import_started(
+            &mut w,
+            &lineage,
+            &k,
+            &union(),
+            Some(3),
+        ))
+        .expect_flagged("flag");
+        let before = w.journal_stores;
+        for n in [1, 3] {
+            block_on(note_app_import_started(
+                &mut w,
+                &lineage,
+                &k,
+                &union(),
+                Some(n),
+            ))
+            .expect_flagged("flag");
+        }
+        assert_eq!(w.journal_stores, before);
+        assert_eq!(pending_of(&w.store, &lineage)[0].items_seen, 3);
+    }
+
+    /// A journal written before #44 has no `items_seen` field and must decode.
+    #[test]
+    fn p4_a_pre_44_journal_decodes() {
+        use ciborium::value::Value;
+        let g1 = entry(1, 1);
+        let k = key_of(&g1);
+        let t = |s: &str| Value::Text(s.to_string());
+        let i = |n: u32| Value::Integer(n.into());
+        let e = Value::Map(vec![
+            (t("key"), Value::Bytes(k.bytes().to_vec())),
+            (t("generation"), i(1)),
+            (t("state"), i(0)),
+            (t("attempts"), i(2)),
+            (t("import"), i(1)),
+            (t("absent_streak"), i(0)),
+            (t("rejected"), i(0)),
+            (t("revision"), i(0)),
+        ]);
+        let j = Value::Map(vec![(t("v"), i(1)), (t("entries"), Value::Array(vec![e]))]);
+        let mut bytes = Vec::new();
+        ciborium::ser::into_writer(&j, &mut bytes).unwrap();
+        let back = MigrationJournal::decode(&bytes).expect("old journal decodes");
+        assert_eq!(back.items_seen(&k), 0);
+        assert!(matches!(
+            back.entry(&k).map(|e| e.state),
+            Some(JournalState::Pending {
+                attempts: 2,
+                import: ImportFlag::Started,
+                items_seen: 0,
+                ..
+            })
+        ));
+    }
+
+    /// Reserved keys are not counted: a retry without them is not short.
+    #[test]
+    fn p5_reserved_keys_do_not_count_toward_the_export() {
+        let g1 = entry(1, 1);
+        let lineage = [g1];
+        let k = key_of(&g1);
+        let mut w = InspectingWriter::new(&lineage);
+        w.retryable_fail.insert(b"room:b".to_vec());
+        let with_journal: &[(&[u8], &[u8])] = &[
+            (b"room:a", b"A"),
+            (b"room:b", b"B"),
+            (MIGRATION_JOURNAL_KEY, b"j"),
+        ];
+        let _ = w.run(
+            &mut MockIo::default().executable_with(&k, with_journal),
+            union(),
+        );
+        assert_eq!(pending_of(&w.store, &lineage)[0].items_seen, 2);
+        w.retryable_fail.clear();
+        let two: &[(&[u8], &[u8])] = &[(b"room:a", b"A"), (b"room:b", b"B")];
+        let run = w.run(&mut MockIo::default().executable_with(&k, two), union());
+        assert!(complete(&run), "{run:?}");
+    }
+
+    /// The two accessors are disjoint.
+    #[test]
+    fn p6_the_short_export_accessors_are_disjoint() {
+        let g1 = entry(1, 1);
+        let lineage = [g1];
+        let k = key_of(&g1);
+        let mut w = InspectingWriter::new(&lineage);
+        w.retryable_fail.insert(b"room:b".to_vec());
+        let two: &[(&[u8], &[u8])] = &[(b"room:a", b"A"), (b"room:b", b"B")];
+        let _ = w.run(&mut MockIo::default().executable_with(&k, two), union());
+        let none: &[(&[u8], &[u8])] = &[];
+        let run = w.run(&mut MockIo::default().executable_with(&k, none), union());
+        assert!(run.report.predecessors[0].exported_nothing_after_data());
+        assert!(!run.report.predecessors[0].exported_fewer_after_data());
+        let run = w.run(
+            &mut MockIo::default().executable_with(&k, &[(b"room:a", b"A")]),
+            union(),
+        );
+        assert!(run.report.predecessors[0].exported_fewer_after_data());
+        assert!(!run.report.predecessors[0].exported_nothing_after_data());
+        let other = PredecessorMigration::Unresponsive {
+            key: k.clone(),
+            generation: 1,
+            error: Some("transport fault".to_string()),
+        };
+        assert!(!other.exported_fewer_after_data());
+        let none_err = PredecessorMigration::Unresponsive {
+            key: k,
+            generation: 1,
+            error: None,
+        };
+        assert!(!none_err.exported_fewer_after_data());
+        // the message carries both counts
+        if let PredecessorMigration::Unresponsive { error: Some(e), .. } =
+            &run.report.predecessors[0]
+        {
+            assert!(e.ends_with(": 1 of 2"), "{e}");
+        } else {
+            panic!()
+        }
+    }
+
+    /// A reopened entry starts uncounted.
+    #[test]
+    fn p7_reopened_entries_start_uncounted_except_a_reopened_rejection() {
+        let g1 = entry(1, 1);
+        let k = key_of(&g1);
+        let mut j = MigrationJournal::new_pending(&[g1]);
+        j.record(&k, 1, resolved(JournalResolution::NoData));
+        assert!(j.mark_import_started(&k, 1));
+        assert_eq!(j.items_seen(&k), 0);
+        // status of an entry absent from the journal
+        let empty = MigrationJournal::default();
+        match empty.status(&[g1], &union_binding()) {
+            JournalStatus::Incomplete { pending, .. } => assert_eq!(pending[0].items_seen, 0),
+            other => panic!("{other:?}"),
+        }
+        // rejections reopened by a higher import revision keep the count their
+        // import saw (so a short export on the reopen is not believed)
+        let mut j = MigrationJournal::new_pending(&[g1]);
+        j.mark_import_started(&k, 1);
+        j.note_items_seen(&k, 3);
+        j.record(
+            &k,
+            1,
+            resolved(JournalResolution::ImportedWithRejections {
+                rejected: 1,
+                revision: 0,
+                items_seen: 0,
+            }),
+        );
+        let j = MigrationJournal::decode(&j.encode()).expect("round trip");
+        let mut b = union_binding();
+        b.import_revision = 1;
+        match j.status(&[g1], &b) {
+            JournalStatus::Incomplete { pending, .. } => assert_eq!(pending[0].items_seen, 3),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// An import with rejections, reopened by a higher import revision, holds the
+    /// retry to the count its import saw: a short export on the reopen is not
+    /// believed, so the rejected item is still recovered once the read heals.
+    #[test]
+    fn a_reopened_rejection_holds_the_retry_to_its_count() {
+        let g1 = entry(1, 1);
+        let lineage = [g1];
+        let k = key_of(&g1);
+        let full: &[(&[u8], &[u8])] = &[(b"room:a", b"A"), (b"room:b", b"B"), (b"room:x", b"X")];
+        let mut w = InspectingWriter::new(&lineage);
+        w.permanent_fail.insert(b"room:x".to_vec());
+        let _ = w.run(&mut MockIo::default().executable_with(&k, full), union());
+        assert!(matches!(
+            state_of(&w.store, &g1),
+            JournalState::Resolved(JournalResolution::ImportedWithRejections { items_seen: 3, .. })
+        ));
+        w.permanent_fail.clear();
+        w.revision = 1;
+        let run = w.run(
+            &mut MockIo::default().executable_with(&k, &[(b"room:a", b"A"), (b"room:b", b"B")]),
+            union(),
+        );
+        assert!(
+            run.report.predecessors[0].exported_fewer_after_data(),
+            "{run:?}"
+        );
+        assert!(!run.status.expect("stored").is_complete());
+        let status = w
+            .run(&mut MockIo::default().executable_with(&k, full), union())
+            .status
+            .expect("stored");
+        assert!(status.is_complete(), "{status:?}");
+        assert_eq!(w.store.get_secret(b"room:x").as_deref(), Some(&b"X"[..]));
+    }
+
+    /// Another session stores a larger count after this run loaded the journal:
+    /// the retry's re-read before its first item holds it to that count.
+    #[test]
+    fn a_count_stored_by_another_session_mid_run_holds_the_retry() {
+        let g1 = entry(1, 1);
+        let lineage = [g1];
+        let k = key_of(&g1);
+        let mut w = InspectingWriter::new(&lineage);
+        block_on(begin_migration_journal(&mut w, &lineage, &union())).expect("begin");
+        let _ = block_on(note_app_import_started(
+            &mut w,
+            &lineage,
+            &k,
+            &union(),
+            None,
+        ))
+        .expect("flag");
+        w.store.set_secret(b"room:a", b"A");
+        let mut theirs =
+            MigrationJournal::decode(&w.store.get_secret(MIGRATION_JOURNAL_KEY).unwrap())
+                .expect("decode");
+        theirs.note_items_seen(&k, 3);
+        w.inject_at_first_marker_read = Some(theirs.encode());
+        let run = w.run(
+            &mut MockIo::default().executable_with(&k, &[(b"room:a", b"A")]),
+            union(),
+        );
+        assert!(
+            run.report.predecessors[0].exported_fewer_after_data(),
+            "{run:?}"
+        );
+        assert!(!run.status.expect("stored").is_complete());
+    }
+
+    /// A key listed twice in one export counts once, so a later export listing
+    /// it once is not held short.
+    #[test]
+    fn a_duplicated_key_counts_once() {
+        let g1 = entry(1, 1);
+        let lineage = [g1];
+        let k = key_of(&g1);
+        let mut w = InspectingWriter::new(&lineage);
+        w.retryable_fail.insert(b"room:b".to_vec());
+        let _ = w.run(
+            &mut MockIo::default().executable_with(
+                &k,
+                &[(b"room:a", b"A"), (b"room:a", b"A"), (b"room:b", b"B")],
+            ),
+            union(),
+        );
+        assert!(matches!(
+            state_of(&w.store, &g1),
+            JournalState::Pending { items_seen: 2, .. }
+        ));
+        w.retryable_fail.clear();
+        let status = w
+            .run(
+                &mut MockIo::default().executable_with(&k, &[(b"room:a", b"A"), (b"room:b", b"B")]),
+                union(),
+            )
+            .status
+            .expect("stored");
+        assert!(status.is_complete(), "{status:?}");
+    }
 }
