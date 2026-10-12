@@ -3326,7 +3326,7 @@ mod tests {
 
     // ---- test successor store -------------------------------------------------
 
-    #[derive(Default)]
+    #[derive(Default, Clone)]
     struct MemStore {
         data: BTreeMap<Vec<u8>, Vec<u8>>,
         /// `set_secret` fails (stores nothing) for keys in this set, modelling a
@@ -13484,5 +13484,277 @@ mod tests {
         ));
         assert_eq!(store.get_secret(MIGRATION_JOURNAL_KEY), before);
         assert!(store.get_secret(&pred_wip_marker(&key_of(&g2))).is_none());
+    }
+
+    // ---- round-13 probes --------------------------------------------------------
+
+    /// A generation OLDER than the one flagged holding data does not make the newest
+    /// refusable: the guard looks only at newer generations. Over-refusing here
+    /// strands the authoritative snapshot's app-side import.
+    #[test]
+    fn r13_p1_an_older_generation_holding_data_does_not_refuse_a_newer_flag() {
+        for make in [newest as fn() -> SecretSelectionPolicy, r10_cpu] {
+            for older_state in 0..3 {
+                let (g1, g2) = (entry(1, 1), entry(2, 2));
+                let lineage = [g1, g2];
+                let mut store = MemStore::default();
+                block_on(begin_migration_journal(
+                    &mut store_io(&mut store),
+                    &lineage,
+                    &make(),
+                ))
+                .expect("begin");
+                match older_state {
+                    // journal resolved with data (and its seal)
+                    0 => {
+                        let mut j = MigrationJournal::new_pending(&lineage);
+                        j.record(
+                            &key_of(&g1),
+                            1,
+                            RunOutcome::Resolved(JournalResolution::Imported),
+                        );
+                        put_journal(&mut store, &j);
+                        store.set_secret(
+                            &pred_done_marker(&key_of(&g1)),
+                            PRED_DONE_MARKER_VALUE_DATA,
+                        );
+                    }
+                    // an import under way
+                    // (flagged under the continue-past policy, which imports past a
+                    // newer generation that has not answered)
+                    1 => {
+                        r12_flag(&mut store, &lineage, &key_of(&g1), &r10_cpu()).expect("g1");
+                    }
+                    // only its marker records data
+                    _ => {
+                        store.set_secret(
+                            &pred_wip_marker(&key_of(&g1)),
+                            PRED_DONE_MARKER_VALUE_DATA,
+                        );
+                    }
+                }
+                r12_flag(&mut store, &lineage, &key_of(&g2), &make())
+                    .expect("the newest generation is never superseded by an older one");
+                assert!(matches!(
+                    state_of(&store, &g2),
+                    JournalState::Pending {
+                        import: ImportFlag::Started,
+                        ..
+                    }
+                ));
+            }
+        }
+    }
+
+    /// A newer generation whose in-progress marker saw NO data does not hold the
+    /// authoritative snapshot. The continue-past policy accepts the older flag;
+    /// plain NewestSnapshotWins defers it only because the newer one has not
+    /// answered yet, not as superseded.
+    #[test]
+    fn r13_p2_a_newer_empty_in_progress_marker_does_not_refuse_an_older_flag() {
+        for make in [newest as fn() -> SecretSelectionPolicy, r10_cpu] {
+            let (g1, g2) = (entry(1, 1), entry(2, 2));
+            let lineage = [g1, g2];
+            let mut store = MemStore::default();
+            block_on(begin_migration_journal(
+                &mut store_io(&mut store),
+                &lineage,
+                &make(),
+            ))
+            .expect("begin");
+            store.set_secret(&pred_wip_marker(&key_of(&g2)), PRED_DONE_MARKER_VALUE_EMPTY);
+            let r = r12_flag(&mut store, &lineage, &key_of(&g1), &make());
+            if make().unresponsive_terminates(false) {
+                assert!(
+                    matches!(&r, Err(JournalError::NotImportable(m)) if m.contains("has not answered")),
+                    "{r:?}"
+                );
+            } else {
+                r.expect("a newer generation that saw nothing supersedes nothing");
+            }
+        }
+    }
+
+    /// A legacy GENERATION-KEYED seal written for the newer generation AFTER the
+    /// journal was begun, while the older one has its own data seal: the guard must
+    /// read the NEWER generation's number for it (not the flagged one's), or the
+    /// older flag returns Ok and the app re-merges older values over the newer.
+    #[test]
+    fn r13_p3_a_legacy_exact_seal_for_a_newer_generation_refuses_an_older_flag() {
+        let (g1, g2) = (entry(1, 1), entry(2, 2));
+        let lineage = [g1, g2];
+        let mut store = MemStore::default();
+        block_on(begin_migration_journal(
+            &mut store_io(&mut store),
+            &lineage,
+            &newest(),
+        ))
+        .expect("begin");
+        store.set_secret(&pred_done_marker(&key_of(&g1)), PRED_DONE_MARKER_VALUE_DATA);
+        store.set_secret(&done_marker(2), b"1");
+        let before = store.get_secret(MIGRATION_JOURNAL_KEY);
+        assert!(matches!(
+            r12_flag(&mut store, &lineage, &key_of(&g1), &newest()),
+            Err(JournalError::NotImportable(_))
+        ));
+        assert_eq!(store.get_secret(MIGRATION_JOURNAL_KEY), before);
+    }
+
+    /// A legacy at-or-above seal for a newer generation hides this generation's own
+    /// in-progress import: the flag is still refused (superseded), not returned Ok
+    /// with nothing recorded.
+    #[test]
+    fn r13_p4_a_legacy_seal_over_an_own_in_progress_marker_is_refused() {
+        let g3 = entry(3, 3);
+        let mut store = MemStore::default();
+        block_on(begin_migration_journal(
+            &mut store_io(&mut store),
+            &[g3],
+            &newest(),
+        ))
+        .expect("begin");
+        store.set_secret(&pred_wip_marker(&key_of(&g3)), PRED_DONE_MARKER_VALUE_DATA);
+        store.set_secret(&done_marker(5), b"1");
+        assert!(matches!(
+            r12_flag(&mut store, &[g3], &key_of(&g3), &newest()),
+            Err(JournalError::NotImportable(_))
+        ));
+    }
+
+    /// A newer lineage entry the journal has never seen and whose marker is clean
+    /// supersedes nothing: the continue-past policy accepts, and plain
+    /// NewestSnapshotWins defers only because it has not answered.
+    #[test]
+    fn r13_p5_an_unjournaled_newer_entry_with_a_clean_marker_refuses_nothing() {
+        let (g1, g2) = (entry(1, 1), entry(2, 2));
+        let mut store = MemStore::default();
+        block_on(begin_migration_journal(
+            &mut store_io(&mut store),
+            &[g1],
+            &newest(),
+        ))
+        .expect("begin");
+        r12_flag(&mut store, &[g1, g2], &key_of(&g1), &r10_cpu()).expect("accepted");
+        let r = r12_flag(&mut store, &[g1, g2], &key_of(&g1), &newest());
+        assert!(
+            matches!(&r, Err(JournalError::NotImportable(m)) if m.contains("has not answered")),
+            "{r:?}"
+        );
+    }
+
+    /// The same delegate key with another code hash is not in the lineage.
+    #[test]
+    fn r13_p6_a_known_delegate_key_with_a_foreign_code_hash_is_not_importable() {
+        let g1 = entry(1, 1);
+        let mut store = MemStore::default();
+        block_on(begin_migration_journal(
+            &mut store_io(&mut store),
+            &[g1],
+            &union(),
+        ))
+        .expect("begin");
+        let foreign = DelegateKey::new(g1.delegate_key, CodeHash::new([0xEE; 32]));
+        assert!(matches!(
+            r12_flag(&mut store, &[g1], &foreign, &union()),
+            Err(JournalError::NotImportable(_))
+        ));
+    }
+
+    /// Every newer generation counts, not just the first one the caller's slice
+    /// lists: with three generations, data on only the newest or only the middle
+    /// one refuses the oldest, in either slice order, whatever the way the data is
+    /// recorded (journal flag, or marker only).
+    #[test]
+    fn r13_p7_any_newer_generation_holding_data_refuses_an_older_flag() {
+        for make in [newest as fn() -> SecretSelectionPolicy, r10_cpu] {
+            for descending in [false, true] {
+                for holder in [2usize, 3] {
+                    for via_marker in [false, true] {
+                        let (g1, g2, g3) = (entry(1, 1), entry(2, 2), entry(3, 3));
+                        let mut lineage = vec![g1, g2, g3];
+                        if descending {
+                            lineage.reverse();
+                        }
+                        let mut store = MemStore::default();
+                        block_on(begin_migration_journal(
+                            &mut store_io(&mut store),
+                            &lineage,
+                            &make(),
+                        ))
+                        .expect("begin");
+                        let h = if holder == 2 { g2 } else { g3 };
+                        if via_marker {
+                            store.set_secret(
+                                &pred_wip_marker(&key_of(&h)),
+                                PRED_DONE_MARKER_VALUE_DATA,
+                            );
+                        } else {
+                            r12_flag(&mut store, &lineage, &key_of(&h), &r10_cpu())
+                                .expect("holder");
+                        }
+                        let r = r12_flag(&mut store, &lineage, &key_of(&g1), &make());
+                        assert!(
+                            matches!(r, Err(JournalError::NotImportable(_))),
+                            "descending={descending} holder={holder} via_marker={via_marker}: {r:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// A newer generation the journal already shows holding data refuses without a
+    /// marker read: a fault on that marker cannot turn the refusal into a failure
+    /// (the documented cost reads only the markers the journal does not settle).
+    #[test]
+    fn r13_p8_a_journal_settled_newer_generation_is_not_re_read() {
+        let (g1, g2) = (entry(1, 1), entry(2, 2));
+        let lineage = [g1, g2];
+        let mut w = InspectingWriter::new(&lineage);
+        block_on(begin_migration_journal(&mut w, &lineage, &newest())).expect("begin");
+        block_on(note_app_import_started(
+            &mut w,
+            &lineage,
+            &key_of(&g2),
+            &newest(),
+        ))
+        .expect("g2");
+        w.fail_marker_read.insert(key_of(&g2).bytes().to_vec());
+        let r = block_on(note_app_import_started(
+            &mut w,
+            &lineage,
+            &key_of(&g1),
+            &newest(),
+        ));
+        assert!(matches!(r, Err(JournalError::NotImportable(_))), "{r:?}");
+    }
+
+    /// Under plain NewestSnapshotWins, a newer generation resolved as holding
+    /// nothing lets an older flag through, as the walk goes past it; unless its
+    /// own marker contradicts the resolution (an import from it since, whose flag
+    /// a stale store erased).
+    #[test]
+    fn a_newer_generation_resolved_empty_lets_an_older_flag_through_unless_contradicted() {
+        let (g1, g2) = (entry(1, 1), entry(2, 2));
+        let lineage = [g1, g2];
+        let mut store = MemStore::default();
+        let mut io = MockIo::default()
+            .executable_with(&key_of(&g2), &[])
+            .not_installed(&key_of(&g1));
+        let _ = journaled(&mut store, &mut io, &lineage, newest());
+        assert_eq!(
+            state_of(&store, &g2),
+            JournalState::Resolved(JournalResolution::NoData)
+        );
+        // Its empty seal stands beside the resolution; drop it so the journal alone
+        // decides.
+        store.data.remove(&pred_done_marker(&key_of(&g2)));
+        let mut contradicted = store.clone();
+        r12_flag(&mut store, &lineage, &key_of(&g1), &newest()).expect("accepted");
+        contradicted.set_secret(&pred_wip_marker(&key_of(&g2)), PRED_DONE_MARKER_VALUE_DATA);
+        assert!(matches!(
+            r12_flag(&mut contradicted, &lineage, &key_of(&g1), &newest()),
+            Err(JournalError::NotImportable(_))
+        ));
     }
 }
