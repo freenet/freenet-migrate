@@ -120,8 +120,11 @@
 //! [`crate::begin_migration_journal`] reopens such a resolution, and the walk
 //! restores a flag on any predecessor it reaches, and after it on any whose
 //! marker neither it nor the start read (behind a halt, a failed read, a legacy
-//! seal, a supersession). So decide from the status those calls return, not from a raw
-//! [`journal_status`] read. Every store a walk relies on **fails closed**:
+//! seal, a supersession). So decide from the status those calls return, not
+//! from a raw [`journal_status`] read. The same window lets a walk's import
+//! flag store bring in another session's completion of that predecessor and
+//! still write its items: under a never-clobber writer that rewrites the same
+//! data, and brings back only a key deleted inside the window. Every store a walk relies on **fails closed**:
 //! if the journal cannot be read or established, or the import flag cannot be
 //! stored before a predecessor's first item, that predecessor is not imported
 //! this run. A journal from a different encoding version is never overwritten.

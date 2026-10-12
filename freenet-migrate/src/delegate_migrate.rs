@@ -12093,7 +12093,7 @@ mod tests {
         }
     }
 
-    /// Under a snapshot policy: a completed own-generation import is refused as
+    /// Under a snapshot policy: a completed own-generation import is reported as
     /// already imported, a newer NoData does not supersede, a newer
     /// rejection-resolved one does.
     #[test]

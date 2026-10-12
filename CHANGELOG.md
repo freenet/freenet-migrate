@@ -153,11 +153,16 @@ of 4 rooms on every later load. Four review rounds of in-session fixes
 * On success it returns `AppImport::Flagged` (write the data) or, for a
   predecessor whose import already completed (a `Done` seal with data, or
   resolved with data under the binding), `AppImport::AlreadyImported` with
-  nothing recorded. The walk will not offer that one again. Its data can still
-  be partial (a short export, #44; an old tab's writes during a rollout; items
-  the import path rejected), and writing it again fills that gap but also
-  brings back keys deleted since: an app whose merge cannot resurrect a deleted
-  key may write it again, unflagged, and any other skips it.
+  nothing recorded (including when the flag's own store brings in another
+  session's completion). The walk will not offer that one again. Its data can
+  still be partial, or missing altogether (a short export, #44; an old tab's
+  writes during a rollout; items the import path rejected; a legacy seal that
+  never covered it). Writing it again, unflagged, fills that gap but also
+  brings back keys deleted since; skipping it leaves the gap for good, and no
+  status reports it. An app whose merge cannot resurrect a deleted key writes
+  it again, as should one that can tolerate a resurrected key; any other skips
+  it and logs that it did. `AppImport` is `#[must_use]` and `#[non_exhaustive]`:
+  treat a variant you do not know as "do not write".
 * Inside the no-compare-and-swap window between two sessions' stores, a stale
   session can overwrite an app's flag, and the stored journal can then say no
   import is under way over the app's partial copy (even `Complete`, if the
