@@ -200,7 +200,7 @@ use crate::delegate::{
 use crate::driver::RollbackRiskAck;
 use crate::journal::{
     JournalBinding, JournalDecodeError, JournalError, JournalResolution, JournalState,
-    JournalStatus, JournaledSuccessorIo, MigrationJournal, RunOutcome, MIGRATION_JOURNAL_KEY,
+    JournalStatus, JournaledSuccessorIo, MigrationJournal, RunOutcome,
 };
 use crate::lineage::DelegateLineageEntry;
 
@@ -1908,6 +1908,7 @@ where
     // 3. The walk, flagging each data-bearing import durably before it writes.
     let mut journal_error: Option<String> = None;
     let mut observer = JournalObserver {
+        journal_key: successor.journal_key().map(<[u8]>::to_vec),
         journal: &mut journal,
         binding,
         predecessors,
@@ -2100,6 +2101,7 @@ where
 
 struct JournalObserver<'j> {
     journal: &'j mut MigrationJournal,
+    journal_key: Option<Vec<u8>>,
     binding: JournalBinding,
     predecessors: &'j [DelegateLineageEntry],
     policy: &'j SecretSelectionPolicy,
@@ -2111,6 +2113,10 @@ where
     W: JournaledSuccessorIo,
     W::Error: core::fmt::Debug,
 {
+    fn withholds(&self, key: &[u8]) -> bool {
+        self.journal_key.as_deref() == Some(key)
+    }
+
     fn import_started(&self, predecessor: &DelegateKey) -> bool {
         matches!(
             self.journal.entry(predecessor).map(|e| e.state),
@@ -2226,30 +2232,6 @@ fn resolve_outcomes(
     outcomes
 }
 
-/// One limit: [`SecretStore::get_secret`] answers `None` both for an absent key
-/// and, on a node that cannot read it, for a present one (freenet-core reports a
-/// failed secret read as "not found", freenet/freenet-core#5857). So
-/// `load_journal` here cannot return the `Err` the trait asks for on a failed
-/// read, and a journal the node failed to read is started afresh. Every predecessor
-/// is then pending again (rebuilt from the markers), so nothing is sealed by it,
-/// but resolutions and counts the unreadable journal held are lost.
-impl<S: SecretStore + ?Sized> JournaledSuccessorIo for SecretStoreIo<'_, S> {
-    fn load_journal(&mut self) -> impl Future<Output = Result<Option<Vec<u8>>, Self::Error>> {
-        core::future::ready(Ok(self.store.get_secret(MIGRATION_JOURNAL_KEY)))
-    }
-
-    fn store_journal(&mut self, journal: &[u8]) -> impl Future<Output = Result<(), Self::Error>> {
-        let ok = self.store.set_secret(MIGRATION_JOURNAL_KEY, journal);
-        core::future::ready(if ok {
-            Ok(())
-        } else {
-            Err(SecretStoreWriteFailed {
-                key: MIGRATION_JOURNAL_KEY.to_vec(),
-            })
-        })
-    }
-}
-
 /// The redesigned, sans-IO secret transport — the internal factoring of the
 /// **interim** app-side migration (plan G1.7 / G3.6).
 ///
@@ -2352,6 +2334,10 @@ where
 /// Hook into the walk for the journaled entry point. The plain entry points use
 /// [`NoObserver`].
 pub(crate) trait WalkObserver<W> {
+    /// Whether an item with this key must never be offered to the writer (beyond
+    /// the crate's reserved namespace, which is always withheld).
+    fn withholds(&self, key: &[u8]) -> bool;
+
     /// Whether an import from `predecessor` is already known to have started,
     /// though no in-progress marker may say so (the app announced it, or a tab
     /// died between the journal flag and the marker).
@@ -2372,6 +2358,10 @@ pub(crate) trait WalkObserver<W> {
 pub(crate) struct NoObserver;
 
 impl<W> WalkObserver<W> for NoObserver {
+    fn withholds(&self, _key: &[u8]) -> bool {
+        false
+    }
+
     fn import_started(&self, _predecessor: &DelegateKey) -> bool {
         false
     }
@@ -2593,7 +2583,10 @@ where
             // The crate's own reserved namespace is never handed to the app's
             // writer and never counted: an import payload must not be able to write
             // (or forge) a migration marker.
-            let items: Vec<&SecretPair> = secrets.iter().filter(|(k, _)| !is_marker(k)).collect();
+            let items: Vec<&SecretPair> = secrets
+                .iter()
+                .filter(|(k, _)| !is_marker(k) && !observer.withholds(k))
+                .collect();
             let saw_data = prior_saw_data || !items.is_empty();
 
             // An earlier attempt saw data and this one exports nothing. A frozen
@@ -6066,8 +6059,36 @@ mod tests {
     use crate::journal::{
         journal_status, ImportFlag, JournalBinding, JournalDecodeError, JournalError,
         JournalResolution, JournalState, JournalStatus, MigrationJournal, RunOutcome,
-        MIGRATION_JOURNAL_KEY,
     };
+
+    /// Where these tests keep the journal. (The crate ships no delegate-side
+    /// journal store: a node refuses non-marker keys in the reserved namespace, so
+    /// an app picks a key in its own.)
+    const MIGRATION_JOURNAL_KEY: &[u8] = b"test-app/migration-journal";
+
+    impl<S: SecretStore + ?Sized> JournaledSuccessorIo for SecretStoreIo<'_, S> {
+        fn load_journal(&mut self) -> impl Future<Output = Result<Option<Vec<u8>>, Self::Error>> {
+            core::future::ready(Ok(self.store.get_secret(MIGRATION_JOURNAL_KEY)))
+        }
+
+        fn store_journal(
+            &mut self,
+            journal: &[u8],
+        ) -> impl Future<Output = Result<(), Self::Error>> {
+            let ok = self.store.set_secret(MIGRATION_JOURNAL_KEY, journal);
+            core::future::ready(if ok {
+                Ok(())
+            } else {
+                Err(SecretStoreWriteFailed {
+                    key: MIGRATION_JOURNAL_KEY.to_vec(),
+                })
+            })
+        }
+
+        fn journal_key(&self) -> Option<&[u8]> {
+            Some(MIGRATION_JOURNAL_KEY)
+        }
+    }
 
     fn union_binding() -> JournalBinding {
         JournalBinding::new(&union(), 0)
@@ -6279,6 +6300,9 @@ mod tests {
                 });
             }
             self.raw().store_journal(journal).await
+        }
+        fn journal_key(&self) -> Option<&[u8]> {
+            Some(MIGRATION_JOURNAL_KEY)
         }
         fn import_revision(&self) -> u32 {
             self.revision
@@ -7259,7 +7283,10 @@ mod tests {
             .executable_with(&k, &[(MIGRATION_JOURNAL_KEY, b"forged"), (b"room:a", b"A")]);
         writer.run(&mut io, union());
         assert_eq!(writer.offered, vec![b"room:a".to_vec()]);
-        assert!(crate::delegate::is_marker(MIGRATION_JOURNAL_KEY));
+        assert_ne!(
+            writer.store.get_secret(MIGRATION_JOURNAL_KEY).as_deref(),
+            Some(&b"forged"[..])
+        );
     }
 
     // -- the stored form -------------------------------------------------------------

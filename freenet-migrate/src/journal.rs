@@ -129,8 +129,7 @@
 //!   the export is empty and the predecessor resolves `NoData`. Only once an
 //!   attempt has seen data is a later "nothing" refused.
 //! * It does not bind a journal to the successor it is stored in. Store it under
-//!   a key the predecessor adapter never offers for import
-//!   ([`crate::SecretStoreIo`] uses the reserved [`MIGRATION_JOURNAL_KEY`]).
+//!   a key the predecessor adapter never offers for import.
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -147,13 +146,6 @@ use crate::lineage::DelegateLineageEntry;
 /// added field: a build that decodes a same-version journal it does not fully
 /// understand drops what it does not know when it stores it again.
 pub const MIGRATION_JOURNAL_VERSION: u8 = 1;
-
-/// Storage key [`crate::SecretStoreIo`] uses for the journal, inside the crate's
-/// reserved marker namespace (so it is filtered out of every export and can
-/// never be written by an import payload). An app implementing
-/// [`JournaledSuccessorIo`] itself chooses its own key, and must keep that key
-/// out of what its predecessor adapter offers for import.
-pub const MIGRATION_JOURNAL_KEY: &[u8] = b"\0freenet-migrate/v1/journal";
 
 /// How a predecessor was dealt with. See the module docs for which walk outcome
 /// maps to which resolution.
@@ -979,11 +971,13 @@ pub fn journal_status(
 /// [`crate::begin_migration_journal`], [`crate::note_app_import_started`] and
 /// [`crate::migrate_delegate_secrets_journaled`].
 ///
-/// Store the bytes under one fixed key in the successor, and keep that key out of
-/// anything the app's predecessor adapter offers for import — a journal copied
-/// into the next generation would claim a migration that never ran there.
-/// [`crate::SecretStoreIo`] uses [`MIGRATION_JOURNAL_KEY`], which is in the crate's
-/// reserved namespace and filtered automatically.
+/// Store the bytes under one fixed key **in the app's own namespace**, and keep
+/// that key out of anything the app's predecessor adapter offers for import — a
+/// journal copied into the next generation would claim a migration that never
+/// ran there. The crate's reserved `\0freenet-migrate/` namespace is not
+/// available: a node refuses any key there that is not a migration marker, which
+/// is also why the crate ships no delegate-side journal store
+/// ([`crate::SecretStoreIo`] does not implement this trait).
 ///
 /// Like a migration marker, the journal must be **durable when
 /// [`store_journal`](Self::store_journal) returns**, not batched with items.
@@ -1002,6 +996,15 @@ pub trait JournaledSuccessorIo: SuccessorSecretsIo {
 
     /// Durably store `journal`, replacing any stored journal.
     fn store_journal(&mut self, journal: &[u8]) -> impl Future<Output = Result<(), Self::Error>>;
+
+    /// The secret key the journal is stored under, when it lives among the
+    /// successor's secrets. The journaled walk then never offers a predecessor's
+    /// item with this key to the writer, so a predecessor's own journal cannot be
+    /// imported over this one. Return it unless the journal is stored somewhere a
+    /// predecessor export can never reach. Defaults to `None`.
+    fn journal_key(&self) -> Option<&[u8]> {
+        None
+    }
 
     /// A number the app raises when it finds that its import path refused items
     /// permanently that it should have accepted (a decoder bug, say) and has
