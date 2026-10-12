@@ -144,14 +144,20 @@ of 4 rooms on every later load. Four review rounds of in-session fixes
   newer generation covers it. Under plain `NewestSnapshotWins` it also refuses,
   for now, one behind a newer generation that has not answered that it holds
   nothing (the walk halts there too; if that generation never answers, neither
-  clears). And it refuses a predecessor whose import already completed (a `Done`
-  seal with data, or resolved with data under the binding), since writing it
-  again could bring back keys deleted since. Under the continue-past policy it
-  refuses only a newer generation it knows holds data, while the walk asks
-  first: a sweep reads newer generations itself, newest first, and stops at the
-  first that holds data or is refused. A marker read that fails there is a plain
-  `Successor` error, never a verdict. Treat every `Err` alike: skip the
-  predecessor now, try again on a later load.
+  clears). Under the continue-past policy it refuses only a newer generation it
+  knows holds data, while the walk asks first: a sweep reads newer generations
+  itself, newest first, and stops at the first that holds data or errs. A
+  marker read that fails there is a plain `Successor` error, never a verdict.
+  Treat every `Err` alike: skip the predecessor now, try again on a later load,
+  and under a snapshot policy skip every older one for this load too.
+* On success it returns `AppImport::Flagged` (write the data) or, for a
+  predecessor whose import already completed (a `Done` seal with data, or
+  resolved with data under the binding), `AppImport::AlreadyImported` with
+  nothing recorded. The walk will not offer that one again. Its data can still
+  be partial (a short export, #44; an old tab's writes during a rollout; items
+  the import path rejected), and writing it again fills that gap but also
+  brings back keys deleted since: an app whose merge cannot resurrect a deleted
+  key may write it again, unflagged, and any other skips it.
 * Inside the no-compare-and-swap window between two sessions' stores, a stale
   session can overwrite an app's flag, and the stored journal can then say no
   import is under way over the app's partial copy (even `Complete`, if the

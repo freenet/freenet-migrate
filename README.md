@@ -696,9 +696,11 @@ state (freenet/river#760). Store a `MigrationJournal` in the successor instead:
 let begun = begin_migration_journal(&mut successor, DELEGATE_LINEAGE, &policy).await?;
 if !begun.is_complete() {
     // Writing migrated data yourself, outside the walk? Flag it first, once you
-    // hold data read from the predecessor and before you write or merge it, and
-    // skip the write if this errs:
-    // note_app_import_started(&mut successor, DELEGATE_LINEAGE, &predecessor, &policy).await?;
+    // hold data read from the predecessor and before you write or merge it.
+    // Flagged: write. AlreadyImported: nothing recorded; write again only if your
+    // merge cannot resurrect a deleted key. Err: skip it (and, under a snapshot
+    // policy, every older one) this load:
+    // match note_app_import_started(&mut successor, DELEGATE_LINEAGE, &predecessor, &policy).await { .. }
     let run = migrate_delegate_secrets_journaled(
         &mut successor, &mut io, DELEGATE_LINEAGE, authz, policy,
     ).await;

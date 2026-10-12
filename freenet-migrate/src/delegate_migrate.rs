@@ -1810,7 +1810,7 @@ fn status_with_unverified(
 /// with one gap: under `NewestSnapshotWinsContinuePastUnresponsive` it refuses
 /// past a newer generation only when it knows that generation holds data, while
 /// the walk asks it first. So a sweep reads newer generations itself, newest
-/// first, and stops at the first that holds data or that this refuses.
+/// first, and stops at the first that holds data or that this errs on.
 ///
 /// # Errors
 ///
@@ -14077,7 +14077,7 @@ mod tests {
     /// was reachable only with a resolved journal entry, which the journal check
     /// refuses first.
     #[test]
-    fn r15_p1_a_sealed_import_the_journal_missed_is_refused_under_every_policy() {
+    fn r15_p1_a_sealed_import_the_journal_missed_is_already_imported_under_every_policy() {
         for (name, make) in [
             ("union", union as fn() -> SecretSelectionPolicy),
             ("nsw", newest),
@@ -14123,7 +14123,7 @@ mod tests {
     /// stale store erased the seal). Only `ImportedWithRejections` was pinned
     /// through the journal check; a plain `Imported` was covered only by its seal.
     #[test]
-    fn r15_p2_a_journal_resolved_import_without_markers_is_refused_under_every_policy() {
+    fn r15_p2_a_journal_resolved_import_without_markers_is_already_imported_under_every_policy() {
         for (name, make) in [
             ("union", union as fn() -> SecretSelectionPolicy),
             ("nsw", newest),
