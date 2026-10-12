@@ -147,7 +147,10 @@ of 4 rooms on every later load. Four review rounds of in-session fixes
   flagged with no count; and any retry after the journal was lost or corrupt,
   or after a stale store dropped the count (the markers do not carry it). Under
   Union a refused newest generation does not stop older ones, which can then
-  shadow its values under a never-clobber writer (#42). And a predecessor that
+  shadow its values under a never-clobber writer (#42). A count the journal
+  kept is itself evidence that the predecessor holds data, so a rejection a
+  higher revision reopened is not believed empty even if its in-progress marker
+  was lost (#48). And a predecessor that
   really does export fewer than it once did (an old tab's deletes, a build whose
   `fetch_secrets` lists less) stays pending for good (#39).
 * `note_app_import_started(successor, lineage, predecessor, policy, items)` raises the
