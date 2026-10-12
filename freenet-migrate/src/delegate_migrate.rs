@@ -9897,4 +9897,706 @@ mod tests {
             JournalState::Resolved(JournalResolution::SupersededByAuthoritative)
         );
     }
+
+    // -- round 6 of the #38 review --------------------------------------------------
+    //
+    // The lenses' probes, kept as written (the migration lens's loss probes are
+    // inverted into the regression they now pin).
+
+    /// R6S-A: NSW adoption with a pre-0.5 legacy `done:5` marker resolves g3
+    /// `Imported` (AtOrAboveGeneration). The app then switches to Union. g3 was
+    /// barred by the legacy path's monotonicity and never copied; the plain Union
+    /// walk would import it. Does the journaled walk?
+    #[test]
+    fn r6s_a_legacy_nsw_resolution_then_union_switch_imports_the_barred_generation() {
+        let (g3, g5) = (entry(3, 3), entry(5, 5));
+        let lineage = [g3, g5];
+        let mut store = MemStore::default();
+        store.set_secret(&done_marker(5), b"1");
+        block_on(begin_migration_journal(
+            &mut store_io(&mut store),
+            &lineage,
+            &newest(),
+        ))
+        .expect("begin");
+        // The legacy seal stands for g5's authoritative snapshot, not an import of
+        // g3, so g3 is superseded (which reopens under Union), never "imported".
+        assert_eq!(
+            state_of(&store, &g3),
+            JournalState::Resolved(JournalResolution::SupersededByAuthoritative)
+        );
+        let mut io = MockIo::default()
+            .executable_with(&key_of(&g3), &[(b"room:old", b"O")])
+            .executable_with(&key_of(&g5), &[(b"room:new", b"N")]);
+        let run = journaled(&mut store, &mut io, &lineage, union());
+        assert!(
+            store.has_secret(b"room:old"),
+            "g3's data was never imported, journal says {:?}",
+            run.status
+        );
+    }
+
+    /// R6S-A control: the plain Union walk from the same store imports g3.
+    #[test]
+    fn r6s_a_control_plain_union_walk_imports_the_barred_generation() {
+        let (g3, g5) = (entry(3, 3), entry(5, 5));
+        let lineage = [g3, g5];
+        let mut store = MemStore::default();
+        store.set_secret(&done_marker(5), b"1");
+        let mut io = MockIo::default()
+            .executable_with(&key_of(&g3), &[(b"room:old", b"O")])
+            .executable_with(&key_of(&g5), &[(b"room:new", b"N")]);
+        block_on(migrate_delegate_secrets(
+            &mut store_io(&mut store),
+            &mut io,
+            &lineage,
+            ack(),
+            union(),
+        ));
+        assert!(store.has_secret(b"room:old"));
+    }
+
+    /// R6S-A2: same, but the app also flags g3 for its own sweep under Union
+    /// (River's shape) and dies mid-sweep. Does anything report the partial copy?
+    #[test]
+    fn r6s_a2_app_sweep_of_a_legacy_nsw_resolved_generation_after_switch() {
+        let (g3, g5) = (entry(3, 3), entry(5, 5));
+        let lineage = [g3, g5];
+        let k3 = key_of(&g3);
+        let mut store = MemStore::default();
+        store.set_secret(&done_marker(5), b"1");
+        block_on(begin_migration_journal(
+            &mut store_io(&mut store),
+            &lineage,
+            &newest(),
+        ))
+        .expect("begin");
+        // Now Union.
+        block_on(note_app_import_started(
+            &mut store_io(&mut store),
+            &k3,
+            3,
+            &union(),
+        ))
+        .expect("flag");
+        // The app writes one of two rooms, then the tab dies.
+        store.set_secret(b"room:old1", b"O1");
+        assert!(stored_status(&store, &lineage).interrupted_import());
+        let mut io = MockIo::default()
+            .executable_with(&k3, &[(b"room:old1", b"O1"), (b"room:old2", b"O2")])
+            .executable_with(&key_of(&g5), &[(b"room:new", b"N")]);
+        let run = journaled(&mut store, &mut io, &lineage, union());
+        assert!(
+            store.has_secret(b"room:old2"),
+            "room:old2 never imported; status {:?}",
+            run.status
+        );
+    }
+
+    /// A JournaledSuccessorIo that keeps the default `journal_key()`.
+    struct NoKeyWriter {
+        store: MemStore,
+    }
+    impl SuccessorSecretsIo for NoKeyWriter {
+        type Error = SecretStoreWriteFailed;
+        async fn migration_marker(
+            &mut self,
+            query: &MarkerQuery<'_>,
+        ) -> Result<Option<MigrationMarker>, Self::Error> {
+            store_io(&mut self.store).migration_marker(query).await
+        }
+        async fn record_marker(
+            &mut self,
+            predecessor: &DelegateKey,
+            marker: MigrationMarker,
+        ) -> Result<(), Self::Error> {
+            store_io(&mut self.store)
+                .record_marker(predecessor, marker)
+                .await
+        }
+        async fn write_secret(&mut self, item: &RecoveredSecret<'_>) -> ItemWrite<Self::Error> {
+            store_io(&mut self.store).write_secret(item).await
+        }
+    }
+    impl JournaledSuccessorIo for NoKeyWriter {
+        async fn load_journal(&mut self) -> Result<Option<Vec<u8>>, Self::Error> {
+            Ok(self.store.get_secret(MIGRATION_JOURNAL_KEY))
+        }
+        async fn store_journal(&mut self, journal: &[u8]) -> Result<(), Self::Error> {
+            self.store.set_secret(MIGRATION_JOURNAL_KEY, journal);
+            Ok(())
+        }
+    }
+
+    /// What a node would export from a store: everything outside the node's
+    /// reserved migration-marker namespace (the journal namespace is the crate's,
+    /// so a node exports it).
+    fn export_of(store: &MemStore) -> Vec<(Vec<u8>, Vec<u8>)> {
+        store
+            .data
+            .iter()
+            .filter(|(k, _)| !k.starts_with(b"\0freenet-migrate/"))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
+
+    fn continue_past() -> SecretSelectionPolicy {
+        SecretSelectionPolicy::NewestSnapshotWinsContinuePastUnresponsive(
+            crate::RollbackRiskAck::i_understand_continuing_past_silence_can_roll_back(),
+        )
+    }
+
+    /// gen2 ran the journaled code while gen1 was silent: gen2 holds ONLY its
+    /// journal. gen3 then walks [gen1 (now has data), gen2 (journal only)].
+    fn r6_journal_only_middle(
+        policy: fn() -> SecretSelectionPolicy,
+        forget_key: bool,
+        plain: bool,
+    ) -> (MemStore, JournaledMigrationReport) {
+        let g1 = entry(1, 1);
+        let g2 = entry(2, 2);
+        // gen 2's lifetime: lineage [g1], g1 silent.
+        let mut gen2 = MemStore::default();
+        {
+            let mut io = MockIo::default().dead(&key_of(&g1));
+            let run = journaled(&mut gen2, &mut io, &[g1], policy());
+            assert!(!complete(&run));
+        }
+        let gen2_export = export_of(&gen2);
+        assert_eq!(
+            gen2_export.len(),
+            1,
+            "gen2 holds only its journal: {gen2_export:?}"
+        );
+        let pairs: Vec<(&[u8], &[u8])> =
+            gen2_export.iter().map(|(k, v)| (&k[..], &v[..])).collect();
+        // gen 3: g1 now answers with the user's data.
+        let mut io = MockIo::default()
+            .executable_with(&key_of(&g1), &[(b"room:a", b"A")])
+            .executable_with(&key_of(&g2), &pairs);
+        let lineage = [g1, g2];
+        if plain {
+            let mut store = MemStore::default();
+            let report = block_on(migrate_delegate_secrets(
+                &mut store_io(&mut store),
+                &mut io,
+                &lineage,
+                ack(),
+                policy(),
+            ));
+            return (
+                store,
+                JournaledMigrationReport {
+                    report,
+                    status: None,
+                    journal_error: None,
+                },
+            );
+        }
+        if forget_key {
+            let mut w = NoKeyWriter {
+                store: MemStore::default(),
+            };
+            let run = block_on(migrate_delegate_secrets_journaled(
+                &mut w,
+                &mut io,
+                &lineage,
+                ack(),
+                policy(),
+            ));
+            (w.store, run)
+        } else {
+            let mut store = MemStore::default();
+            let run = journaled(&mut store, &mut io, &lineage, policy());
+            (store, run)
+        }
+    }
+
+    #[test]
+    fn r6_control_with_journal_key_imports_the_older_generation() {
+        for policy in [newest as fn() -> SecretSelectionPolicy, continue_past] {
+            let (store, run) = r6_journal_only_middle(policy, false, false);
+            assert_eq!(
+                store.get_secret(b"room:a").as_deref(),
+                Some(&b"A"[..]),
+                "{run:?}"
+            );
+        }
+    }
+
+    /// A predecessor holding only its journal is not a data-bearing snapshot: the
+    /// older generation holding the user's data is still imported, whether the
+    /// writer keeps the default `journal_key()` or the walk is a plain one.
+    #[test]
+    fn a_journal_only_predecessor_never_supersedes_real_data() {
+        for policy in [newest as fn() -> SecretSelectionPolicy, continue_past] {
+            for (forget_key, plain) in [(true, false), (false, true)] {
+                let (store, run) = r6_journal_only_middle(policy, forget_key, plain);
+                assert_eq!(
+                    store.get_secret(b"room:a").as_deref(),
+                    Some(&b"A"[..]),
+                    "plain={plain}: {:?}",
+                    run.report.predecessors
+                );
+            }
+        }
+    }
+
+    /// A successor whose marker store has configurable rule violations.
+    #[derive(Default)]
+    struct Quirky {
+        store: MemStore,
+        /// After any `record_marker`, every later marker read fails.
+        fail_reads_after_record: bool,
+        recorded: bool,
+        /// `InProgress { saw_data: true }` is recorded as `{ saw_data: false }`.
+        drop_data_flag: bool,
+        /// Reads the in-progress marker first (like a store with a single slot).
+        wip_first: bool,
+    }
+    impl SuccessorSecretsIo for Quirky {
+        type Error = SecretStoreWriteFailed;
+        async fn migration_marker(
+            &mut self,
+            query: &MarkerQuery<'_>,
+        ) -> Result<Option<MigrationMarker>, Self::Error> {
+            if self.fail_reads_after_record && self.recorded {
+                return Err(SecretStoreWriteFailed {
+                    key: b"read".to_vec(),
+                });
+            }
+            if self.wip_first && self.recorded {
+                if let Some(v) = self.store.get_secret(&pred_wip_marker(query.predecessor)) {
+                    return Ok(Some(MigrationMarker::InProgress {
+                        saw_data: v != PRED_DONE_MARKER_VALUE_EMPTY,
+                    }));
+                }
+            }
+            store_io(&mut self.store).migration_marker(query).await
+        }
+        async fn record_marker(
+            &mut self,
+            p: &DelegateKey,
+            m: MigrationMarker,
+        ) -> Result<(), Self::Error> {
+            self.recorded = true;
+            let m = match m {
+                MigrationMarker::InProgress { saw_data: true } if self.drop_data_flag => {
+                    MigrationMarker::InProgress { saw_data: false }
+                }
+                other => other,
+            };
+            store_io(&mut self.store).record_marker(p, m).await
+        }
+        async fn write_secret(&mut self, item: &RecoveredSecret<'_>) -> ItemWrite<Self::Error> {
+            store_io(&mut self.store).write_secret(item).await
+        }
+    }
+    impl JournaledSuccessorIo for Quirky {
+        async fn load_journal(&mut self) -> Result<Option<Vec<u8>>, Self::Error> {
+            store_io(&mut self.store).load_journal().await
+        }
+        async fn store_journal(&mut self, j: &[u8]) -> Result<(), Self::Error> {
+            store_io(&mut self.store).store_journal(j).await
+        }
+        fn journal_key(&self) -> &[u8] {
+            MIGRATION_JOURNAL_KEY
+        }
+    }
+
+    fn run_q(
+        w: &mut Quirky,
+        io: &mut MockIo,
+        lineage: &[DelegateLineageEntry],
+        p: SecretSelectionPolicy,
+    ) -> JournaledMigrationReport {
+        block_on(migrate_delegate_secrets_journaled(w, io, lineage, ack(), p))
+    }
+
+    /// PROBE B19: a refused re-ask (marker store breaks the precedence rule) must
+    /// halt the walk so an OLDER generation cannot shadow the newer one's keys.
+    fn setup_empty_sealed_then_flagged(
+        policy: fn() -> SecretSelectionPolicy,
+    ) -> (Quirky, DelegateLineageEntry, DelegateLineageEntry) {
+        let (old, new) = (entry(1, 1), entry(2, 2));
+        let mut w = Quirky::default();
+        // Newest alone, answers empty -> Done{false}.
+        let mut io = MockIo::default().executable_with(&key_of(&new), &[]);
+        run_q(&mut w, &mut io, &[new], policy());
+        (w, old, new)
+    }
+
+    #[test]
+    fn probe_b19_refused_reask_halts_older_generations() {
+        for policy in [union as fn() -> SecretSelectionPolicy, newest] {
+            let (mut w, old, new) = setup_empty_sealed_then_flagged(policy);
+            // The app flags `new` (journal first), but the store reads Done first.
+            let mut df = DoneFirst {
+                store: core::mem::take(&mut w.store),
+            };
+            assert!(block_on(note_app_import_started(
+                &mut df,
+                &key_of(&new),
+                2,
+                &policy()
+            ))
+            .is_err());
+            w.store = df.store;
+            // The lineage grows by an older generation holding other values.
+            let mut df = DoneFirst {
+                store: core::mem::take(&mut w.store),
+            };
+            let mut io = MockIo::default()
+                .executable_with(&key_of(&new), &[(b"room:a", b"NEW")])
+                .executable_with(&key_of(&old), &[(b"room:a", b"OLD"), (b"room:b", b"B")]);
+            let r = block_on(migrate_delegate_secrets_journaled(
+                &mut df,
+                &mut io,
+                &[old, new],
+                ack(),
+                policy(),
+            ));
+            assert!(
+                matches!(
+                    r.report.predecessors[0],
+                    PredecessorMigration::WriterUnavailable { .. }
+                ),
+                "{:?}",
+                r.report
+            );
+            assert!(!df.store.has_secret(b"room:a"), "newer value not written");
+            assert!(
+                !df.store.has_secret(b"room:b"),
+                "older generation must not import behind a refused newer one: {:?}",
+                r.report
+            );
+            assert!(matches!(
+                r.report.predecessors[1],
+                PredecessorMigration::Superseded { .. }
+            ));
+        }
+    }
+
+    /// PROBE B20/D11: a marker read that FAILS after the in-progress record is not
+    /// a pass.
+    #[test]
+    fn probe_d11_note_app_read_back_error_refuses() {
+        let e = entry(1, 1);
+        let mut w = Quirky::default();
+        let mut io = MockIo::default().executable_with(&key_of(&e), &[]);
+        run_q(&mut w, &mut io, &[e], union());
+        w.fail_reads_after_record = true;
+        w.recorded = false;
+        assert!(block_on(note_app_import_started(&mut w, &key_of(&e), 1, &union())).is_err());
+    }
+
+    #[test]
+    fn probe_b20_walk_read_back_error_refuses() {
+        let e = entry(1, 1);
+        let mut w = Quirky::default();
+        let mut io = MockIo::default().executable_with(&key_of(&e), &[]);
+        run_q(&mut w, &mut io, &[e], union());
+        // flag in the journal only (journal first), marker unchanged.
+        let mut j = stored_journal(&w.store);
+        j.mark_import_started(&key_of(&e), 1);
+        put_journal(&mut w.store, &j);
+        w.fail_reads_after_record = true;
+        w.recorded = false;
+        let mut io = MockIo::default().executable_with(&key_of(&e), &[(b"room:a", b"A")]);
+        let r = run_q(&mut w, &mut io, &[e], union());
+        assert!(
+            matches!(
+                r.report.predecessors[0],
+                PredecessorMigration::WriterUnavailable { .. }
+            ),
+            "{:?}",
+            r.report
+        );
+        assert!(!w.store.has_secret(b"room:a"));
+    }
+
+    /// PROBE D9/B23: a store that records the in-progress marker WITHOUT its data
+    /// flag is refused.
+    #[test]
+    fn probe_d9_note_app_dropped_data_flag_refuses() {
+        let e = entry(1, 1);
+        let mut w = Quirky::default();
+        let mut io = MockIo::default().executable_with(&key_of(&e), &[]);
+        run_q(&mut w, &mut io, &[e], union());
+        // fresh predecessor entry w/ no marker: new lineage entry
+        let f = entry(2, 2);
+        block_on(begin_migration_journal(&mut w, &[e, f], &union())).unwrap();
+        w.drop_data_flag = true;
+        assert!(block_on(note_app_import_started(&mut w, &key_of(&f), 2, &union())).is_err());
+    }
+
+    #[test]
+    fn probe_b23_walk_dropped_data_flag_refuses() {
+        let e = entry(1, 1);
+        let mut w = Quirky::default();
+        let mut io = MockIo::default().executable_with(&key_of(&e), &[]);
+        run_q(&mut w, &mut io, &[e], union());
+        let mut j = stored_journal(&w.store);
+        j.mark_import_started(&key_of(&e), 1);
+        put_journal(&mut w.store, &j);
+        w.drop_data_flag = true;
+        w.wip_first = true;
+        w.recorded = false;
+        let mut io = MockIo::default().executable_with(&key_of(&e), &[(b"room:a", b"A")]);
+        let r = run_q(&mut w, &mut io, &[e], union());
+        assert!(
+            matches!(
+                r.report.predecessors[0],
+                PredecessorMigration::WriterUnavailable { .. }
+            ),
+            "{:?}",
+            r.report
+        );
+        assert!(!w.store.has_secret(b"room:a"));
+    }
+
+    /// PROBE A1: a journal NoData resolution is not an import; if the marker is
+    /// gone the predecessor is asked again, and its data imports.
+    #[test]
+    fn probe_a1_journal_no_data_resolution_without_marker_is_reasked() {
+        let e = entry(1, 1);
+        let mut store = MemStore::default();
+        let mut j = MigrationJournal::new_pending(&[e]);
+        j.record(&key_of(&e), 1, resolved(JournalResolution::NoData));
+        put_journal(&mut store, &j);
+        let mut io = MockIo::default().executable_with(&key_of(&e), &[(b"room:a", b"A")]);
+        for policy in [union(), newest()] {
+            let mut s = MemStore::default();
+            put_journal(&mut s, &j);
+            let mut io = MockIo::default().executable_with(&key_of(&e), &[(b"room:a", b"A")]);
+            journaled(&mut s, &mut io, &[e], policy);
+            assert!(s.has_secret(b"room:a"));
+        }
+        let _ = (&mut store, &mut io);
+    }
+
+    /// PROBE A1b: newest policy; newer NoData-resolved in journal, no marker; older holds data.
+    #[test]
+    fn probe_a1b_no_data_resolution_does_not_supersede_older_generation() {
+        let (old, new) = (entry(1, 1), entry(2, 2));
+        let mut store = MemStore::default();
+        let mut j = MigrationJournal::new_pending(&[old, new]);
+        j.record(&key_of(&new), 2, resolved(JournalResolution::NoData));
+        put_journal(&mut store, &j);
+        let mut io = MockIo::default()
+            .executable_with(&key_of(&new), &[])
+            .executable_with(&key_of(&old), &[(b"room:o", b"O")]);
+        journaled(&mut store, &mut io, &[old, new], newest());
+        assert!(store.has_secret(b"room:o"));
+    }
+
+    /// PROBE A3: a journal Imported resolution with the Done marker gone is not
+    /// walked again (no resurrection).
+    #[test]
+    fn probe_a3_journal_imported_without_done_marker_is_not_rewalked() {
+        let e = entry(1, 1);
+        let mut store = MemStore::default();
+        let mut j = MigrationJournal::new_pending(&[e]);
+        j.record(&key_of(&e), 1, resolved(JournalResolution::Imported));
+        put_journal(&mut store, &j);
+        let mut io = MockIo::default().executable_with(&key_of(&e), &[(b"room:a", b"A")]);
+        journaled(&mut store, &mut io, &[e], union());
+        assert!(!io.fetched.contains(key_of(&e).bytes()));
+        assert!(!store.has_secret(b"room:a"));
+    }
+
+    /// PROBE E: refused rows carry the lineage's identity, newest first.
+    #[test]
+    fn probe_e_refused_rows_identify_the_lineage() {
+        let (old, new) = (entry(1, 1), entry(2, 2));
+        let mut store = MemStore::default();
+        store.set_secret(MIGRATION_JOURNAL_KEY, &[0xFF; 4]);
+        // foreign version
+        let mut j = MigrationJournal::new_pending(&[old, new]).encode();
+        let pos = j.windows(2).position(|w| w == [0x61, b'v']).unwrap() + 2;
+        j[pos] = 0x02;
+        store.set_secret(MIGRATION_JOURNAL_KEY, &j);
+        let mut io = MockIo::default();
+        let r = journaled(&mut store, &mut io, &[old, new], union());
+        assert!(refused(&r), "{:?}", r.report);
+        let rows: Vec<(u32, DelegateKey)> = r
+            .report
+            .predecessors
+            .iter()
+            .map(|p| (p.generation(), p.key().clone()))
+            .collect();
+        assert_eq!(rows, vec![(2, key_of(&new)), (1, key_of(&old))]);
+        assert!(r.journal_error.as_deref().is_some_and(|m| !m.is_empty()));
+    }
+
+    /// PROBE W2: the newest generation's in-progress marker cannot be written; an
+    /// older generation must not import behind it.
+    #[test]
+    fn probe_w2_begin_marker_failure_halts_older_generations() {
+        for policy in [union as fn() -> SecretSelectionPolicy, newest] {
+            let (old, new) = (entry(1, 1), entry(2, 2));
+            let mut store = MemStore::default();
+            store.fail_writes_to(&pred_wip_marker(&key_of(&new)));
+            let mut io = MockIo::default()
+                .executable_with(&key_of(&new), &[(b"room:a", b"NEW")])
+                .executable_with(&key_of(&old), &[(b"room:a", b"OLD")]);
+            let r = journaled(&mut store, &mut io, &[old, new], policy());
+            assert!(
+                matches!(
+                    r.report.predecessors[0],
+                    PredecessorMigration::WriterUnavailable { .. }
+                ),
+                "{:?}",
+                r.report
+            );
+            assert!(
+                !store.has_secret(b"room:a"),
+                "older generation imported behind a failed newer one"
+            );
+            assert!(matches!(
+                r.report.predecessors[1],
+                PredecessorMigration::Superseded { .. }
+            ));
+        }
+    }
+
+    /// PROBE K5: an empty in-progress marker (an earlier attempt saw nothing) does
+    /// not make a later empty answer "data then empty"; the primitive seals empty.
+    #[test]
+    fn probe_k5_primitive_seals_empty_over_an_empty_wip() {
+        let k = key_of(&entry(1, 1));
+        let mut store = MemStore::default();
+        store.set_secret(&pred_wip_marker(&k), PRED_DONE_MARKER_VALUE_EMPTY);
+        let out = import_predecessor_secrets_once(&mut store, &k, &[]);
+        assert!(
+            !matches!(out, PredecessorImportOutcome::Incomplete { .. }),
+            "{out:?}"
+        );
+        assert_eq!(
+            crate::delegate::predecessor_migration_had_data(&store, &k),
+            Some(false)
+        );
+    }
+
+    /// PROBE W8 (plain walk, no journal): an empty newest generation is sealed
+    /// EMPTY, so under NewestSnapshotWins a still-incomplete older generation is
+    /// retried on the next run rather than superseded by the empty seal.
+    #[test]
+    fn probe_w8_plain_walk_empty_seal_does_not_supersede_an_incomplete_older_generation() {
+        let (old, new) = (entry(1, 1), entry(2, 2));
+        let mut store = MemStore::default();
+        store.fail_writes_to(b"room:o");
+        let mut io = MockIo::default()
+            .executable_with(&key_of(&new), &[])
+            .executable_with(&key_of(&old), &[(b"room:o", b"O")]);
+        let r1 = block_on(migrate_delegate_secrets(
+            &mut store_io(&mut store),
+            &mut io,
+            &[old, new],
+            ack(),
+            newest(),
+        ));
+        assert!(!r1.is_complete());
+        store.stop_failing();
+        let r2 = block_on(migrate_delegate_secrets(
+            &mut store_io(&mut store),
+            &mut io,
+            &[old, new],
+            ack(),
+            newest(),
+        ));
+        assert!(
+            store.has_secret(b"room:o"),
+            "older generation must be retried: {:?}",
+            r2
+        );
+        assert_eq!(
+            crate::delegate::predecessor_migration_had_data(&store, &key_of(&new)),
+            Some(false)
+        );
+    }
+
+    /// PROBE NJ1/NJ3: under Union (and ContinuePast with no data seen) a newest
+    /// generation that is NOT INSTALLED, or whose probe ERRORS, must not halt the
+    /// walk: the older generation holding the data is still imported. (River's
+    /// shape: absent generations.)
+    #[test]
+    fn probe_nj_absent_or_erroring_newest_does_not_block_older_generations() {
+        let cont = || {
+            SecretSelectionPolicy::NewestSnapshotWinsContinuePastUnresponsive(
+                RollbackRiskAck::i_understand_continuing_past_silence_can_roll_back(),
+            )
+        };
+        for policy in [union as fn() -> SecretSelectionPolicy, cont] {
+            for variant in 0..2 {
+                let (old, new) = (entry(1, 1), entry(2, 2));
+                let mut store = MemStore::default();
+                let mut io = MockIo::default().executable_with(&key_of(&old), &[(b"room:o", b"O")]);
+                io = if variant == 0 {
+                    io.not_installed(&key_of(&new))
+                } else {
+                    io.error_probe(&key_of(&new))
+                };
+                let r = journaled(&mut store, &mut io, &[old, new], policy());
+                assert!(
+                    store.has_secret(b"room:o"),
+                    "variant {variant}: {:?}",
+                    r.report
+                );
+                // and the plain walk
+                let mut store = MemStore::default();
+                let r = block_on(migrate_delegate_secrets(
+                    &mut store_io(&mut store),
+                    &mut io,
+                    &[old, new],
+                    ack(),
+                    policy(),
+                ));
+                assert!(
+                    store.has_secret(b"room:o"),
+                    "plain variant {variant}: {:?}",
+                    r
+                );
+            }
+        }
+    }
+
+    /// PROBE Y1: a newest generation exporting NOTHING BUT its own journal is
+    /// empty, not a data-bearing snapshot: the older generation still imports.
+    #[test]
+    fn probe_y1_a_journal_only_export_is_empty_not_authoritative() {
+        let (old, new) = (entry(1, 1), entry(2, 2));
+        let mut writer = InspectingWriter::new(&[old, new]);
+        let mut io = MockIo::default()
+            .executable_with(&key_of(&new), &[(MIGRATION_JOURNAL_KEY, b"their-journal")])
+            .executable_with(&key_of(&old), &[(b"room:o", b"O")]);
+        writer.run(&mut io, newest());
+        assert!(writer.store.has_secret(b"room:o"));
+        assert_eq!(
+            crate::delegate::predecessor_migration_had_data(&writer.store, &key_of(&new)),
+            Some(false)
+        );
+    }
+
+    /// PROBE Y2: after data was seen, an export holding nothing but the
+    /// predecessor's own journal is still "exported nothing": no seal.
+    #[test]
+    fn probe_y2_a_journal_only_export_after_data_is_not_believed() {
+        let e = entry(1, 1);
+        let mut writer = InspectingWriter::new(&[e]);
+        writer.retryable_fail.insert(b"room:a".to_vec());
+        let mut io =
+            MockIo::default().executable_with(&key_of(&e), &[(b"room:a", b"A"), (b"room:b", b"B")]);
+        writer.run(&mut io, union());
+        writer.retryable_fail.clear();
+        let mut io = MockIo::default()
+            .executable_with(&key_of(&e), &[(MIGRATION_JOURNAL_KEY, b"their-journal")]);
+        let run = writer.run(&mut io, union());
+        assert!(!complete(&run), "{:?}", run.report);
+        assert_eq!(
+            crate::delegate::predecessor_migration_had_data(&writer.store, &key_of(&e)),
+            None,
+            "sealed over a partial copy"
+        );
+    }
 }
