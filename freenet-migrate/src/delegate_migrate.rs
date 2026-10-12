@@ -1746,7 +1746,9 @@ where
 ///
 /// A predecessor whose import already completed with data (its `Done` marker
 /// says so) is left alone: nothing is recorded, and the app's write is a re-merge
-/// of data already in the successor. `policy` is the one the app migrates under;
+/// of data already in the successor. One sealed only by a legacy marker for a
+/// newer generation is superseded under a snapshot policy, not imported: that is
+/// an error (do not write it). `policy` is the one the app migrates under;
 /// `predecessor` must be in the lineage it passes to the walk, or the flag is
 /// recorded where nothing reads it.
 ///
@@ -1795,6 +1797,17 @@ where
         .await
         .map_err(|e| JournalError::Successor(format!("marker read failed: {e:?}")))?;
     if matches!(marker, Some(MigrationMarker::Done { had_data: true })) {
+        if seal_is_bridged(successor, predecessor, generation, policy).await {
+            // A legacy seal for a NEWER generation: under this snapshot policy
+            // this generation is superseded, not imported. Writing its data would
+            // leave a partial copy nothing can record (the flag's read-back would
+            // read the seal again).
+            return Err(JournalError::Successor(
+                "this predecessor is superseded under the snapshot policy (a legacy \
+                 seal for a newer generation); do not import it"
+                    .to_string(),
+            ));
+        }
         return Ok(());
     }
     // The journal first: a kill before the marker leaves the flag, which the walk
@@ -1997,15 +2010,26 @@ async fn seal_is_bridged<W: SuccessorSecretsIo>(
     if policy.legacy_bridge() != LegacyBridge::AtOrAboveGeneration {
         return false;
     }
+    !matches!(
+        exact_marker(successor, predecessor, generation).await,
+        Ok(Some(MigrationMarker::Done { had_data: true }))
+    )
+}
+
+/// `predecessor`'s own marker, ignoring any legacy at-or-above seal: what is
+/// recorded for THIS generation (an in-progress import the bridge would hide,
+/// say).
+async fn exact_marker<W: SuccessorSecretsIo>(
+    successor: &mut W,
+    predecessor: &DelegateKey,
+    generation: u32,
+) -> Result<Option<MigrationMarker>, W::Error> {
     let exact = MarkerQuery {
         predecessor,
         generation,
         legacy_bridge: LegacyBridge::ExactGenerationOnly,
     };
-    !matches!(
-        successor.migration_marker(&exact).await,
-        Ok(Some(MigrationMarker::Done { had_data: true }))
-    )
+    successor.migration_marker(&exact).await
 }
 
 /// What [`start_journal`] found.
@@ -2104,14 +2128,35 @@ where
             // A completion an earlier (plain) walk sealed, resolved as the walk
             // would resolve its `AlreadyMigrated`, so nothing treats it as owed.
             Ok(Some(MigrationMarker::Done { had_data })) => {
-                let resolution = if !had_data {
-                    JournalResolution::NoData
+                if !had_data {
+                    journal.record(
+                        &key,
+                        e.generation,
+                        RunOutcome::Resolved(JournalResolution::NoData),
+                    );
                 } else if seal_is_bridged(successor, &key, e.generation, policy).await {
-                    JournalResolution::SupersededByAuthoritative
+                    // A legacy seal can hide this generation's own in-progress
+                    // marker: an import that started (under Union, say) is still a
+                    // possible partial copy.
+                    if matches!(
+                        exact_marker(successor, &key, e.generation).await,
+                        Ok(Some(MigrationMarker::InProgress { saw_data: true }))
+                    ) {
+                        journal.mark_import_started(&key, e.generation);
+                    } else {
+                        journal.record(
+                            &key,
+                            e.generation,
+                            RunOutcome::Resolved(JournalResolution::SupersededByAuthoritative),
+                        );
+                    }
                 } else {
-                    JournalResolution::Imported
-                };
-                journal.record(&key, e.generation, RunOutcome::Resolved(resolution))
+                    journal.record(
+                        &key,
+                        e.generation,
+                        RunOutcome::Resolved(JournalResolution::Imported),
+                    );
+                }
             }
             Ok(_) => {}
             Err(err) => {
@@ -10699,5 +10744,329 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    // ---- round-7 probes -----------------------------------------------------
+
+    fn r7_own_key_writer_walk(
+        journal_key: &'static [u8],
+        exports: &[(&[u8], &[u8])],
+    ) -> (MemStore, JournaledMigrationReport) {
+        struct OwnKey {
+            store: MemStore,
+            key: &'static [u8],
+        }
+        impl SuccessorSecretsIo for OwnKey {
+            type Error = SecretStoreWriteFailed;
+            async fn migration_marker(
+                &mut self,
+                query: &MarkerQuery<'_>,
+            ) -> Result<Option<MigrationMarker>, Self::Error> {
+                store_io(&mut self.store).migration_marker(query).await
+            }
+            async fn record_marker(
+                &mut self,
+                p: &DelegateKey,
+                m: MigrationMarker,
+            ) -> Result<(), Self::Error> {
+                store_io(&mut self.store).record_marker(p, m).await
+            }
+            async fn write_secret(&mut self, item: &RecoveredSecret<'_>) -> ItemWrite<Self::Error> {
+                store_io(&mut self.store).write_secret(item).await
+            }
+        }
+        impl JournaledSuccessorIo for OwnKey {
+            async fn load_journal(&mut self) -> Result<Option<Vec<u8>>, Self::Error> {
+                Ok(self.store.get_secret(self.key))
+            }
+            async fn store_journal(&mut self, j: &[u8]) -> Result<(), Self::Error> {
+                self.store.set_secret(self.key, j);
+                Ok(())
+            }
+            fn journal_key(&self) -> &[u8] {
+                self.key
+            }
+        }
+        let lineage = [entry(1, 1)];
+        let mut w = OwnKey {
+            store: MemStore::default(),
+            key: journal_key,
+        };
+        let mut io = MockIo::default().executable_with(&key_of(&lineage[0]), exports);
+        let run = block_on(migrate_delegate_secrets_journaled(
+            &mut w,
+            &mut io,
+            &lineage,
+            ack(),
+            union(),
+        ));
+        (w.store, run)
+    }
+
+    /// Only the exact journal key is withheld; a sibling key sharing its prefix is
+    /// the user's data.
+    #[test]
+    fn r7_a_key_sharing_the_journal_keys_prefix_is_still_imported() {
+        let (store, run) = r7_own_key_writer_walk(
+            b"app/journal",
+            &[
+                (b"app/journal-notes", b"N"),
+                (b"app/journal", b"forged"),
+                (b"room:a", b"A"),
+            ],
+        );
+        assert!(complete(&run), "{:?}", run.status);
+        assert!(
+            store.has_secret(b"app/journal-notes"),
+            "sibling key dropped"
+        );
+    }
+
+    /// Keys adjacent to the crate's reserved namespaces are the user's data.
+    #[test]
+    fn r7_keys_adjacent_to_the_reserved_namespaces_are_imported() {
+        let adjacent: [&[u8]; 5] = [
+            b"\0freenet-migrate-journal",
+            b"freenet-migrate-journal/v1",
+            b"\0freenet-migrate",
+            b"\0other",
+            b"\0freenet-migrat",
+        ];
+        for k in adjacent {
+            let (store, run) = r7_own_key_writer_walk(b"app/journal", &[(k, b"V")]);
+            assert!(complete(&run), "{k:?}: {:?}", run.status);
+            assert!(store.has_secret(k), "{k:?} was dropped");
+        }
+    }
+
+    /// A legacy generation-keyed marker for EXACTLY this generation is an import of
+    /// it, not "superseded by a newer snapshot".
+    #[test]
+    fn r7_a_legacy_exact_marker_journals_imported_not_superseded() {
+        let (g2, g3) = (entry(2, 2), entry(3, 3));
+        let lineage = [g2, g3];
+        let mut store = MemStore::default();
+        store.set_secret(&done_marker(3), b"1");
+        block_on(begin_migration_journal(
+            &mut store_io(&mut store),
+            &lineage,
+            &newest(),
+        ))
+        .expect("begin");
+        assert_eq!(
+            state_of(&store, &g3),
+            JournalState::Resolved(JournalResolution::Imported)
+        );
+        assert_eq!(
+            state_of(&store, &g2),
+            JournalState::Resolved(JournalResolution::SupersededByAuthoritative)
+        );
+    }
+
+    /// The same under the continue-past policy, which shares NSW's legacy bridge.
+    #[test]
+    fn r7_legacy_bridge_under_continue_past() {
+        let (g3, g5) = (entry(3, 3), entry(5, 5));
+        let lineage = [g3, g5];
+        let mut store = MemStore::default();
+        store.set_secret(&done_marker(5), b"1");
+        block_on(begin_migration_journal(
+            &mut store_io(&mut store),
+            &lineage,
+            &continue_past(),
+        ))
+        .expect("begin");
+        assert_eq!(
+            state_of(&store, &g3),
+            JournalState::Resolved(JournalResolution::SupersededByAuthoritative)
+        );
+        // The walk itself, continue-past, with no journal entry yet for g3's seal.
+        let mut io = MockIo::default()
+            .executable_with(&key_of(&g3), &[(b"room:old", b"O")])
+            .executable_with(&key_of(&g5), &[(b"room:new", b"N")]);
+        let run = journaled(&mut store, &mut io, &lineage, continue_past());
+        assert!(
+            !store.has_secret(b"room:old"),
+            "barred generation imported under a snapshot policy"
+        );
+        assert!(complete(&run), "{:?}", run.status);
+    }
+
+    /// A read error on the second (exact) marker query counts as bridged.
+    #[test]
+    fn r7_a_failed_exact_read_journals_the_reopenable_side() {
+        struct FailExact {
+            store: MemStore,
+        }
+        impl SuccessorSecretsIo for FailExact {
+            type Error = SecretStoreWriteFailed;
+            async fn migration_marker(
+                &mut self,
+                q: &MarkerQuery<'_>,
+            ) -> Result<Option<MigrationMarker>, Self::Error> {
+                if q.legacy_bridge == LegacyBridge::ExactGenerationOnly {
+                    return Err(SecretStoreWriteFailed {
+                        key: b"exact".to_vec(),
+                    });
+                }
+                store_io(&mut self.store).migration_marker(q).await
+            }
+            async fn record_marker(
+                &mut self,
+                p: &DelegateKey,
+                m: MigrationMarker,
+            ) -> Result<(), Self::Error> {
+                store_io(&mut self.store).record_marker(p, m).await
+            }
+            async fn write_secret(&mut self, i: &RecoveredSecret<'_>) -> ItemWrite<Self::Error> {
+                store_io(&mut self.store).write_secret(i).await
+            }
+        }
+        impl JournaledSuccessorIo for FailExact {
+            async fn load_journal(&mut self) -> Result<Option<Vec<u8>>, Self::Error> {
+                Ok(self.store.get_secret(MIGRATION_JOURNAL_KEY))
+            }
+            async fn store_journal(&mut self, j: &[u8]) -> Result<(), Self::Error> {
+                self.store.set_secret(MIGRATION_JOURNAL_KEY, j);
+                Ok(())
+            }
+        }
+        let (g3, g5) = (entry(3, 3), entry(5, 5));
+        let lineage = [g3, g5];
+        let mut w = FailExact {
+            store: MemStore::default(),
+        };
+        w.store.set_secret(&done_marker(5), b"1");
+        block_on(begin_migration_journal(&mut w, &lineage, &newest())).expect("begin");
+        assert_eq!(
+            state_of(&w.store, &g3),
+            JournalState::Resolved(JournalResolution::SupersededByAuthoritative)
+        );
+    }
+
+    /// A plain walk pays no extra marker read for the bridge check.
+    #[test]
+    fn r7_a_plain_walk_reads_each_marker_once() {
+        struct Counting {
+            store: MemStore,
+            reads: usize,
+        }
+        impl SuccessorSecretsIo for Counting {
+            type Error = SecretStoreWriteFailed;
+            async fn migration_marker(
+                &mut self,
+                q: &MarkerQuery<'_>,
+            ) -> Result<Option<MigrationMarker>, Self::Error> {
+                self.reads += 1;
+                store_io(&mut self.store).migration_marker(q).await
+            }
+            async fn record_marker(
+                &mut self,
+                p: &DelegateKey,
+                m: MigrationMarker,
+            ) -> Result<(), Self::Error> {
+                store_io(&mut self.store).record_marker(p, m).await
+            }
+            async fn write_secret(&mut self, i: &RecoveredSecret<'_>) -> ItemWrite<Self::Error> {
+                store_io(&mut self.store).write_secret(i).await
+            }
+        }
+        let g5 = entry(5, 5);
+        let mut w = Counting {
+            store: MemStore::default(),
+            reads: 0,
+        };
+        w.store
+            .set_secret(&pred_done_marker(&key_of(&g5)), PRED_DONE_MARKER_VALUE_DATA);
+        let mut io = MockIo::default();
+        block_on(migrate_delegate_secrets(
+            &mut w,
+            &mut io,
+            &[g5],
+            ack(),
+            newest(),
+        ));
+        assert_eq!(w.reads, 1, "a plain walk read the marker more than once");
+    }
+
+    /// A legacy seal for a newer generation must not hide this generation's own
+    /// in-progress data marker when a journal is rebuilt under a snapshot policy:
+    /// a partial copy stays flagged.
+    #[test]
+    fn a_rebuilt_journal_keeps_a_started_import_behind_a_legacy_seal() {
+        let (g3, g4) = (entry(3, 3), entry(4, 4));
+        let lineage = [g3, g4];
+        let mut store = MemStore::default();
+        store.set_secret(&done_marker(5), b"1");
+        // A Union import of g3 started (and died part-way).
+        store.set_secret(&pred_wip_marker(&key_of(&g3)), PRED_DONE_MARKER_VALUE_DATA);
+        store.set_secret(b"g3:a", b"A");
+        let status = block_on(begin_migration_journal(
+            &mut store_io(&mut store),
+            &lineage,
+            &newest(),
+        ))
+        .expect("begin");
+        assert!(matches!(
+            state_of(&store, &g3),
+            JournalState::Pending {
+                import: ImportFlag::Started,
+                ..
+            }
+        ));
+        assert!(status.interrupted_import(), "{status:?}");
+    }
+
+    /// Under a snapshot policy, a predecessor sealed only by a legacy marker for a
+    /// newer generation is superseded, not imported: the app's flag is refused
+    /// (the app must not write it), never silently accepted.
+    #[test]
+    fn an_app_flag_on_a_legacy_superseded_generation_is_refused() {
+        let g3 = entry(3, 3);
+        let k3 = key_of(&g3);
+        let lineage = [g3];
+        let mut store = MemStore::default();
+        store.set_secret(&done_marker(5), b"1");
+        block_on(begin_migration_journal(
+            &mut store_io(&mut store),
+            &lineage,
+            &newest(),
+        ))
+        .expect("begin");
+        assert!(block_on(note_app_import_started(
+            &mut store_io(&mut store),
+            &k3,
+            3,
+            &newest()
+        ))
+        .is_err());
+        assert!(!store.has_secret(&pred_wip_marker(&k3)));
+        // Under Union the same predecessor is owed, and the flag is recorded.
+        block_on(note_app_import_started(
+            &mut store_io(&mut store),
+            &k3,
+            3,
+            &union(),
+        ))
+        .expect("flag under Union");
+        assert!(stored_status(&store, &lineage).interrupted_import());
+    }
+
+    /// The journal key sits in the crate's journal namespace and outside the
+    /// node's marker namespace (which a node restricts to marker shapes), and
+    /// every key in the journal namespace is withheld, not only the current one.
+    #[test]
+    fn the_journal_namespace_is_reserved_and_node_storable() {
+        assert!(MIGRATION_JOURNAL_KEY.starts_with(crate::delegate::JOURNAL_NS));
+        assert!(!MIGRATION_JOURNAL_KEY.starts_with(b"\0freenet-migrate/"));
+        let lineage = [entry(1, 1)];
+        let k = key_of(&lineage[0]);
+        let mut writer = InspectingWriter::new(&lineage);
+        let mut io = MockIo::default().executable_with(
+            &k,
+            &[(b"\0freenet-migrate-journal/x", b"j"), (b"room:a", b"A")],
+        );
+        writer.run(&mut io, union());
+        assert_eq!(writer.offered, vec![b"room:a".to_vec()]);
     }
 }

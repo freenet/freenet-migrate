@@ -1884,4 +1884,64 @@ mod tests {
         let checked = predecessor_delegate_keys_checked(&params, &lineage).unwrap();
         assert_eq!(checked[0].bytes(), recorded_key);
     }
+
+    // ---- round-7 probes: the journal namespace at every is_marker caller ----
+
+    #[test]
+    fn r7_export_withholds_the_journal_key() {
+        let mut store = v1_store();
+        store.set_secret(crate::MIGRATION_JOURNAL_KEY, b"journal-bytes");
+        let origin = MessageOrigin::WebApp(ContractInstanceId::new([7u8; 32]));
+        let msgs = handle_export_request(
+            &store,
+            Some(&origin),
+            &OriginPolicy::Any,
+            &whole_scope(),
+            &ExportRequest {
+                source_generation: 2,
+            },
+        )
+        .unwrap();
+        let exported = extract_exported(&msgs);
+        assert_eq!(exported.secrets.len(), 3);
+        assert!(exported
+            .secrets
+            .iter()
+            .all(|(k, _)| k.as_slice() != crate::MIGRATION_JOURNAL_KEY));
+    }
+
+    #[test]
+    fn r7_import_secrets_once_never_writes_a_journal_key() {
+        let exported = ExportedSecrets {
+            source_generation: 1,
+            secrets: vec![
+                (b"rooms_data".to_vec(), b"R".to_vec()),
+                (crate::MIGRATION_JOURNAL_KEY.to_vec(), b"forged".to_vec()),
+            ],
+        };
+        let mut store = MemStore::default();
+        import_secrets_once(&mut store, &exported, 2).unwrap();
+        assert!(store.has_secret(b"rooms_data"));
+        assert!(!store.has_secret(crate::MIGRATION_JOURNAL_KEY));
+    }
+
+    #[test]
+    fn r7_import_predecessor_journal_only_payload_is_empty_not_data() {
+        let key = dk(3);
+        let mut store = MemStore::default();
+        let out = import_predecessor_secrets_once(
+            &mut store,
+            &key,
+            &[(
+                crate::MIGRATION_JOURNAL_KEY.to_vec(),
+                b"their-journal".to_vec(),
+            )],
+        );
+        assert!(!store.has_secret(crate::MIGRATION_JOURNAL_KEY));
+        assert_eq!(
+            predecessor_migration_had_data(&store, &key),
+            Some(false),
+            "{out:?}"
+        );
+    }
 }
