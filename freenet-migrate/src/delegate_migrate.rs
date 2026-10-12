@@ -3044,8 +3044,11 @@ where
             // marker says so. Then a `Done { had_data: false }` seal contradicts it
             // and is not believed: the predecessor is asked again.
             let journal_started = observer.import_started(&key);
+            // So is a count the journal kept from an import that saw items (a
+            // rejection a higher revision reopened, whose marker may be gone).
+            let known_data = journal_started || observer.items_seen(&key) > 0;
             match marker {
-                Some(MigrationMarker::Done { had_data }) if had_data || !journal_started => {
+                Some(MigrationMarker::Done { had_data }) if had_data || !known_data => {
                     if had_data {
                         if observer.journaled()
                             && seal_is_bridged(successor, &key, generation, policy).await
@@ -3070,11 +3073,9 @@ where
             // NoData and fall through to older generations (resurrection). A
             // journal's started import is the same evidence.
             let (retry, prior_saw_data) = match marker {
-                Some(MigrationMarker::InProgress { saw_data }) => {
-                    (true, saw_data || journal_started)
-                }
+                Some(MigrationMarker::InProgress { saw_data }) => (true, saw_data || known_data),
                 Some(MigrationMarker::Done { .. }) => (true, true),
-                None => (journal_started, journal_started),
+                None => (known_data, known_data),
             };
 
             // A predecessor known to hold data may be partially written to the
@@ -15512,5 +15513,62 @@ mod tests {
                 ))
             ));
         }
+    }
+
+    /// #48: a rejection reopened by a higher import revision whose in-progress
+    /// marker was lost still holds data by the count its import kept, so an empty
+    /// retry is not believed and the rejected item is recovered later.
+    #[test]
+    fn a_reopened_rejection_without_its_marker_does_not_believe_an_empty_retry() {
+        let g1 = entry(1, 1);
+        let lineage = [g1];
+        let k = key_of(&g1);
+        let full: &[(&[u8], &[u8])] = &[(b"room:a", b"A"), (b"room:x", b"X")];
+        let mut w = InspectingWriter::new(&lineage);
+        w.permanent_fail.insert(b"room:x".to_vec());
+        let _ = w.run(&mut MockIo::default().executable_with(&k, full), union());
+        assert!(matches!(
+            state_of(&w.store, &g1),
+            JournalState::Resolved(JournalResolution::ImportedWithRejections { .. })
+        ));
+        w.store.data.remove(&pred_wip_marker(&k));
+        w.permanent_fail.clear();
+        w.revision = 1;
+        let run = w.run(&mut MockIo::default().executable_with(&k, &[]), union());
+        assert!(
+            run.report.predecessors[0].exported_nothing_after_data(),
+            "{run:?}"
+        );
+        assert!(!run.status.expect("stored").is_complete());
+        let status = w
+            .run(&mut MockIo::default().executable_with(&k, full), union())
+            .status
+            .expect("stored");
+        assert!(status.is_complete(), "{status:?}");
+        assert_eq!(w.store.get_secret(b"room:x").as_deref(), Some(&b"X"[..]));
+    }
+
+    /// #48: an empty seal beside a counted, reopened rejection is not believed:
+    /// the predecessor is asked again.
+    #[test]
+    fn an_empty_seal_beside_a_counted_reopened_rejection_is_asked_again() {
+        let g1 = entry(1, 1);
+        let lineage = [g1];
+        let k = key_of(&g1);
+        let full: &[(&[u8], &[u8])] = &[(b"room:a", b"A"), (b"room:x", b"X")];
+        let mut w = InspectingWriter::new(&lineage);
+        w.permanent_fail.insert(b"room:x".to_vec());
+        let _ = w.run(&mut MockIo::default().executable_with(&k, full), union());
+        w.store.data.remove(&pred_wip_marker(&k));
+        w.store
+            .set_secret(&pred_done_marker(&k), PRED_DONE_MARKER_VALUE_EMPTY);
+        w.permanent_fail.clear();
+        w.revision = 1;
+        let status = w
+            .run(&mut MockIo::default().executable_with(&k, full), union())
+            .status
+            .expect("stored");
+        assert!(status.is_complete(), "{status:?}");
+        assert_eq!(w.store.get_secret(b"room:x").as_deref(), Some(&b"X"[..]));
     }
 }
