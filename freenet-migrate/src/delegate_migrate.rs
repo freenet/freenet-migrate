@@ -1728,12 +1728,12 @@ where
     W::Error: core::fmt::Debug,
 {
     let binding = JournalBinding::new(policy, successor.import_revision());
-    let (started, unverified) = start_journal(successor, predecessors, policy, &binding).await?;
+    let (started, checks) = start_journal(successor, predecessors, policy, &binding).await?;
     let mut journal = match started {
         Started::Existing(journal) => {
             return Ok(status_with_unverified(
                 &journal,
-                &unverified,
+                &checks.unverified,
                 predecessors,
                 &binding,
             ))
@@ -1749,7 +1749,7 @@ where
     .await?;
     Ok(status_with_unverified(
         &journal,
-        &unverified,
+        &checks.unverified,
         predecessors,
         &binding,
     ))
@@ -2002,7 +2002,7 @@ where
     let binding = JournalBinding::new(&policy, successor.import_revision());
 
     // 1. Load or start, failing closed.
-    let (started, mut unverified) =
+    let (started, mut checks) =
         match start_journal(successor, predecessors, &policy, &binding).await {
             Err(e) => return refused(e.to_string()),
             Ok(started) => started,
@@ -2054,36 +2054,58 @@ where
         journal.record(row.key(), row.generation(), *run_outcome);
     }
 
-    // 5. What this run never reached (behind a halt, or a successor fault) it
-    // could not check against the markers. A pending predecessor behind a halt
-    // whose marker records an import under way lost its journal flag to another
-    // session's store: restore it. A marker the start could not read, on a
-    // predecessor the walk did not reach either, stays unverified.
+    // 5. Check against its own marker every predecessor whose marker neither the
+    // walk nor the start read: rows behind a halt, the row whose read failed, a
+    // seal read only through a legacy bridge, and rows the journal short-cut.
+    // One that says no import is under way, or that its data is not in the
+    // successor, while its marker records an import (a journal flag another
+    // session's stale store overwrote) is flagged again. A marker that cannot be
+    // read is unverified, as at the start.
     let mut reached = Vec::new();
-    for (row, run_outcome) in outcome.report.predecessors.iter().zip(&outcomes) {
-        if *run_outcome != RunOutcome::Unexamined {
-            reached.push(row.key().clone());
+    for row in &outcome.report.predecessors {
+        let key = row.key();
+        let key_bytes = crate::journal::key_bytes(key);
+        let walk_read_it = !matches!(row, PredecessorMigration::Superseded { .. })
+            && !matches!(
+                row,
+                PredecessorMigration::WriterUnavailable { failure, .. }
+                    if failure.stage == WriterStage::ReadMarker
+            )
+            && !outcome.bridged.contains(&key_bytes)
+            && !outcome.journal_resolved.contains_key(&key_bytes);
+        if walk_read_it {
+            reached.push(key.clone());
             continue;
         }
-        let unflagged = matches!(
-            journal.entry(row.key()).map(|e| e.state),
+        if checks.read.contains(key) {
+            continue;
+        }
+        let unchecked = match journal.entry(key).map(|e| e.state) {
             Some(JournalState::Pending {
                 import: crate::journal::ImportFlag::None,
                 ..
-            })
-        );
-        if !unflagged || !matches!(row, PredecessorMigration::Superseded { .. }) {
+            }) => true,
+            Some(JournalState::Resolved(r)) => !r.is_data_bearing(),
+            _ => false,
+        };
+        if !unchecked {
             continue;
         }
-        match exact_marker(successor, row.key(), row.generation()).await {
-            Ok(Some(MigrationMarker::InProgress { saw_data: true })) => {
-                journal.mark_import_started(row.key(), row.generation());
+        match exact_marker(successor, key, row.generation()).await {
+            Ok(marker) => {
+                checks.unverified.retain(|(k, _)| k != key);
+                if matches!(marker, Some(MigrationMarker::InProgress { saw_data: true })) {
+                    journal.mark_import_started(key, row.generation());
+                }
             }
-            Ok(_) => {}
-            Err(_) => unverified.push((row.key().clone(), row.generation())),
+            Err(_) => {
+                if !checks.unverified.iter().any(|(k, _)| k == key) {
+                    checks.unverified.push((key.clone(), row.generation()));
+                }
+            }
         }
     }
-    unverified.retain(|(key, _)| !reached.contains(key));
+    checks.unverified.retain(|(key, _)| !reached.contains(key));
 
     // 6. Store with read-merge-write.
     let status = match store_merged(
@@ -2096,7 +2118,7 @@ where
     {
         Ok(()) => Some(status_with_unverified(
             &journal,
-            &unverified,
+            &checks.unverified,
             predecessors,
             &binding,
         )),
@@ -2152,6 +2174,10 @@ async fn exact_marker<W: SuccessorSecretsIo>(
     successor.migration_marker(&exact).await
 }
 
+fn lineage_key(e: &DelegateLineageEntry) -> DelegateKey {
+    DelegateKey::new(e.delegate_key, CodeHash::new(e.code_hash))
+}
+
 /// What [`start_journal`] found.
 enum Started {
     /// A readable journal is stored, and nothing in it needs changing.
@@ -2162,16 +2188,24 @@ enum Started {
     New(MigrationJournal),
 }
 
+/// Which predecessors' markers [`start_journal`] read to check the journal.
+#[derive(Default)]
+struct MarkerChecks {
+    /// Read: the journal agrees with them.
+    read: Vec<DelegateKey>,
+    /// Could not be read to check a stored resolution: the caller reports each as
+    /// an import under way for this load, without storing that.
+    unverified: Vec<(DelegateKey, u32)>,
+}
+
 /// Load the stored journal, or build the one to start with, for `begin` and the
-/// journaled walk alike. Never stores anything. Also returns the predecessors
-/// whose markers could not be read to check a stored resolution: the caller
-/// reports each as an import under way for this load, without storing that.
+/// journaled walk alike. Never stores anything.
 async fn start_journal<W>(
     successor: &mut W,
     predecessors: &[DelegateLineageEntry],
     policy: &SecretSelectionPolicy,
     binding: &JournalBinding,
-) -> Result<(Started, Vec<(DelegateKey, u32)>), JournalError>
+) -> Result<(Started, MarkerChecks), JournalError>
 where
     W: JournaledSuccessorIo,
     W::Error: core::fmt::Debug,
@@ -2191,7 +2225,7 @@ where
                 // other predecessor migrating); the entry is left as stored and
                 // reported unverified.
                 let mut reopened = false;
-                let mut unverified = Vec::new();
+                let mut checks = MarkerChecks::default();
                 for e in predecessors {
                     let key = DelegateKey::new(e.delegate_key, CodeHash::new(e.code_hash));
                     let non_data = matches!(
@@ -2202,11 +2236,16 @@ where
                         continue;
                     }
                     match exact_marker(successor, &key, e.generation).await {
-                        Ok(Some(MigrationMarker::InProgress { saw_data: true })) => {
-                            reopened |= journal.mark_import_started(&key, e.generation);
+                        Ok(marker) => {
+                            if matches!(
+                                marker,
+                                Some(MigrationMarker::InProgress { saw_data: true })
+                            ) {
+                                reopened |= journal.mark_import_started(&key, e.generation);
+                            }
+                            checks.read.push(key);
                         }
-                        Ok(_) => {}
-                        Err(_) => unverified.push((key, e.generation)),
+                        Err(_) => checks.unverified.push((key, e.generation)),
                     }
                 }
                 // Lineage entries the stored journal has never seen (the lineage
@@ -2232,22 +2271,30 @@ where
                         } else {
                             Started::Existing(journal)
                         },
-                        unverified,
+                        checks,
                     ));
                 }
                 let mut seeded = fresh_journal(successor, &unseen, policy).await?;
                 seeded.merge_stored(&journal, Some(binding));
-                Ok((Started::New(seeded), unverified))
+                checks.read.extend(unseen.iter().map(lineage_key));
+                Ok((Started::New(seeded), checks))
             }
             Err(JournalDecodeError::UnknownVersion(v)) => Err(JournalError::ForeignVersion(v)),
+            // A fresh journal is read off every predecessor's marker.
             Err(JournalDecodeError::Corrupt(_)) => Ok((
                 Started::New(fresh_journal(successor, predecessors, policy).await?),
-                Vec::new(),
+                MarkerChecks {
+                    read: predecessors.iter().map(lineage_key).collect(),
+                    unverified: Vec::new(),
+                },
             )),
         },
         None => Ok((
             Started::New(fresh_journal(successor, predecessors, policy).await?),
-            Vec::new(),
+            MarkerChecks {
+                read: predecessors.iter().map(lineage_key).collect(),
+                unverified: Vec::new(),
+            },
         )),
     }
 }
@@ -2792,6 +2839,22 @@ where
                 continue;
             }
 
+            // A journal that resolved this predecessor with its data in the
+            // successor is not walked again, and its marker is not read (so a
+            // stuck one cannot halt the walk). An import whose only blemish was
+            // permanent rejections has no `Done` marker, so without this every
+            // later walk would re-offer its items and bring back keys deleted
+            // since. (A rejection reopened by a higher import revision is not
+            // "resolved" under the run's binding, and is asked again.)
+            if let Some(resolution) = observer.resolved_with_data(&key) {
+                journal_resolved.insert(crate::journal::key_bytes(&key), resolution);
+                if policy.data_bearing_is_authoritative(true) {
+                    terminated = true;
+                }
+                results.push(PredecessorMigration::AlreadyMigrated { key, generation });
+                continue;
+            }
+
             // Already migrated? The marker (with its data/empty flag), which for a
             // store-backed successor also covers the defensive legacy
             // generation-keyed bridge (P1#3). Skip the round-trips entirely.
@@ -2839,21 +2902,6 @@ where
                 }
                 _ => {}
             }
-            // A journal that resolved this predecessor with its data in the
-            // successor is not walked again. An import whose only blemish was
-            // permanent rejections has no `Done` marker, so without this every
-            // later walk would re-offer its items and bring back keys deleted
-            // since. (A rejection reopened by a higher import revision is not
-            // "resolved" under the run's binding, and is asked again.)
-            if let Some(resolution) = observer.resolved_with_data(&key) {
-                journal_resolved.insert(crate::journal::key_bytes(&key), resolution);
-                if policy.data_bearing_is_authoritative(true) {
-                    terminated = true;
-                }
-                results.push(PredecessorMigration::AlreadyMigrated { key, generation });
-                continue;
-            }
-
             // A surviving in-progress marker means this is a re-attempt, and it
             // carries the earlier attempt's data/empty observation — the sticky-data
             // rule (keep data, upgrade empty→data), so a data-then-empty retry can
