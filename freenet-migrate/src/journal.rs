@@ -945,9 +945,36 @@ fn merge_states(older: JournalState, newer: JournalState) -> JournalState {
             _ if completeness_rank(b) > completeness_rank(a) => Resolved(b),
             _ => Resolved(a),
         },
-        (Resolved(r), p @ Pending { import, .. }) | (p @ Pending { import, .. }, Resolved(r)) => {
+        (
+            Resolved(r),
+            p @ Pending {
+                import,
+                items_seen: seen,
+                ..
+            },
+        )
+        | (
+            p @ Pending {
+                import,
+                items_seen: seen,
+                ..
+            },
+            Resolved(r),
+        ) => {
             if !r.is_data_bearing() && import == ImportFlag::Started {
                 p
+            } else if let JournalResolution::ImportedWithRejections {
+                rejected,
+                revision,
+                items_seen,
+            } = r
+            {
+                // The count only rises: a pending attempt may have seen more.
+                Resolved(JournalResolution::ImportedWithRejections {
+                    rejected,
+                    revision,
+                    items_seen: items_seen.max(seen),
+                })
             } else {
                 Resolved(r)
             }

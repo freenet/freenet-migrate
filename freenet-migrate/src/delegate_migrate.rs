@@ -15476,4 +15476,41 @@ mod tests {
             ))
         ));
     }
+
+    /// A pending attempt that saw more items, merged with another session's
+    /// rejection resolution that saw fewer, keeps the larger count, in either
+    /// merge order.
+    #[test]
+    fn a_rejection_resolution_merged_with_a_pending_attempt_keeps_the_larger_count() {
+        let g1 = entry(1, 1);
+        let k = key_of(&g1);
+        let pending = || {
+            let mut j = MigrationJournal::new_pending(&[g1]);
+            j.mark_import_started(&k, 1);
+            j.note_items_seen(&k, 3);
+            j
+        };
+        let resolved_two = || {
+            let mut j = MigrationJournal::new_pending(&[g1]);
+            j.record(
+                &k,
+                1,
+                resolved(JournalResolution::ImportedWithRejections {
+                    rejected: 1,
+                    revision: 0,
+                    items_seen: 2,
+                }),
+            );
+            j
+        };
+        for (mut ours, theirs) in [(pending(), resolved_two()), (resolved_two(), pending())] {
+            ours.merge_stored(&theirs, None);
+            assert!(matches!(
+                ours.entry(&k).map(|e| e.state),
+                Some(JournalState::Resolved(
+                    JournalResolution::ImportedWithRejections { items_seen: 3, .. }
+                ))
+            ));
+        }
+    }
 }
