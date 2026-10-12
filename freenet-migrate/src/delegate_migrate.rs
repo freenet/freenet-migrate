@@ -10651,11 +10651,8 @@ mod tests {
     #[test]
     fn probe_a1_journal_no_data_resolution_without_marker_is_reasked() {
         let e = entry(1, 1);
-        let mut store = MemStore::default();
         let mut j = MigrationJournal::new_pending(&[e]);
         j.record(&key_of(&e), 1, resolved(JournalResolution::NoData));
-        put_journal(&mut store, &j);
-        let mut io = MockIo::default().executable_with(&key_of(&e), &[(b"room:a", b"A")]);
         for policy in [union(), newest()] {
             let mut s = MemStore::default();
             put_journal(&mut s, &j);
@@ -10663,7 +10660,6 @@ mod tests {
             journaled(&mut s, &mut io, &[e], policy);
             assert!(s.has_secret(b"room:a"));
         }
-        let _ = (&mut store, &mut io);
     }
 
     /// PROBE A1b: newest policy; newer NoData-resolved in journal, no marker; older holds data.
