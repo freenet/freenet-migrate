@@ -1833,6 +1833,13 @@ where
 {
     let begin_first =
         |why: &str| JournalError::Successor(format!("{why}; call begin_migration_journal first"));
+    let already_imported = || {
+        JournalError::NotImportable(
+            "its import already completed: its data is in the successor, and writing it \
+             again could bring back keys deleted since"
+                .to_string(),
+        )
+    };
     let Some(generation) = predecessors
         .iter()
         .find(|e| lineage_key(e) == *predecessor)
@@ -1893,10 +1900,10 @@ where
                 }) if import == crate::journal::ImportFlag::Started || rejected > 0 => {
                     return superseded(newer.generation)
                 }
-                _ => undecided.push((newer, state)),
+                _ => undecided.push(newer),
             }
         }
-        for (newer, state) in undecided {
+        for newer in undecided {
             let marker = exact_marker(successor, &lineage_key(newer), newer.generation)
                 .await
                 .map_err(|e| {
@@ -1904,20 +1911,21 @@ where
                         "marker read failed for a newer generation: {e:?}"
                     ))
                 })?;
-            let known_empty = match marker {
+            // Only its empty seal says it answered "nothing": the walk asks again
+            // wherever that seal is missing, whatever the journal says.
+            let answered_empty = match marker {
                 Some(
                     MigrationMarker::InProgress { saw_data: true }
                     | MigrationMarker::Done { had_data: true },
                 ) => return superseded(newer.generation),
                 Some(MigrationMarker::Done { had_data: false }) => true,
-                // Resolved as holding nothing, and its marker does not contradict it.
-                _ => matches!(state, Some(JournalState::Resolved(_))),
+                _ => false,
             };
-            if !known_empty && policy.unresponsive_terminates(false) {
+            if !answered_empty && policy.unresponsive_terminates(false) {
                 return Err(JournalError::NotImportable(format!(
                     "generation {} has not answered that it holds nothing, and \
-                     NewestSnapshotWins does not import past it (yet: the walk will, once \
-                     it has)",
+                     NewestSnapshotWins does not import past it (until it does, which it \
+                     may never)",
                     newer.generation
                 )));
             }
@@ -1925,6 +1933,16 @@ where
     }
     let binding = JournalBinding::new(policy, successor.import_revision());
     journal.rebind(&binding);
+    // Already imported, as the journal records it under this binding (an import
+    // with rejections at the current revision has no `Done` marker): the walk does
+    // not offer it again, and neither may the app, or a key deleted since comes
+    // back.
+    if matches!(
+        journal.entry(predecessor).map(|e| e.state),
+        Some(JournalState::Resolved(r)) if r.is_data_bearing()
+    ) {
+        return Err(already_imported());
+    }
     let query = MarkerQuery {
         predecessor,
         generation,
@@ -1953,7 +1971,7 @@ where
                     .to_string(),
             ));
         }
-        return Ok(());
+        return Err(already_imported());
     }
     // The journal first: a kill before the marker leaves the flag, which the walk
     // honours on its own; the other order would leave a journal still reading the
@@ -8973,7 +8991,8 @@ mod tests {
         ));
     }
 
-    /// An app flag on an already imported predecessor changes nothing.
+    /// An app flag on an already imported predecessor is refused (writing it again
+    /// could bring back keys deleted since) and changes nothing.
     #[test]
     fn an_app_flag_does_not_reopen_an_imported_predecessor() {
         let lineage = [entry(1, 1)];
@@ -8981,13 +9000,15 @@ mod tests {
         let mut store = MemStore::default();
         let mut io = MockIo::default().executable_with(&k, &[(b"room:a", b"A")]);
         assert!(complete(&journaled(&mut store, &mut io, &lineage, union())));
-        block_on(note_app_import_started(
-            &mut store_io(&mut store),
-            &lineage,
-            &k,
-            &union(),
-        ))
-        .expect("flag");
+        assert!(matches!(
+            block_on(note_app_import_started(
+                &mut store_io(&mut store),
+                &lineage,
+                &k,
+                &union(),
+            )),
+            Err(JournalError::NotImportable(_))
+        ));
         assert!(stored_status(&store, &lineage).is_complete());
     }
 
@@ -9285,13 +9306,15 @@ mod tests {
         let mut io = MockIo::default().executable_with(&k, &[(b"room:a", b"A")]);
         assert!(complete(&journaled(&mut store, &mut io, &lineage, union())));
         let journal_before = store.get_secret(MIGRATION_JOURNAL_KEY);
-        block_on(note_app_import_started(
-            &mut store_io(&mut store),
-            &lineage,
-            &k,
-            &union(),
-        ))
-        .expect("ok");
+        assert!(matches!(
+            block_on(note_app_import_started(
+                &mut store_io(&mut store),
+                &lineage,
+                &k,
+                &union(),
+            )),
+            Err(JournalError::NotImportable(_))
+        ));
         assert_eq!(store.get_secret(MIGRATION_JOURNAL_KEY), journal_before);
         assert!(stored_status(&store, &lineage).is_complete());
         let mut j = MigrationJournal::decode(&journal_before.unwrap()).unwrap();
@@ -9642,7 +9665,10 @@ mod tests {
         let mut io = MockIo::default().executable_with(&k, &[(b"room:a", b"A")]);
         assert!(complete(&writer.run(&mut io, union())));
         let before = writer.markers_recorded.len();
-        block_on(note_app_import_started(&mut writer, &lineage, &k, &union())).expect("ok");
+        assert!(matches!(
+            block_on(note_app_import_started(&mut writer, &lineage, &k, &union())),
+            Err(JournalError::NotImportable(_))
+        ));
         assert_eq!(writer.markers_recorded.len(), before);
     }
 
@@ -12050,15 +12076,18 @@ mod tests {
         assert!(journaled(&mut store, &mut io, &lineage, newest())
             .status
             .is_some());
-        block_on(note_app_import_started(
+        let before = store.get_secret(MIGRATION_JOURNAL_KEY);
+        let r = block_on(note_app_import_started(
             &mut store_io(&mut store),
             &lineage,
             &key_of(&g2),
             &newest(),
-        ))
-        .expect(
-            "a completed own-generation import under a snapshot policy is a no-op, not a refusal",
+        ));
+        assert!(
+            matches!(&r, Err(JournalError::NotImportable(m)) if m.contains("already completed")),
+            "a completed own-generation import is refused as already imported: {r:?}"
         );
+        assert_eq!(store.get_secret(MIGRATION_JOURNAL_KEY), before);
         // (b) a newer NoData resolution does not supersede an older generation
         let mut store = MemStore::default();
         block_on(begin_migration_journal(
@@ -12074,6 +12103,10 @@ mod tests {
             RunOutcome::Resolved(JournalResolution::NoData),
         );
         put_journal(&mut store, &j);
+        store.set_secret(
+            &pred_done_marker(&key_of(&g2)),
+            PRED_DONE_MARKER_VALUE_EMPTY,
+        );
         block_on(note_app_import_started(
             &mut store_io(&mut store),
             &lineage,
@@ -13738,7 +13771,7 @@ mod tests {
     /// own marker contradicts the resolution (an import from it since, whose flag
     /// a stale store erased).
     #[test]
-    fn a_newer_generation_resolved_empty_lets_an_older_flag_through_unless_contradicted() {
+    fn a_newer_generation_answered_empty_lets_an_older_flag_through_unless_contradicted() {
         let (g1, g2) = (entry(1, 1), entry(2, 2));
         let lineage = [g1, g2];
         let mut store = MemStore::default();
@@ -13750,15 +13783,69 @@ mod tests {
             state_of(&store, &g2),
             JournalState::Resolved(JournalResolution::NoData)
         );
-        // Its empty seal stands beside the resolution; drop it so the journal alone
-        // decides.
-        store.data.remove(&pred_done_marker(&key_of(&g2)));
         let mut contradicted = store.clone();
+        let mut unsealed = store.clone();
         r12_flag(&mut store, &lineage, &key_of(&g1), &newest()).expect("accepted");
         contradicted.set_secret(&pred_wip_marker(&key_of(&g2)), PRED_DONE_MARKER_VALUE_DATA);
         assert!(matches!(
             r12_flag(&mut contradicted, &lineage, &key_of(&g1), &newest()),
             Err(JournalError::NotImportable(_))
         ));
+        // Without its empty seal the walk would ask it again: so does the guard,
+        // whatever the journal says.
+        unsealed.data.remove(&pred_done_marker(&key_of(&g2)));
+        let r = r12_flag(&mut unsealed, &lineage, &key_of(&g1), &newest());
+        assert!(
+            matches!(&r, Err(JournalError::NotImportable(m)) if m.contains("has not answered")),
+            "{r:?}"
+        );
+    }
+
+    /// A predecessor resolved as imported with rejections at the current revision
+    /// has no `Done` marker; an app flag on it is still refused as already
+    /// imported (the walk does not offer it again either), and nothing is
+    /// recorded. A higher revision reopens it, and then the flag is taken.
+    #[test]
+    fn an_app_flag_on_an_import_with_rejections_at_the_current_revision_is_refused() {
+        let g1 = entry(1, 1);
+        let lineage = [g1];
+        let mut w = InspectingWriter::new(&lineage);
+        w.permanent_fail.insert(b"room:x".to_vec());
+        let mut io = MockIo::default()
+            .executable_with(&key_of(&g1), &[(b"room:x", b"X"), (b"room:y", b"Y")]);
+        let _ = w.run(&mut io, union());
+        assert!(matches!(
+            state_of(&w.store, &g1),
+            JournalState::Resolved(JournalResolution::ImportedWithRejections { .. })
+        ));
+        let before = (
+            w.store.get_secret(MIGRATION_JOURNAL_KEY),
+            w.markers_recorded.len(),
+        );
+        let r = block_on(note_app_import_started(
+            &mut w,
+            &lineage,
+            &key_of(&g1),
+            &union(),
+        ));
+        assert!(
+            matches!(&r, Err(JournalError::NotImportable(m)) if m.contains("already completed")),
+            "{r:?}"
+        );
+        assert_eq!(
+            (
+                w.store.get_secret(MIGRATION_JOURNAL_KEY),
+                w.markers_recorded.len()
+            ),
+            before
+        );
+        w.revision = 1;
+        block_on(note_app_import_started(
+            &mut w,
+            &lineage,
+            &key_of(&g1),
+            &union(),
+        ))
+        .expect("reopened by the higher revision");
     }
 }
