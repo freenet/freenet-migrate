@@ -142,10 +142,16 @@ of 4 rooms on every later load. Four review rounds of in-session fixes
   data by the journal (resolved with it, an import under way, or a rejection a
   higher revision reopened) or by its own marker, or only a legacy seal for a
   newer generation covers it. Under plain `NewestSnapshotWins` it also refuses,
-  until it has, one behind a newer generation that has not answered that it
-  holds nothing (the walk halts there too). So an app's sweep is held to what
-  the walk would import. A marker read that fails there is a plain `Successor`
-  error, never a verdict.
+  for now, one behind a newer generation that has not answered that it holds
+  nothing (the walk halts there too; if that generation never answers, neither
+  clears). And it refuses a predecessor whose import already completed (a `Done`
+  seal with data, or resolved with data under the binding), since writing it
+  again could bring back keys deleted since. Under the continue-past policy it
+  refuses only a newer generation it knows holds data, while the walk asks
+  first: a sweep reads newer generations itself, newest first, and stops at the
+  first that holds data or is refused. A marker read that fails there is a plain
+  `Successor` error, never a verdict. Treat every `Err` alike: skip the
+  predecessor now, try again on a later load.
 * Inside the no-compare-and-swap window between two sessions' stores, a stale
   session can overwrite an app's flag, and the stored journal can then say no
   import is under way over the app's partial copy (even `Complete`, if the
@@ -326,14 +332,17 @@ is not there (freenet/freenet-core#5857).
   partial copy cannot be told apart from a complete one. Ship the journal with
   a delegate re-key, or accept that window knowingly.
 * **Do not renumber a lineage over a successor holding legacy generation-keyed
-  markers.** Those markers (pre-0.5 `import_secrets_once`) are keyed by
-  generation number, under every policy's bridge, so a renumber points them at
+  markers.** Those markers (from the generation-keyed `import_secrets_once`, any
+  version) are keyed by the export's generation, under every policy's bridge, so a renumber points them at
   a different predecessor: one can then read as migrated without ever being
   imported, or hide an import under way, and the journal certifies it. A
   successor that only ever saw the per-predecessor markers does not have this
   problem. Under a snapshot policy, inserting a forgotten data-bearing
   generation between two already resolved is a different hazard: the older one
   was imported as the authoritative snapshot, and the walk does not revisit it.
+  So is an older build, whose lineage lacks the new generation, walking the
+  same successor during the rollout: ship a lineage change with a delegate
+  re-key.
 * **A legacy generation-keyed import (`import_secrets_once`) interrupted part-way
   is invisible to the journal,** which reads only the per-predecessor markers.
   Do not mix the two APIs on one successor. A legacy at-or-above seal (a

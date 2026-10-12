@@ -1783,9 +1783,7 @@ fn status_with_unverified(
 /// "nothing" is not believed. `predecessors` is the lineage the app passes to
 /// [`begin_migration_journal`] and the walk: it decides the predecessor's
 /// generation and which generations are newer, never the stored journal (which
-/// a tab running another build may have numbered differently). Under a snapshot
-/// policy the app is held to what the walk would import (see Errors), so sweep
-/// newest first and stop where this refuses. Once per
+/// a tab running another build may have numbered differently). Once per
 /// predecessor per session is enough; each call costs two journal loads, a
 /// journal store, two marker reads and a marker write, plus under a snapshot
 /// policy one marker read per newer generation the journal does not already
@@ -1800,10 +1798,16 @@ fn status_with_unverified(
 /// [`JournalStatus::interrupted_import`] reports that the successor may hold a
 /// partial copy.
 ///
-/// A predecessor whose import already completed with data (its `Done` marker
-/// says so) is left alone: nothing is recorded, and the app's write is a re-merge
-/// of data already in the successor (unless a snapshot policy supersedes it, see
-/// Errors).
+/// A predecessor whose import already completed (its `Done` marker records data,
+/// or the journal resolves it with its data) is refused, with nothing recorded:
+/// its data is in the successor, and writing it again could bring back keys the
+/// user deleted since. The walk does not offer it again either.
+///
+/// Under a snapshot policy this holds the app to what the walk would import,
+/// with one gap: under `NewestSnapshotWinsContinuePastUnresponsive` it refuses
+/// past a newer generation only when it knows that generation holds data, while
+/// the walk asks it first. So a sweep reads newer generations itself, newest
+/// first, and stops at the first that holds data or that this refuses.
 ///
 /// # Errors
 ///
@@ -1813,14 +1817,17 @@ fn status_with_unverified(
 /// flag or the marker could not be stored. Do not write: a kill mid-write would
 /// leave a partial copy nothing records.
 ///
-/// [`JournalError::NotImportable`]: the walk would not import the predecessor
-/// now, so do not write from it on this call. It is not in `predecessors`; or a
-/// snapshot policy supersedes it, because a newer generation holds data (the
-/// journal shows it resolved with data, an import from it under way, or a
-/// rejection a higher revision reopened; or its own marker records data) or only
-/// a legacy seal for a newer generation covers this one; or, under plain
-/// `NewestSnapshotWins`, a newer generation has not yet answered that it holds
-/// nothing (the walk halts there too; this one can change on a later load).
+/// [`JournalError::NotImportable`]: do not write from the predecessor on this
+/// call. It is not in `predecessors`; its import already completed; a snapshot
+/// policy supersedes it, because a newer generation holds data (the journal
+/// shows it resolved with data, an import from it under way, or a rejection a
+/// higher revision reopened; or its own marker records data) or only a legacy
+/// seal for a newer generation covers this one; or, under plain
+/// `NewestSnapshotWins`, a newer generation has not answered that it holds
+/// nothing. The last clears once that generation answers "nothing" (its empty
+/// seal); if it never answers, it never clears, and the walk halts there too.
+/// Treat every `Err` alike: skip this predecessor now, and try again on a later
+/// load.
 pub async fn note_app_import_started<W>(
     successor: &mut W,
     predecessors: &[DelegateLineageEntry],

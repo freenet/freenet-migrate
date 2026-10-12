@@ -1094,12 +1094,13 @@ pub enum JournalError {
     /// The stored journal was written by a build with a different journal encoding
     /// version. This build never overwrites it.
     ForeignVersion(u64),
-    /// [`crate::note_app_import_started`] was asked to flag a predecessor the walk
-    /// would not import now: one not in the lineage the app passed, one a newer
-    /// generation's data supersedes under a snapshot policy, or, under plain
-    /// `NewestSnapshotWins`, one behind a newer generation that has not yet
-    /// answered that it holds nothing (that one can change on a later load). Do
-    /// not write from it on this call.
+    /// [`crate::note_app_import_started`] was asked to flag a predecessor the app
+    /// must not write from now: one not in the lineage the app passed, one whose
+    /// import already completed, one a newer generation's data supersedes under a
+    /// snapshot policy, or, under plain `NewestSnapshotWins`, one behind a newer
+    /// generation that has not answered that it holds nothing (that one clears
+    /// once it does, and never if it never does). Skip it on this call; the
+    /// reason is in the string.
     NotImportable(String),
 }
 
