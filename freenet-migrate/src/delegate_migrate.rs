@@ -11408,4 +11408,98 @@ mod tests {
         assert!(complete(&run), "{:?} {:?}", run.status, run.journal_error);
         assert!(w.store.has_secret(b"room:a"));
     }
+
+    /// The no-compare-and-swap window: a stale session's store overwrites the app's
+    /// flag on a predecessor already resolved as holding nothing, and the journal
+    /// reads `Complete` over the app's partial copy. The predecessor's marker still
+    /// says an import started, and the next `begin` reopens it.
+    #[test]
+    fn a_flag_lost_to_a_stale_store_is_recovered_at_the_next_begin() {
+        let lineage = [entry(1, 1)];
+        let k = key_of(&lineage[0]);
+        let mut store = MemStore::default();
+        // Load 1: the predecessor answered "nothing" (a #5857 read fault, say).
+        assert!(complete(&journaled(
+            &mut store,
+            &mut MockIo::default().executable_with(&k, &[]),
+            &lineage,
+            union()
+        )));
+        let stale = store.get_secret(MIGRATION_JOURNAL_KEY).unwrap();
+        // Tab A flags it (journal and marker) and writes part of it, then dies.
+        block_on(note_app_import_started(
+            &mut store_io(&mut store),
+            &k,
+            1,
+            &union(),
+        ))
+        .expect("flag");
+        store.set_secret(b"room:a", b"A");
+        // Tab B, which read the journal before A's flag, stores its stale view.
+        store.set_secret(MIGRATION_JOURNAL_KEY, &stale);
+        assert!(
+            stored_status(&store, &lineage).is_complete(),
+            "the window: Complete over a partial copy"
+        );
+        // The next begin reads the contradicted marker and reopens it.
+        let status = block_on(begin_migration_journal(
+            &mut store_io(&mut store),
+            &lineage,
+            &union(),
+        ))
+        .expect("begin");
+        assert!(status.interrupted_import(), "{status:?}");
+        let mut io = MockIo::default().executable_with(&k, &[(b"room:a", b"A"), (b"room:b", b"B")]);
+        assert!(complete(&journaled(&mut store, &mut io, &lineage, union())));
+        assert_eq!(store.get_secret(b"room:b").as_deref(), Some(&b"B"[..]));
+    }
+
+    /// `note_app_import_started` refuses what it could never resolve: a predecessor
+    /// outside the lineage, and one a snapshot policy supersedes by a newer
+    /// generation's data.
+    #[test]
+    fn an_app_flag_is_refused_where_it_could_never_resolve() {
+        let (g1, g2) = (entry(1, 1), entry(2, 2));
+        let lineage = [g1, g2];
+        let mut store = MemStore::default();
+        let mut io = MockIo::default()
+            .executable_with(&key_of(&g2), &[(b"room:n", b"N")])
+            .executable_with(&key_of(&g1), &[(b"room:o", b"O")]);
+        assert!(complete(&journaled(
+            &mut store,
+            &mut io,
+            &lineage,
+            newest()
+        )));
+        assert!(matches!(
+            block_on(note_app_import_started(
+                &mut store_io(&mut store),
+                &key_of(&entry(9, 9)),
+                9,
+                &newest()
+            )),
+            Err(JournalError::NotImportable(_))
+        ));
+        assert!(matches!(
+            block_on(note_app_import_started(
+                &mut store_io(&mut store),
+                &key_of(&g1),
+                1,
+                &newest()
+            )),
+            Err(JournalError::NotImportable(_))
+        ));
+        assert!(
+            stored_status(&store, &lineage).is_complete(),
+            "nothing recorded"
+        );
+        // Under Union the older generation is owed, and the flag is recorded.
+        block_on(note_app_import_started(
+            &mut store_io(&mut store),
+            &key_of(&g1),
+            1,
+            &union(),
+        ))
+        .expect("flag under Union");
+    }
 }
