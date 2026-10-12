@@ -1858,42 +1858,62 @@ where
     if journal.entry(predecessor).is_none() {
         return Err(begin_first("the journal has no entry for the predecessor"));
     }
-    // Under a snapshot policy a newer generation that holds data is the
-    // authoritative snapshot, which the walk imports instead of this one: a flag
-    // here could never resolve, and the app's older values would shadow the newer
-    // ones under a never-clobber writer. Read as stored, before this binding
+    // Under a snapshot policy the app may import from this generation only where
+    // the walk would. A newer generation that holds data is the authoritative
+    // snapshot: the walk imports it instead, and the app's older values would
+    // shadow it under a never-clobber writer. And under plain `NewestSnapshotWins`
+    // the walk does not look past a newer generation until it has answered that
+    // it holds nothing. The journal is read first, as stored (before this binding
     // reopens anything: a rejection a higher revision reopened still holds the
-    // rest of its data. And the newer generation's own marker, for a flag another
-    // session's stale store erased.
+    // rest of its data), so a marker is read only where the journal does not
+    // decide; then each undecided generation's own marker (a flag another
+    // session's stale store erased, or a seal the journal never recorded).
     if matches!(
         crate::journal::PolicyFamily::of(policy),
         crate::journal::PolicyFamily::NewestSnapshot
     ) {
+        let superseded = |newer: u32| {
+            Err(JournalError::NotImportable(format!(
+                "generation {newer} holds the authoritative snapshot under the snapshot policy"
+            )))
+        };
+        let mut undecided = Vec::new();
         for newer in predecessors.iter().filter(|e| e.generation > generation) {
-            let key = lineage_key(newer);
-            let journal_says = match journal.entry(&key).map(|e| e.state) {
-                Some(JournalState::Resolved(r)) => r.is_data_bearing(),
+            let state = journal.entry(&lineage_key(newer)).map(|e| e.state);
+            match state {
+                Some(JournalState::Resolved(r)) if r.is_data_bearing() => {
+                    return superseded(newer.generation)
+                }
                 Some(JournalState::Pending {
                     import, rejected, ..
-                }) => import == crate::journal::ImportFlag::Started || rejected > 0,
-                None => false,
+                }) if import == crate::journal::ImportFlag::Started || rejected > 0 => {
+                    return superseded(newer.generation)
+                }
+                _ => undecided.push((newer, state)),
+            }
+        }
+        for (newer, state) in undecided {
+            let marker = exact_marker(successor, &lineage_key(newer), newer.generation)
+                .await
+                .map_err(|e| {
+                    JournalError::Successor(format!(
+                        "marker read failed for a newer generation: {e:?}"
+                    ))
+                })?;
+            let known_empty = match marker {
+                Some(
+                    MigrationMarker::InProgress { saw_data: true }
+                    | MigrationMarker::Done { had_data: true },
+                ) => return superseded(newer.generation),
+                Some(MigrationMarker::Done { had_data: false }) => true,
+                // Resolved as holding nothing, and its marker does not contradict it.
+                _ => matches!(state, Some(JournalState::Resolved(_))),
             };
-            let holds_data = journal_says
-                || matches!(
-                    exact_marker(successor, &key, newer.generation)
-                        .await
-                        .map_err(|e| JournalError::Successor(format!(
-                            "marker read failed for a newer generation: {e:?}"
-                        )))?,
-                    Some(
-                        MigrationMarker::InProgress { saw_data: true }
-                            | MigrationMarker::Done { had_data: true }
-                    )
-                );
-            if holds_data {
+            if !known_empty && policy.unresponsive_terminates(false) {
                 return Err(JournalError::NotImportable(format!(
-                    "generation {} holds the authoritative snapshot under the snapshot \
-                     policy",
+                    "generation {} has not answered that it holds nothing, and \
+                     NewestSnapshotWins does not import past it (yet: the walk will, once \
+                     it has)",
                     newer.generation
                 )));
             }
@@ -11881,7 +11901,7 @@ mod tests {
         ))
         .expect("begin");
         let stale = store.get_secret(MIGRATION_JOURNAL_KEY).unwrap();
-        r9_flag(&mut store, &lineage, &k2, newest());
+        r9_flag(&mut store, &lineage, &k2, r10_cpu());
         store.set_secret(b"g2:a", b"A");
         store.set_secret(MIGRATION_JOURNAL_KEY, &stale);
         assert!(matches!(
@@ -12619,7 +12639,7 @@ mod tests {
         ))
         .expect("begin");
         let stale = store.get_secret(MIGRATION_JOURNAL_KEY).unwrap();
-        r9_flag(&mut store, &lineage, &k2, newest());
+        r9_flag(&mut store, &lineage, &k2, r10_cpu());
         store.set_secret(&done_marker(3), b"1");
         store.set_secret(MIGRATION_JOURNAL_KEY, &stale);
         let mut io = MockIo::default()
@@ -12639,7 +12659,7 @@ mod tests {
         let k2 = key_of(&g2);
         let mut w = InspectingWriter::new(&lineage);
         block_on(begin_migration_journal(&mut w, &lineage, &newest())).expect("begin");
-        r9_flag(&mut w.store, &lineage, &k2, newest());
+        r9_flag(&mut w.store, &lineage, &k2, r10_cpu());
         let before = w.status_at_marker_reads.len();
         let mut io = MockIo::default()
             .executable_with(&k2, &[(b"g2:a", b"A")])
@@ -12949,7 +12969,7 @@ mod tests {
         ))
         .expect("begin");
         let stale = store.get_secret(MIGRATION_JOURNAL_KEY).unwrap();
-        r9_flag(&mut store, &old, &k1, newest());
+        r9_flag(&mut store, &old, &k1, r10_cpu());
         store.set_secret(MIGRATION_JOURNAL_KEY, &stale);
         let mut io = MockIo::default()
             .executable_with(&k1, &[(b"g1:a", b"A")])
@@ -13174,7 +13194,9 @@ mod tests {
             let policy = make();
             let (g1, g2) = (entry(1, 1), entry(2, 2));
             let lineage = [g1, g2];
-            // A newer generation merely pending (never answered) supersedes nothing.
+            // A newer generation that has not answered: plain NewestSnapshotWins
+            // does not import past it (the walk halts there), the continue-past
+            // variant does.
             let mut quiet = MemStore::default();
             block_on(begin_migration_journal(
                 &mut store_io(&mut quiet),
@@ -13182,13 +13204,17 @@ mod tests {
                 &policy,
             ))
             .expect("begin");
-            block_on(note_app_import_started(
+            let r = block_on(note_app_import_started(
                 &mut store_io(&mut quiet),
                 &lineage,
                 &key_of(&g1),
                 &policy,
-            ))
-            .expect("a pending, unflagged newer generation supersedes nothing");
+            ));
+            if policy.unresponsive_terminates(false) {
+                assert!(matches!(r, Err(JournalError::NotImportable(_))), "{r:?}");
+            } else {
+                r.expect("the continue-past policy imports past a silent newer generation");
+            }
             let mut store = MemStore::default();
             block_on(begin_migration_journal(
                 &mut store_io(&mut store),
