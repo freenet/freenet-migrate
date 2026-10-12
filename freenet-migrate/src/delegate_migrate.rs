@@ -1927,7 +1927,7 @@ where
     // 3. The walk, flagging each data-bearing import durably before it writes.
     let mut journal_error: Option<String> = None;
     let mut observer = JournalObserver {
-        journal_key: successor.journal_key().map(<[u8]>::to_vec),
+        journal_key: successor.journal_key().to_vec(),
         journal: &mut journal,
         binding,
         predecessors,
@@ -1975,6 +1975,32 @@ where
         report: outcome.report,
         journal_error,
     }
+}
+
+/// Whether a `Done { had_data: true }` read under a snapshot policy holds only
+/// through the legacy at-or-above bridge: a pre-0.5 generation-keyed marker for
+/// a NEWER generation, standing for "a newer authoritative snapshot was
+/// migrated", not "this generation was imported". Such a seal is journalled as
+/// superseded (which reopens under Union), never as imported. A read error counts
+/// as bridged, the reopenable side.
+async fn seal_is_bridged<W: SuccessorSecretsIo>(
+    successor: &mut W,
+    predecessor: &DelegateKey,
+    generation: u32,
+    policy: &SecretSelectionPolicy,
+) -> bool {
+    if policy.legacy_bridge() != LegacyBridge::AtOrAboveGeneration {
+        return false;
+    }
+    let exact = MarkerQuery {
+        predecessor,
+        generation,
+        legacy_bridge: LegacyBridge::ExactGenerationOnly,
+    };
+    !matches!(
+        successor.migration_marker(&exact).await,
+        Ok(Some(MigrationMarker::Done { had_data: true }))
+    )
 }
 
 /// What [`start_journal`] found.
@@ -2072,15 +2098,16 @@ where
             }
             // A completion an earlier (plain) walk sealed, resolved as the walk
             // would resolve its `AlreadyMigrated`, so nothing treats it as owed.
-            Ok(Some(MigrationMarker::Done { had_data })) => journal.record(
-                &key,
-                e.generation,
-                RunOutcome::Resolved(if had_data {
-                    JournalResolution::Imported
-                } else {
+            Ok(Some(MigrationMarker::Done { had_data })) => {
+                let resolution = if !had_data {
                     JournalResolution::NoData
-                }),
-            ),
+                } else if seal_is_bridged(successor, &key, e.generation, policy).await {
+                    JournalResolution::SupersededByAuthoritative
+                } else {
+                    JournalResolution::Imported
+                };
+                journal.record(&key, e.generation, RunOutcome::Resolved(resolution))
+            }
             Ok(_) => {}
             Err(err) => {
                 return Err(JournalError::Successor(format!(
@@ -2144,7 +2171,7 @@ where
 
 struct JournalObserver<'j> {
     journal: &'j mut MigrationJournal,
-    journal_key: Option<Vec<u8>>,
+    journal_key: Vec<u8>,
     binding: JournalBinding,
     predecessors: &'j [DelegateLineageEntry],
     policy: &'j SecretSelectionPolicy,
@@ -2156,8 +2183,12 @@ where
     W: JournaledSuccessorIo,
     W::Error: core::fmt::Debug,
 {
+    fn journaled(&self) -> bool {
+        true
+    }
+
     fn withholds(&self, key: &[u8]) -> bool {
-        self.journal_key.as_deref() == Some(key)
+        self.journal_key == key
     }
 
     fn resolved_with_data(&self, predecessor: &DelegateKey) -> Option<JournalResolution> {
@@ -2226,6 +2257,16 @@ fn resolve_outcomes(
         if let Some(r) = outcome.journal_resolved.get(&key) {
             outcomes.push(RunOutcome::Unexamined);
             resolved.push(Some(*r));
+            continue;
+        }
+        // A legacy at-or-above seal: this generation is superseded by the newer
+        // authoritative snapshot the legacy marker stands for, which also
+        // supersedes everything older behind it in this run.
+        if outcome.bridged.contains(&key) {
+            outcomes.push(RunOutcome::Resolved(
+                JournalResolution::SupersededByAuthoritative,
+            ));
+            resolved.push(Some(JournalResolution::Imported));
             continue;
         }
         let resolution = match row {
@@ -2391,6 +2432,10 @@ where
 /// Hook into the walk for the journaled entry point. The plain entry points use
 /// [`NoObserver`].
 pub(crate) trait WalkObserver<W> {
+    /// Whether a journal records this walk's outcomes (so a legacy seal must be
+    /// told apart from an import, at the cost of one extra marker read).
+    fn journaled(&self) -> bool;
+
     /// Whether an item with this key must never be offered to the writer (beyond
     /// the crate's reserved namespace, which is always withheld).
     fn withholds(&self, key: &[u8]) -> bool;
@@ -2420,6 +2465,10 @@ pub(crate) trait WalkObserver<W> {
 pub(crate) struct NoObserver;
 
 impl<W> WalkObserver<W> for NoObserver {
+    fn journaled(&self) -> bool {
+        false
+    }
+
     fn withholds(&self, _key: &[u8]) -> bool {
         false
     }
@@ -2455,6 +2504,9 @@ pub(crate) struct WalkOutcome {
     /// Predecessors short-circuited as `AlreadyMigrated` by a journal resolution,
     /// with that resolution.
     pub(crate) journal_resolved: BTreeMap<[u8; 32], JournalResolution>,
+    /// Predecessors short-circuited as `AlreadyMigrated` by a legacy at-or-above
+    /// seal only (see [`seal_is_bridged`]).
+    pub(crate) bridged: BTreeSet<[u8; 32]>,
 }
 
 impl<IO> AppSideRoundTrip<'_, IO>
@@ -2478,6 +2530,7 @@ where
         let mut not_installed: BTreeSet<[u8; 32]> = BTreeSet::new();
         let mut done_with_data: BTreeSet<[u8; 32]> = BTreeSet::new();
         let mut journal_resolved: BTreeMap<[u8; 32], JournalResolution> = BTreeMap::new();
+        let mut bridged: BTreeSet<[u8; 32]> = BTreeSet::new();
         // Interim: the app-author ack is a no-op gate — its PRESENCE authorizes
         // the migration. Gap 3's stronger variant (per-transition user consent +
         // node-recorded same-origin binding) is checked here without changing any
@@ -2556,7 +2609,13 @@ where
             match marker {
                 Some(MigrationMarker::Done { had_data }) if had_data || !journal_started => {
                     if had_data {
-                        done_with_data.insert(crate::journal::key_bytes(&key));
+                        if observer.journaled()
+                            && seal_is_bridged(successor, &key, generation, policy).await
+                        {
+                            bridged.insert(crate::journal::key_bytes(&key));
+                        } else {
+                            done_with_data.insert(crate::journal::key_bytes(&key));
+                        }
                     }
                     if policy.data_bearing_is_authoritative(had_data) {
                         terminated = true;
@@ -2923,6 +2982,7 @@ where
             not_installed,
             done_with_data,
             journal_resolved,
+            bridged,
         }
     }
 }
@@ -6177,10 +6237,7 @@ mod tests {
         JournalResolution, JournalState, JournalStatus, MigrationJournal, RunOutcome,
     };
 
-    /// Where these tests keep the journal. (The crate ships no delegate-side
-    /// journal store: a node refuses non-marker keys in the reserved namespace, so
-    /// an app picks a key in its own.)
-    const MIGRATION_JOURNAL_KEY: &[u8] = b"test-app/migration-journal";
+    use crate::journal::MIGRATION_JOURNAL_KEY;
 
     impl<S: SecretStore + ?Sized> JournaledSuccessorIo for SecretStoreIo<'_, S> {
         fn load_journal(&mut self) -> impl Future<Output = Result<Option<Vec<u8>>, Self::Error>> {
@@ -6201,8 +6258,8 @@ mod tests {
             })
         }
 
-        fn journal_key(&self) -> Option<&[u8]> {
-            Some(MIGRATION_JOURNAL_KEY)
+        fn journal_key(&self) -> &[u8] {
+            MIGRATION_JOURNAL_KEY
         }
     }
 
@@ -6443,8 +6500,8 @@ mod tests {
             }
             self.raw().store_journal(journal).await
         }
-        fn journal_key(&self) -> Option<&[u8]> {
-            Some(MIGRATION_JOURNAL_KEY)
+        fn journal_key(&self) -> &[u8] {
+            MIGRATION_JOURNAL_KEY
         }
         fn import_revision(&self) -> u32 {
             self.revision
@@ -9684,8 +9741,8 @@ mod tests {
         async fn store_journal(&mut self, j: &[u8]) -> Result<(), Self::Error> {
             store_io(&mut self.store).store_journal(j).await
         }
-        fn journal_key(&self) -> Option<&[u8]> {
-            Some(MIGRATION_JOURNAL_KEY)
+        fn journal_key(&self) -> &[u8] {
+            MIGRATION_JOURNAL_KEY
         }
     }
 

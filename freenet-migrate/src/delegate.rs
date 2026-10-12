@@ -64,6 +64,12 @@ pub const HOST_ENUMERATION_CAP: usize = 4096;
 /// practice. Marker keys are filtered out of every export and are never
 /// writable from an import payload.
 const MARKER_NS: &[u8] = b"\0freenet-migrate/";
+/// The crate also reserves every key beginning with these bytes, for an app's
+/// migration journal ([`crate::MIGRATION_JOURNAL_KEY`]). It sits OUTSIDE
+/// [`MARKER_NS`] on purpose: a node accepts only migration-marker shapes inside
+/// that one. Keys here are, like markers, never exported, never imported and
+/// never counted as a predecessor's data.
+pub(crate) const JOURNAL_NS: &[u8] = b"\0freenet-migrate-journal/";
 /// Generation-keyed in-progress marker sub-prefix:
 /// `MARKER_NS ++ b"wip:" ++ <gen decimal>` (used by [`import_secrets_once`]).
 const WIP_PREFIX: &[u8] = b"\0freenet-migrate/wip:";
@@ -832,7 +838,7 @@ pub fn predecessor_done_marker(predecessor: &DelegateKey, had_data: bool) -> (Ve
 
 /// Whether `key` is in this crate's reserved marker namespace.
 pub(crate) fn is_marker(key: &[u8]) -> bool {
-    key.starts_with(MARKER_NS)
+    key.starts_with(MARKER_NS) || key.starts_with(JOURNAL_NS)
 }
 
 /// The in-progress marker key for a source generation.
