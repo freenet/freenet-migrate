@@ -9747,7 +9747,7 @@ mod tests {
             JournalState::Resolved(JournalResolution::ImportedWithRejections { .. })
         ));
         // The user deletes room:a.
-        writer.store.data.remove(&b"room:a".to_vec());
+        writer.store.data.remove(b"room:a".as_slice());
         let mut io = MockIo::default()
             .executable_with(&key_of(&holder), &[(b"room:a", b"A"), (b"room:x", b"?")])
             .not_installed(&key_of(&absent));
@@ -9810,5 +9810,30 @@ mod tests {
             Err(JournalError::ForeignVersion(2))?
         }
         assert!(boxed().is_err());
+    }
+
+    /// Under a snapshot policy, a generation behind a predecessor the journal
+    /// resolved with rejections (and the walk short-circuits on) resolves as
+    /// superseded by it: the journal's resolution is the authoritative snapshot.
+    #[test]
+    fn a_grown_lineage_behind_a_rejection_resolved_snapshot_resolves() {
+        let (older, newer) = (entry(1, 1), entry(2, 2));
+        let mut writer = InspectingWriter::new(&[newer]);
+        writer.permanent_fail.insert(b"room:x".to_vec());
+        let mut io = MockIo::default()
+            .executable_with(&key_of(&newer), &[(b"room:a", b"A"), (b"room:x", b"?")])
+            .executable_with(&key_of(&older), &[(b"room:o", b"O")]);
+        assert!(complete(&writer.run(&mut io, newest())));
+        // The lineage grows by an older generation.
+        writer.lineage = vec![older, newer];
+        let run = writer.run(&mut io, newest());
+        assert_eq!(
+            run.status,
+            Some(JournalStatus::Complete { rejected_items: 1 })
+        );
+        assert_eq!(
+            state_of(&writer.store, &older),
+            JournalState::Resolved(JournalResolution::SupersededByAuthoritative)
+        );
     }
 }
