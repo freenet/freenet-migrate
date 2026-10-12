@@ -1805,6 +1805,15 @@ fn status_with_unverified(
 /// policy one marker read per newer generation the journal does not already
 /// show holding data.
 ///
+/// `items`: how many items the app read from the predecessor, **in the walk's
+/// unit**: the number of pairs the app's
+/// [`PredecessorSecretsIo::fetch_secrets`] returns for it, not counting reserved
+/// keys ([`crate::is_reserved_key`]). The journal keeps the largest count it is
+/// given, and a later walk export with fewer items is not believed (#44). Pass
+/// `None` if the app cannot count in that unit: a count in another unit (rooms
+/// where the export holds keys, say) that is larger than the walk's export
+/// keeps the predecessor pending for good.
+///
 /// Records it twice: in the journal, and as the predecessor's in-progress
 /// migration marker (`InProgress { saw_data: true }`), exactly as the walk does
 /// before its own first item. So the walk treats the predecessor as known to

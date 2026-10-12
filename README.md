@@ -701,7 +701,7 @@ if !begun.is_complete() {
     // if your merge cannot resurrect a deleted key, since skipping leaves any gap
     // for good. Any other variant: do not write. Err: skip it (and, under a
     // snapshot policy, every older one) this load:
-    // match note_app_import_started(&mut successor, DELEGATE_LINEAGE, &predecessor, &policy).await { .. }
+    // match note_app_import_started(&mut successor, DELEGATE_LINEAGE, &predecessor, &policy, items).await { .. }
     let run = migrate_delegate_secrets_journaled(
         &mut successor, &mut io, DELEGATE_LINEAGE, authz, policy,
     ).await;
@@ -731,8 +731,8 @@ Drive the journal calls one at a time within a session.
 **Do not adopt the journal unless** your `fetch_secrets` fails loudly (a
 resolution is as permanent as a `Done` marker, so an export that can come back
 partial without an `Err` gets a partial import certified complete; that includes
-a shorter answer on a retry, and an index a failed read turns into a short
-list), your
+an index a failed read turns into a short list on a first attempt; a shorter
+retry after an interrupted import is refused), your
 successor store is durable, your marker store follows the contract, your
 predecessors are frozen, no older build of your app walks the same successor,
 and, under a snapshot policy, every predecessor finished its own migration

@@ -158,9 +158,9 @@
 //!   there). River's sweep and walk read the same predecessor keys.
 //! * It does not detect a predecessor whose export is itself partial: that must
 //!   be an `Err` from the app's [`crate::PredecessorSecretsIo::fetch_secrets`].
-//!   That includes the retry after an interrupted import: only an EMPTY answer
-//!   after data is refused, and a shorter one is believed and resolves
-//!   `Imported`. An app that enumerates through an index the predecessor itself
+//!   A retry after an interrupted import is held to the count the interrupted
+//!   attempt saw (an export with fewer items is not believed, #44), but a first
+//!   attempt that is already short is believed. An app that enumerates through an index the predecessor itself
 //!   reads (and freenet/freenet-core#5857 can make that read come back empty)
 //!   must not let an unreadable index become a short list. For a predecessor
 //!   already deployed, an index read that failed may look exactly like an
@@ -1164,7 +1164,7 @@ pub enum AppImport {
     /// current revision is): nothing was recorded, and the walk will not offer it
     /// again (until a higher import revision reopens a rejection). As far as the
     /// crate knows its data is in the successor, but that can be partial, or
-    /// missing altogether: a short export (#44), a write an old tab made to it
+    /// missing altogether: a short first export, a write an old tab made to it
     /// during a rollout, the items an import path rejected, or a legacy
     /// generation-keyed seal that never covered this data. Writing it again
     /// (unflagged) fills such a gap, and also brings back any key the user deleted
