@@ -131,14 +131,20 @@ of 4 rooms on every later load. Four review rounds of in-session fixes
   whose only blemish was permanent rejections has no `Done` marker). A refused
   run reports every predecessor `WriterUnavailable`
   (`WriterStage::JournalUnavailable`), so it never reads complete.
-* `note_app_import_started` raises the same flag for an app that writes migrated
-  data outside the walk (River's hand-rolled sweep), once it holds data read
-  from the predecessor and before it writes or merges it. It refuses
-  (`JournalError::NotImportable`) a predecessor outside the lineage, or one a
-  snapshot policy supersedes (a newer generation's data, or an import from a
-  newer generation under way), or a `generation` that is not the predecessor's,
-  where a flag could never resolve. `begin` takes the lineage's generations for
-  entries it already has, so a renumbered lineage does not trip it.
+* `note_app_import_started(successor, lineage, predecessor, policy)` raises the
+  same flag for an app that writes migrated data outside the walk (River's
+  hand-rolled sweep), once it holds data read from the predecessor and before
+  it writes or merges it. It takes the same lineage as `begin` and the walk,
+  which decides the predecessor's generation and which ones are newer (never
+  the stored journal, which a tab on another build may have numbered
+  differently). It refuses (`JournalError::NotImportable`) a predecessor outside
+  the lineage, or one a snapshot policy supersedes: a newer generation holds
+  data by the journal (resolved with it, an import under way, or a rejection a
+  higher revision reopened) or by its own marker, or only a legacy seal for a
+  newer generation covers it. A marker read that fails there is a plain
+  `Successor` error, never a verdict. Under a snapshot policy, an app's sweep
+  should also stop where the walk would (at a newer generation it cannot read):
+  the guard refuses only what it knows holds data.
 * Inside the no-compare-and-swap window between two sessions' stores, a stale
   session can overwrite an app's flag, and the stored journal can then say no
   import is under way over the app's partial copy (even `Complete`, if the
@@ -318,6 +324,12 @@ is not there (freenet/freenet-core#5857).
   plain empty `Done`. A predecessor sealed `Done { had_data: true }` over a
   partial copy cannot be told apart from a complete one. Ship the journal with
   a delegate re-key, or accept that window knowingly.
+* **Do not renumber a lineage over a successor holding legacy generation-keyed
+  markers.** Those markers (pre-0.5 `import_secrets_once`, and the at-or-above
+  bridge) are keyed by generation number, so a renumber points them at a
+  different predecessor: one can then read as migrated without ever being
+  imported, and the journal certifies it. A successor that only ever saw the
+  per-predecessor markers is unaffected.
 * **A legacy generation-keyed import (`import_secrets_once`) interrupted part-way
   is invisible to the journal,** which reads only the per-predecessor markers.
   Do not mix the two APIs on one successor. A legacy at-or-above seal (a

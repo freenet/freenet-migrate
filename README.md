@@ -698,7 +698,7 @@ if !begun.is_complete() {
     // Writing migrated data yourself, outside the walk? Flag it first, once you
     // hold data read from the predecessor and before you write or merge it, and
     // skip the write if this errs:
-    // note_app_import_started(&mut successor, &predecessor, generation, &policy).await?;
+    // note_app_import_started(&mut successor, DELEGATE_LINEAGE, &predecessor, &policy).await?;
     let run = migrate_delegate_secrets_journaled(
         &mut successor, &mut io, DELEGATE_LINEAGE, authz, policy,
     ).await;
