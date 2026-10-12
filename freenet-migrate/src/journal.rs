@@ -739,18 +739,6 @@ impl MigrationJournal {
     /// With a `binding`, both sides are first evaluated under it, so a resolution
     /// that no longer holds cannot win the merge. Without one (a caller that does
     /// not know the policy), states merge as stored.
-    /// Set `predecessor`'s generation to the lineage's, where it differs (a
-    /// lineage renumbered since the entry was written). Whether it changed.
-    pub(crate) fn sync_generation(&mut self, predecessor: &DelegateKey, generation: u32) -> bool {
-        match self.entries.get_mut(&key_bytes(predecessor)) {
-            Some(e) if e.generation != generation => {
-                e.generation = generation;
-                true
-            }
-            _ => false,
-        }
-    }
-
     pub(crate) fn merge_stored(
         &mut self,
         stored: &MigrationJournal,

@@ -1780,11 +1780,14 @@ fn status_with_unverified(
 /// from it **outside** the walk (River's hand-rolled sweep), or merges it into
 /// state a later save would persist. Call it only once the app holds data read
 /// from the predecessor: a predecessor flagged this way that then answers
-/// "nothing" is not believed. Under a snapshot policy, do not flag a generation
-/// the policy supersedes (an older one behind the newest that holds data): it
-/// can then never resolve, and [`JournalStatus::interrupted_import`] stays true.
-/// Once per predecessor per session is enough; each call costs two journal loads,
-/// a journal store, two marker reads and a marker write.
+/// "nothing" is not believed. `predecessors` is the lineage the app passes to
+/// [`begin_migration_journal`] and the walk: it decides the predecessor's
+/// generation and which generations are newer, never the stored journal (which
+/// a tab running another build may have numbered differently). Once per
+/// predecessor per session is enough; each call costs two journal loads, a
+/// journal store, two marker reads and a marker write, plus under a snapshot
+/// policy one marker read per newer generation the journal does not already
+/// show holding data.
 ///
 /// Records it twice: in the journal, and as the predecessor's in-progress
 /// migration marker (`InProgress { saw_data: true }`), exactly as the walk does
@@ -1798,28 +1801,26 @@ fn status_with_unverified(
 /// A predecessor whose import already completed with data (its `Done` marker
 /// says so) is left alone: nothing is recorded, and the app's write is a re-merge
 /// of data already in the successor (unless a snapshot policy supersedes it, see
-/// Errors). One sealed only by a legacy marker for a
-/// newer generation is superseded under a snapshot policy, not imported: that is
-/// an error (do not write it). `policy` is the one the app migrates under;
-/// `predecessor` must be in the lineage it passes to the walk, or the flag is
-/// recorded where nothing reads it.
+/// Errors).
 ///
 /// # Errors
 ///
-/// No journal is stored (call [`begin_migration_journal`] first), it cannot be
-/// read, is corrupt or from a different encoding version, the marker cannot be
-/// read, or the flag or the marker could not be stored. Do not write: a kill
-/// mid-write would leave a partial copy nothing records.
+/// No journal is stored, or it has no entry for the predecessor (call
+/// [`begin_migration_journal`] with this lineage first); it cannot be read, is
+/// corrupt or from a different encoding version; a marker cannot be read; or the
+/// flag or the marker could not be stored. Do not write: a kill mid-write would
+/// leave a partial copy nothing records.
 ///
-/// [`JournalError::NotImportable`]: the predecessor is not in the lineage (or
-/// `generation` is not its generation there), or the snapshot policy supersedes
-/// it (a newer generation's data, an import from a newer generation under way,
-/// or a legacy seal for a newer one, is the authoritative snapshot). Do not
-/// import from it.
+/// [`JournalError::NotImportable`]: the predecessor is not in `predecessors`, or
+/// a snapshot policy supersedes it. A newer generation holds the authoritative
+/// snapshot when the journal shows it holding data (resolved with it, an import
+/// from it under way, or a rejection a higher revision reopened), when its own
+/// marker records data, or when only a legacy seal for a newer generation covers
+/// this one. The walk would not import it either. Do not import from it.
 pub async fn note_app_import_started<W>(
     successor: &mut W,
+    predecessors: &[DelegateLineageEntry],
     predecessor: &DelegateKey,
-    generation: u32,
     policy: &SecretSelectionPolicy,
 ) -> Result<(), JournalError>
 where
@@ -1828,6 +1829,15 @@ where
 {
     let begin_first =
         |why: &str| JournalError::Successor(format!("{why}; call begin_migration_journal first"));
+    let Some(generation) = predecessors
+        .iter()
+        .find(|e| lineage_key(e) == *predecessor)
+        .map(|e| e.generation)
+    else {
+        return Err(JournalError::NotImportable(
+            "the predecessor is not in the lineage".to_string(),
+        ));
+    };
     let mut journal = match successor
         .load_journal()
         .await
@@ -1845,45 +1855,52 @@ where
         // Starting one here would skip `begin`'s marker seeding.
         None => return Err(begin_first("no journal is stored")),
     };
-    // `begin` enters every lineage predecessor: one the journal does not know is
-    // not in the lineage, and a flag there would be read by nothing.
-    let Some(entry) = journal.entry(predecessor) else {
-        return Err(JournalError::NotImportable(
-            "the predecessor is not in the lineage the journal was begun with (if the \
-             lineage grew, call begin_migration_journal with it first)"
-                .to_string(),
-        ));
-    };
-    // The snapshot guard and the marker query below go by `generation`: one that
-    // is not the lineage's for this predecessor would slip past both.
-    if entry.generation != generation {
-        return Err(JournalError::NotImportable(format!(
-            "generation {generation} is not this predecessor's (the lineage says {})",
-            entry.generation
-        )));
+    if journal.entry(predecessor).is_none() {
+        return Err(begin_first("the journal has no entry for the predecessor"));
+    }
+    // Under a snapshot policy a newer generation that holds data is the
+    // authoritative snapshot, which the walk imports instead of this one: a flag
+    // here could never resolve, and the app's older values would shadow the newer
+    // ones under a never-clobber writer. Read as stored, before this binding
+    // reopens anything: a rejection a higher revision reopened still holds the
+    // rest of its data. And the newer generation's own marker, for a flag another
+    // session's stale store erased.
+    if matches!(
+        crate::journal::PolicyFamily::of(policy),
+        crate::journal::PolicyFamily::NewestSnapshot
+    ) {
+        for newer in predecessors.iter().filter(|e| e.generation > generation) {
+            let key = lineage_key(newer);
+            let journal_says = match journal.entry(&key).map(|e| e.state) {
+                Some(JournalState::Resolved(r)) => r.is_data_bearing(),
+                Some(JournalState::Pending {
+                    import, rejected, ..
+                }) => import == crate::journal::ImportFlag::Started || rejected > 0,
+                None => false,
+            };
+            let holds_data = journal_says
+                || matches!(
+                    exact_marker(successor, &key, newer.generation)
+                        .await
+                        .map_err(|e| JournalError::Successor(format!(
+                            "marker read failed for a newer generation: {e:?}"
+                        )))?,
+                    Some(
+                        MigrationMarker::InProgress { saw_data: true }
+                            | MigrationMarker::Done { had_data: true }
+                    )
+                );
+            if holds_data {
+                return Err(JournalError::NotImportable(format!(
+                    "generation {} holds the authoritative snapshot under the snapshot \
+                     policy",
+                    newer.generation
+                )));
+            }
+        }
     }
     let binding = JournalBinding::new(policy, successor.import_revision());
     journal.rebind(&binding);
-    // Under a snapshot policy a newer generation that holds data is the
-    // authoritative snapshot: resolved with its data in the successor, or with an
-    // import from it under way (which the walk finishes before it looks at older
-    // ones). This one is superseded, and a flag on it could never resolve.
-    if binding.policy == crate::journal::PolicyFamily::NewestSnapshot
-        && journal.entries().any(|(_, e)| {
-            e.generation > generation
-                && match e.state {
-                    JournalState::Resolved(r) => r.is_data_bearing(),
-                    JournalState::Pending { import, .. } => {
-                        import == crate::journal::ImportFlag::Started
-                    }
-                }
-        })
-    {
-        return Err(JournalError::NotImportable(
-            "a newer generation is the authoritative snapshot under the snapshot policy"
-                .to_string(),
-        ));
-    }
     let query = MarkerQuery {
         predecessor,
         generation,
@@ -1894,7 +1911,14 @@ where
         .await
         .map_err(|e| JournalError::Successor(format!("marker read failed: {e:?}")))?;
     if matches!(marker, Some(MigrationMarker::Done { had_data: true })) {
-        if seal_is_bridged(successor, predecessor, generation, policy).await {
+        if policy.legacy_bridge() == LegacyBridge::AtOrAboveGeneration
+            && !matches!(
+                exact_marker(successor, predecessor, generation)
+                    .await
+                    .map_err(|e| JournalError::Successor(format!("marker read failed: {e:?}")))?,
+                Some(MigrationMarker::Done { had_data: true })
+            )
+        {
             // A legacy seal for a NEWER generation: under this snapshot policy
             // this generation is superseded, not imported. Writing its data would
             // leave a partial copy nothing can record (the flag's read-back would
@@ -2250,10 +2274,6 @@ where
                 let mut checks = MarkerChecks::default();
                 for e in predecessors {
                     let key = DelegateKey::new(e.delegate_key, CodeHash::new(e.code_hash));
-                    // A lineage renumbered since (a forgotten generation inserted):
-                    // the entry takes the lineage's generation, which is what the
-                    // app passes to `note_app_import_started`.
-                    changed |= journal.sync_generation(&key, e.generation);
                     let non_data = matches!(
                         journal.entry(&key).map(|x| x.state),
                         Some(JournalState::Resolved(r)) if !r.is_data_bearing()
@@ -7736,8 +7756,8 @@ mod tests {
         .expect("begin");
         block_on(note_app_import_started(
             &mut store_io(&mut store),
+            &lineage,
             &k,
-            1,
             &union(),
         ))
         .expect("flag");
@@ -8194,8 +8214,8 @@ mod tests {
         .expect("begin");
         block_on(note_app_import_started(
             &mut store_io(&mut store),
+            &lineage,
             &k,
-            1,
             &union(),
         ))
         .expect("flag");
@@ -8219,13 +8239,13 @@ mod tests {
         let mut w = InspectingWriter::new(&lineage);
         block_on(begin_migration_journal(&mut w, &lineage, &union())).unwrap();
         w.fail_journal_store_number = Some(w.journal_stores + 1);
-        assert!(block_on(note_app_import_started(&mut w, &k, 1, &union())).is_err());
+        assert!(block_on(note_app_import_started(&mut w, &lineage, &k, &union())).is_err());
 
         let mut w = InspectingWriter::new(&lineage);
         block_on(begin_migration_journal(&mut w, &lineage, &union())).unwrap();
         let before = w.store.get_secret(MIGRATION_JOURNAL_KEY);
         w.fail_journal_load = true;
-        assert!(block_on(note_app_import_started(&mut w, &k, 1, &union())).is_err());
+        assert!(block_on(note_app_import_started(&mut w, &lineage, &k, &union())).is_err());
         assert_eq!(w.store.get_secret(MIGRATION_JOURNAL_KEY), before);
 
         // The re-read before the store fails.
@@ -8233,7 +8253,7 @@ mod tests {
         block_on(begin_migration_journal(&mut w, &lineage, &union())).unwrap();
         let before = w.store.get_secret(MIGRATION_JOURNAL_KEY);
         w.fail_journal_load_number = Some(w.journal_loads + 2);
-        assert!(block_on(note_app_import_started(&mut w, &k, 1, &union())).is_err());
+        assert!(block_on(note_app_import_started(&mut w, &lineage, &k, &union())).is_err());
         assert_eq!(w.store.get_secret(MIGRATION_JOURNAL_KEY), before);
 
         let mut wire = MigrationJournal::new_pending(&lineage).encode();
@@ -8244,8 +8264,8 @@ mod tests {
         assert_eq!(
             block_on(note_app_import_started(
                 &mut store_io(&mut store),
+                &lineage,
                 &k,
-                1,
                 &union()
             )),
             Err(JournalError::ForeignVersion(2))
@@ -8256,8 +8276,8 @@ mod tests {
         store.set_secret(MIGRATION_JOURNAL_KEY, b"\xa1\x61v\x01garbage");
         assert!(block_on(note_app_import_started(
             &mut store_io(&mut store),
+            &lineage,
             &k,
-            1,
             &union()
         ))
         .is_err());
@@ -8618,8 +8638,8 @@ mod tests {
         );
         block_on(note_app_import_started(
             &mut store_io(&mut store),
+            &lineage,
             &k,
-            1,
             &union(),
         ))
         .expect("flag");
@@ -8651,8 +8671,8 @@ mod tests {
         .expect("begin");
         block_on(note_app_import_started(
             &mut store_io(&mut store),
+            &lineage,
             &key_of(&new),
-            2,
             &policy(),
         ))
         .expect("flag");
@@ -8781,8 +8801,8 @@ mod tests {
         let mut store = MemStore::default();
         assert!(block_on(note_app_import_started(
             &mut store_io(&mut store),
+            &lineage,
             &key_of(&lineage[0]),
-            1,
             &union()
         ))
         .is_err());
@@ -8939,8 +8959,8 @@ mod tests {
         assert!(complete(&journaled(&mut store, &mut io, &lineage, union())));
         block_on(note_app_import_started(
             &mut store_io(&mut store),
+            &lineage,
             &k,
-            1,
             &union(),
         ))
         .expect("flag");
@@ -9019,8 +9039,8 @@ mod tests {
         .expect("begin");
         block_on(note_app_import_started(
             &mut store_io(&mut store),
+            &lineage,
             &k,
-            1,
             &union(),
         ))
         .expect("flag");
@@ -9163,8 +9183,8 @@ mod tests {
             )));
             block_on(note_app_import_started(
                 &mut store_io(&mut store),
+                &lineage,
                 &k,
-                1,
                 &union(),
             ))
             .expect("flag");
@@ -9222,7 +9242,7 @@ mod tests {
         let mut io = MockIo::default().executable_with(&k, &[(b"room:a", b"A"), (b"room:x", b"?")]);
         assert!(complete(&writer.run(&mut io, union())));
         writer.revision = 1;
-        block_on(note_app_import_started(&mut writer, &k, 1, &union())).expect("flag");
+        block_on(note_app_import_started(&mut writer, &lineage, &k, &union())).expect("flag");
         let status = journal_status(
             writer.store.get_secret(MIGRATION_JOURNAL_KEY).as_deref(),
             &lineage,
@@ -9243,8 +9263,8 @@ mod tests {
         let journal_before = store.get_secret(MIGRATION_JOURNAL_KEY);
         block_on(note_app_import_started(
             &mut store_io(&mut store),
+            &lineage,
             &k,
-            1,
             &union(),
         ))
         .expect("ok");
@@ -9273,8 +9293,8 @@ mod tests {
         store.fail_writes_to(&pred_wip_marker(&k));
         assert!(block_on(note_app_import_started(
             &mut store_io(&mut store),
+            &lineage,
             &k,
-            1,
             &union()
         ))
         .is_err());
@@ -9598,7 +9618,7 @@ mod tests {
         let mut io = MockIo::default().executable_with(&k, &[(b"room:a", b"A")]);
         assert!(complete(&writer.run(&mut io, union())));
         let before = writer.markers_recorded.len();
-        block_on(note_app_import_started(&mut writer, &k, 1, &union())).expect("ok");
+        block_on(note_app_import_started(&mut writer, &lineage, &k, &union())).expect("ok");
         assert_eq!(writer.markers_recorded.len(), before);
     }
 
@@ -9655,8 +9675,8 @@ mod tests {
         .expect("begin");
         block_on(note_app_import_started(
             &mut store_io(&mut store),
+            &lineage,
             &k3,
-            3,
             &union(),
         ))
         .expect("flag");
@@ -9676,7 +9696,7 @@ mod tests {
         let mut writer = InspectingWriter::new(&lineage);
         block_on(begin_migration_journal(&mut writer, &lineage, &union())).expect("begin");
         writer.fail_marker_read.insert(k.bytes().to_vec());
-        let r = block_on(note_app_import_started(&mut writer, &k, 1, &union()));
+        let r = block_on(note_app_import_started(&mut writer, &lineage, &k, &union()));
         assert!(r.is_err(), "{r:?}");
         assert!(writer.markers_recorded.is_empty());
     }
@@ -9731,8 +9751,8 @@ mod tests {
         .is_complete());
         block_on(note_app_import_started(
             &mut store_io(&mut store),
+            &lineage,
             &k,
-            1,
             &union(),
         ))
         .expect("flag");
@@ -9758,7 +9778,7 @@ mod tests {
         let mut writer = InspectingWriter::new(&lineage);
         block_on(begin_migration_journal(&mut writer, &lineage, &union())).expect("begin");
         writer.inject_at_first_marker_read = Some(b"\xa1\x61v\x01garbage".to_vec());
-        let r = block_on(note_app_import_started(&mut writer, &k, 1, &union()));
+        let r = block_on(note_app_import_started(&mut writer, &lineage, &k, &union()));
         assert!(r.is_err(), "{r:?}");
         assert_eq!(
             writer.store.get_secret(MIGRATION_JOURNAL_KEY).as_deref(),
@@ -9827,8 +9847,8 @@ mod tests {
         .expect("begin");
         block_on(note_app_import_started(
             &mut store_io(&mut store),
+            &lineage,
             &key_of(&g7),
-            7,
             &newest(),
         ))
         .expect("flag");
@@ -9937,13 +9957,10 @@ mod tests {
                     inner: store,
                     budget: writes,
                 };
-                let flagged = block_on(note_app_import_started(
-                    &mut SecretStoreIo::new(
+                let flagged = block_on(note_app_import_started(&mut SecretStoreIo::new(
                         &mut killable,
                         NoCrossEntryInvariantsAck::i_certify_these_secrets_have_no_cross_entry_invariants(),
-                    ),
-                    &k, 1, &union(),
-                ));
+                    ), &lineage, &k, &union()));
                 // The app writes only if the flag succeeded.
                 if flagged.is_ok() {
                     for (key, v) in [(&b"room:a"[..], &b"A"[..]), (b"room:b", b"B")] {
@@ -10056,7 +10073,7 @@ mod tests {
             union(),
         ));
         assert!(complete(&r));
-        assert!(block_on(note_app_import_started(&mut w, &k, 1, &union())).is_err());
+        assert!(block_on(note_app_import_started(&mut w, &lineage, &k, &union())).is_err());
         // The journal flag landed first, so the walk re-asks, and refuses to write
         // over a seal its store will not let it outrank.
         let mut io = MockIo::default().executable_with(&k, &[(b"room:a", b"A")]);
@@ -10265,8 +10282,8 @@ mod tests {
         // Now Union.
         block_on(note_app_import_started(
             &mut store_io(&mut store),
+            &lineage,
             &k3,
-            3,
             &union(),
         ))
         .expect("flag");
@@ -10527,8 +10544,8 @@ mod tests {
             };
             assert!(block_on(note_app_import_started(
                 &mut df,
+                &[new],
                 &key_of(&new),
-                2,
                 &policy()
             ))
             .is_err());
@@ -10578,7 +10595,7 @@ mod tests {
         run_q(&mut w, &mut io, &[e], union());
         w.fail_reads_after_record = true;
         w.recorded = false;
-        assert!(block_on(note_app_import_started(&mut w, &key_of(&e), 1, &union())).is_err());
+        assert!(block_on(note_app_import_started(&mut w, &[e], &key_of(&e), &union())).is_err());
     }
 
     #[test]
@@ -10618,7 +10635,13 @@ mod tests {
         let f = entry(2, 2);
         block_on(begin_migration_journal(&mut w, &[e, f], &union())).unwrap();
         w.drop_data_flag = true;
-        assert!(block_on(note_app_import_started(&mut w, &key_of(&f), 2, &union())).is_err());
+        assert!(block_on(note_app_import_started(
+            &mut w,
+            &[e, f],
+            &key_of(&f),
+            &union()
+        ))
+        .is_err());
     }
 
     #[test]
@@ -11271,8 +11294,8 @@ mod tests {
         .expect("begin");
         assert!(block_on(note_app_import_started(
             &mut store_io(&mut store),
+            &lineage,
             &k3,
-            3,
             &newest()
         ))
         .is_err());
@@ -11280,8 +11303,8 @@ mod tests {
         // Under Union the same predecessor is owed, and the flag is recorded.
         block_on(note_app_import_started(
             &mut store_io(&mut store),
+            &lineage,
             &k3,
-            3,
             &union(),
         ))
         .expect("flag under Union");
@@ -11457,8 +11480,8 @@ mod tests {
         .expect("begin");
         assert!(block_on(note_app_import_started(
             &mut store_io(&mut store),
+            &[g3],
             &k3,
-            3,
             &newest()
         ))
         .is_err());
@@ -11556,9 +11579,9 @@ mod tests {
         let k = key_of(&lineage[0]);
         let mut w = InspectingWriter::new(&lineage);
         block_on(begin_migration_journal(&mut w, &lineage, &union())).expect("begin");
-        block_on(note_app_import_started(&mut w, &k, 1, &union())).expect("flag");
+        block_on(note_app_import_started(&mut w, &lineage, &k, &union())).expect("flag");
         let before = w.journal_stores;
-        block_on(note_app_import_started(&mut w, &k, 1, &union())).expect("flag again");
+        block_on(note_app_import_started(&mut w, &lineage, &k, &union())).expect("flag again");
         assert_eq!(w.journal_stores, before);
     }
 
@@ -11600,8 +11623,8 @@ mod tests {
         // Tab A flags it (journal and marker) and writes part of it, then dies.
         block_on(note_app_import_started(
             &mut store_io(&mut store),
+            &lineage,
             &k,
-            1,
             &union(),
         ))
         .expect("flag");
@@ -11649,8 +11672,8 @@ mod tests {
         assert!(matches!(
             block_on(note_app_import_started(
                 &mut store_io(&mut store),
+                &lineage,
                 &key_of(&entry(9, 9)),
-                9,
                 &newest()
             )),
             Err(JournalError::NotImportable(_))
@@ -11658,8 +11681,8 @@ mod tests {
         assert!(matches!(
             block_on(note_app_import_started(
                 &mut store_io(&mut store),
+                &lineage,
                 &key_of(&g1),
-                1,
                 &newest()
             )),
             Err(JournalError::NotImportable(_))
@@ -11676,8 +11699,8 @@ mod tests {
         // Under Union the older generation is owed, and the flag is recorded.
         block_on(note_app_import_started(
             &mut store_io(&mut store),
+            &lineage,
             &key_of(&g1),
-            1,
             &union(),
         ))
         .expect("flag under Union");
@@ -11685,8 +11708,19 @@ mod tests {
 
     // ---- round-9 probes ---------------------------------------------------------
 
-    fn r9_flag(store: &mut MemStore, k: &DelegateKey, g: u32, policy: SecretSelectionPolicy) {
-        block_on(note_app_import_started(&mut store_io(store), k, g, &policy)).expect("flag");
+    fn r9_flag(
+        store: &mut MemStore,
+        lineage: &[DelegateLineageEntry],
+        k: &DelegateKey,
+        policy: SecretSelectionPolicy,
+    ) {
+        block_on(note_app_import_started(
+            &mut store_io(store),
+            lineage,
+            k,
+            &policy,
+        ))
+        .expect("flag");
     }
 
     /// The no-CAS recovery must cover every predecessor, not just the first or
@@ -11702,12 +11736,7 @@ mod tests {
             }
             assert!(complete(&journaled(&mut store, &mut io, &lineage, union())));
             let stale = store.get_secret(MIGRATION_JOURNAL_KEY).unwrap();
-            r9_flag(
-                &mut store,
-                &key_of(&lineage[flagged]),
-                lineage[flagged].generation,
-                union(),
-            );
+            r9_flag(&mut store, &lineage, &key_of(&lineage[flagged]), union());
             store.set_secret(MIGRATION_JOURNAL_KEY, &stale);
             assert!(stored_status(&store, &lineage).is_complete());
             let status = block_on(begin_migration_journal(
@@ -11748,8 +11777,8 @@ mod tests {
         }
         assert!(complete(&journaled(&mut store, &mut io, &lineage, union())));
         let stale = store.get_secret(MIGRATION_JOURNAL_KEY).unwrap();
-        r9_flag(&mut store, &key_of(&lineage[0]), 1, union());
-        r9_flag(&mut store, &key_of(&lineage[2]), 3, union());
+        r9_flag(&mut store, &lineage, &key_of(&lineage[0]), union());
+        r9_flag(&mut store, &lineage, &key_of(&lineage[2]), union());
         store.set_secret(MIGRATION_JOURNAL_KEY, &stale);
         block_on(begin_migration_journal(
             &mut store_io(&mut store),
@@ -11852,7 +11881,7 @@ mod tests {
         ))
         .expect("begin");
         let stale = store.get_secret(MIGRATION_JOURNAL_KEY).unwrap();
-        r9_flag(&mut store, &k2, 2, newest());
+        r9_flag(&mut store, &lineage, &k2, newest());
         store.set_secret(b"g2:a", b"A");
         store.set_secret(MIGRATION_JOURNAL_KEY, &stale);
         assert!(matches!(
@@ -11999,8 +12028,8 @@ mod tests {
             .is_some());
         block_on(note_app_import_started(
             &mut store_io(&mut store),
+            &lineage,
             &key_of(&g2),
-            2,
             &newest(),
         ))
         .expect(
@@ -12023,8 +12052,8 @@ mod tests {
         put_journal(&mut store, &j);
         block_on(note_app_import_started(
             &mut store_io(&mut store),
+            &lineage,
             &key_of(&g1),
-            1,
             &newest(),
         ))
         .expect("a newer EMPTY generation does not supersede");
@@ -12050,8 +12079,8 @@ mod tests {
         assert!(matches!(
             block_on(note_app_import_started(
                 &mut store_io(&mut store),
+                &lineage,
                 &key_of(&g1),
-                1,
                 &newest()
             )),
             Err(JournalError::NotImportable(_))
@@ -12074,8 +12103,8 @@ mod tests {
         assert!(matches!(
             block_on(note_app_import_started(
                 &mut store_io(&mut store),
+                &[g3],
                 &k3,
-                3,
                 &newest()
             )),
             Err(JournalError::NotImportable(_))
@@ -12150,7 +12179,7 @@ mod tests {
         let mut io = MockIo::default().executable_with(&key_of(&g1), &[]);
         assert!(complete(&journaled(&mut store, &mut io, &[g1], union())));
         let stale = store.get_secret(MIGRATION_JOURNAL_KEY).unwrap();
-        r9_flag(&mut store, &key_of(&g1), 1, union());
+        r9_flag(&mut store, &[g1], &key_of(&g1), union());
         store.set_secret(MIGRATION_JOURNAL_KEY, &stale);
         // g2 has an in-progress data marker (an old plain walk's)
         store.set_secret(&pred_wip_marker(&key_of(&g2)), PRED_DONE_MARKER_VALUE_DATA);
@@ -12186,7 +12215,7 @@ mod tests {
         let mut io = MockIo::default().executable_with(&k, &[]);
         assert!(complete(&journaled(&mut store, &mut io, &lineage, union())));
         let stale = store.get_secret(MIGRATION_JOURNAL_KEY).unwrap();
-        r9_flag(&mut store, &k, 1, union());
+        r9_flag(&mut store, &lineage, &k, union());
         store.set_secret(b"room:a", b"A");
         store.set_secret(MIGRATION_JOURNAL_KEY, &stale);
         // the predecessor answers empty again (a #5857 read fault)
@@ -12345,7 +12374,12 @@ mod tests {
         w.store.set_secret(&done_marker(5), b"1");
         block_on(begin_migration_journal(&mut w, &[g3], &newest())).expect("begin");
         w.fail_exact = true;
-        let r = block_on(note_app_import_started(&mut w, &key_of(&g3), 3, &newest()));
+        let r = block_on(note_app_import_started(
+            &mut w,
+            &[g3],
+            &key_of(&g3),
+            &newest(),
+        ));
         assert!(r.is_err(), "{r:?}");
     }
 
@@ -12373,7 +12407,7 @@ mod tests {
         let mut store = MemStore::default();
         let mut io = MockIo::default().executable_with(&k, &[]);
         assert!(complete(&journaled(&mut store, &mut io, &lineage, union())));
-        r9_flag(&mut store, &k, 1, union());
+        r9_flag(&mut store, &lineage, &k, union());
         let st = stored_status(&store, &lineage);
         assert_eq!(st.rejected_items(), 0);
     }
@@ -12411,7 +12445,7 @@ mod tests {
         let lineage = [entry(1, 1), entry(2, 2)];
         let mut w = r10_resolved_empty(&lineage);
         let stale = w.store.get_secret(MIGRATION_JOURNAL_KEY).unwrap();
-        r9_flag(&mut w.store, &key_of(&lineage[1]), 2, union());
+        r9_flag(&mut w.store, &lineage, &key_of(&lineage[1]), union());
         w.store.set_secret(MIGRATION_JOURNAL_KEY, &stale);
         w.fail_marker_read
             .insert(key_of(&lineage[0]).bytes().to_vec());
@@ -12476,7 +12510,7 @@ mod tests {
         let lineage = [entry(1, 1), entry(2, 2)];
         let mut w = r10_resolved_empty(&lineage);
         let stale = w.store.get_secret(MIGRATION_JOURNAL_KEY).unwrap();
-        r9_flag(&mut w.store, &key_of(&lineage[1]), 2, union());
+        r9_flag(&mut w.store, &lineage, &key_of(&lineage[1]), union());
         w.store.set_secret(MIGRATION_JOURNAL_KEY, &stale);
         w.fail_marker_read
             .insert(key_of(&lineage[0]).bytes().to_vec());
@@ -12561,7 +12595,7 @@ mod tests {
         let mut w = InspectingWriter::new(&[g1]);
         block_on(begin_migration_journal(&mut w, &[g1], &union())).expect("begin");
         let stale = w.store.get_secret(MIGRATION_JOURNAL_KEY).unwrap();
-        r9_flag(&mut w.store, &k, 1, union());
+        r9_flag(&mut w.store, &[g1], &k, union());
         w.store.set_secret(MIGRATION_JOURNAL_KEY, &stale);
         w.fail_marker_read.insert(k.bytes().to_vec());
         let mut io = MockIo::default().executable_with(&k, &[(b"room:a", b"A")]);
@@ -12585,7 +12619,7 @@ mod tests {
         ))
         .expect("begin");
         let stale = store.get_secret(MIGRATION_JOURNAL_KEY).unwrap();
-        r9_flag(&mut store, &k2, 2, newest());
+        r9_flag(&mut store, &lineage, &k2, newest());
         store.set_secret(&done_marker(3), b"1");
         store.set_secret(MIGRATION_JOURNAL_KEY, &stale);
         let mut io = MockIo::default()
@@ -12605,7 +12639,7 @@ mod tests {
         let k2 = key_of(&g2);
         let mut w = InspectingWriter::new(&lineage);
         block_on(begin_migration_journal(&mut w, &lineage, &newest())).expect("begin");
-        r9_flag(&mut w.store, &k2, 2, newest());
+        r9_flag(&mut w.store, &lineage, &k2, newest());
         let before = w.status_at_marker_reads.len();
         let mut io = MockIo::default()
             .executable_with(&k2, &[(b"g2:a", b"A")])
@@ -12681,7 +12715,7 @@ mod tests {
             .not_installed(&k2);
         let _ = w.run(&mut io, r10_cpu());
         let stale = w.store.get_secret(MIGRATION_JOURNAL_KEY).unwrap();
-        r9_flag(&mut w.store, &k1, 1, r10_cpu());
+        r9_flag(&mut w.store, &lineage, &k1, r10_cpu());
         w.store.set_secret(b"g1:a", b"A");
         w.store.set_secret(MIGRATION_JOURNAL_KEY, &stale);
         w.fail_marker_read.insert(k1.bytes().to_vec());
@@ -12740,7 +12774,7 @@ mod tests {
         let mut w = InspectingWriter::new(&lineage);
         block_on(begin_migration_journal(&mut w, &lineage, &union())).expect("begin");
         let stale = w.store.get_secret(MIGRATION_JOURNAL_KEY).unwrap();
-        r9_flag(&mut w.store, &k1, 1, union());
+        r9_flag(&mut w.store, &lineage, &k1, union());
         w.store.set_secret(b"g1:a", b"A");
         w.store.set_secret(MIGRATION_JOURNAL_KEY, &stale);
         w.fail_marker_read.insert(k1.bytes().to_vec());
@@ -12774,40 +12808,38 @@ mod tests {
         assert!(status.is_complete(), "{status:?}");
     }
 
-    /// `note_app_import_started` with a generation that is not the predecessor's
-    /// would slip past the snapshot guard: refused.
+    /// The caller's lineage, not the stored journal, decides which generations are
+    /// newer: a journal another build numbered differently (an old tab during a
+    /// rollout that inserted a forgotten generation) cannot let an older app flag
+    /// past a newer import under a snapshot policy.
     #[test]
-    fn an_app_flag_with_the_wrong_generation_is_refused() {
-        let (g1, g2) = (entry(1, 1), entry(2, 2));
-        let lineage = [g1, g2];
+    fn the_callers_lineage_decides_what_is_newer() {
+        let (a, x, c) = (entry(0, 10), entry(1, 11), entry(2, 12));
+        let new = [a, x, c];
         let mut store = MemStore::default();
-        let mut io = MockIo::default()
-            .executable_with(&key_of(&g2), &[(b"room:n", b"N")])
-            .executable_with(&key_of(&g1), &[(b"room:o", b"O")]);
-        assert!(complete(&journaled(
-            &mut store,
-            &mut io,
-            &lineage,
-            newest()
-        )));
+        // Stored by the old build, which numbers c as 1 (it never had x).
+        let mut old_c = c;
+        old_c.generation = 1;
+        let mut j = MigrationJournal::new_pending(&[a, x, old_c]);
+        j.mark_import_started(&key_of(&c), 1);
+        put_journal(&mut store, &j);
         assert!(matches!(
             block_on(note_app_import_started(
                 &mut store_io(&mut store),
-                &key_of(&g1),
-                7,
+                &new,
+                &key_of(&x),
                 &newest()
             )),
             Err(JournalError::NotImportable(_))
         ));
-        assert!(matches!(
-            block_on(note_app_import_started(
-                &mut store_io(&mut store),
-                &key_of(&g1),
-                7,
-                &union()
-            )),
-            Err(JournalError::NotImportable(_))
-        ));
+        // Under Union x is owed.
+        block_on(note_app_import_started(
+            &mut store_io(&mut store),
+            &new,
+            &key_of(&x),
+            &union(),
+        ))
+        .expect("owed under Union");
     }
 
     /// An entry the start could not check, re-read successfully after the walk and
@@ -12917,7 +12949,7 @@ mod tests {
         ))
         .expect("begin");
         let stale = store.get_secret(MIGRATION_JOURNAL_KEY).unwrap();
-        r9_flag(&mut store, &k1, 1, newest());
+        r9_flag(&mut store, &old, &k1, newest());
         store.set_secret(MIGRATION_JOURNAL_KEY, &stale);
         let mut io = MockIo::default()
             .executable_with(&k1, &[(b"g1:a", b"A")])
@@ -13027,10 +13059,10 @@ mod tests {
         );
     }
 
-    /// `note_app_import_started` refuses a generation that is not the lineage's
-    /// in either direction, and an unknown key whatever generation it carries.
+    /// `note_app_import_started` refuses a key outside the caller's lineage, and
+    /// records nothing.
     #[test]
-    fn r11_p7_an_app_flag_is_refused_for_a_lower_generation_and_for_a_foreign_key() {
+    fn r11_p7_an_app_flag_is_refused_for_a_foreign_key() {
         let (g1, g2) = (entry(1, 1), entry(2, 2));
         let lineage = [g1, g2];
         let mut store = MemStore::default();
@@ -13039,25 +13071,19 @@ mod tests {
             .executable_with(&key_of(&g1), &[(b"room:o", b"O")]);
         assert!(complete(&journaled(&mut store, &mut io, &lineage, union())));
         let before = store.get_secret(MIGRATION_JOURNAL_KEY);
-        for (k, g) in [
-            (key_of(&g2), 1u32),
-            (key_of(&g2), 0),
-            (key_of(&g1), 0),
-            (key_of(&entry(9, 9)), 1),
-            (key_of(&entry(9, 9)), 2),
+        for (lin, k) in [
+            (&lineage[..], key_of(&entry(9, 9))),
+            (&lineage[1..], key_of(&g1)),
         ] {
-            assert!(
-                matches!(
-                    block_on(note_app_import_started(
-                        &mut store_io(&mut store),
-                        &k,
-                        g,
-                        &union()
-                    )),
-                    Err(JournalError::NotImportable(_))
-                ),
-                "generation {g}"
-            );
+            assert!(matches!(
+                block_on(note_app_import_started(
+                    &mut store_io(&mut store),
+                    lin,
+                    &k,
+                    &union()
+                )),
+                Err(JournalError::NotImportable(_))
+            ));
         }
         assert_eq!(
             store.get_secret(MIGRATION_JOURNAL_KEY),
@@ -13075,16 +13101,16 @@ mod tests {
         let mut store = MemStore::default();
         let r = block_on(note_app_import_started(
             &mut store_io(&mut store),
+            &lineage,
             &k,
-            1,
             &union(),
         ));
         assert!(matches!(r, Err(JournalError::Successor(_))), "{r:?}");
         store.set_secret(MIGRATION_JOURNAL_KEY, b"\xa1\x61v\x01garbage");
         let r = block_on(note_app_import_started(
             &mut store_io(&mut store),
+            &lineage,
             &k,
-            1,
             &union(),
         ));
         assert!(matches!(r, Err(JournalError::Successor(_))), "{r:?}");
@@ -13158,8 +13184,8 @@ mod tests {
             .expect("begin");
             block_on(note_app_import_started(
                 &mut store_io(&mut quiet),
+                &lineage,
                 &key_of(&g1),
-                1,
                 &policy,
             ))
             .expect("a pending, unflagged newer generation supersedes nothing");
@@ -13170,21 +13196,21 @@ mod tests {
                 &policy,
             ))
             .expect("begin");
-            r9_flag(&mut store, &key_of(&g2), 2, make());
+            r9_flag(&mut store, &lineage, &key_of(&g2), make());
             store.set_secret(b"room:n", b"N");
             assert!(matches!(
                 block_on(note_app_import_started(
                     &mut store_io(&mut store),
+                    &lineage,
                     &key_of(&g1),
-                    1,
                     &policy
                 )),
                 Err(JournalError::NotImportable(_))
             ));
             block_on(note_app_import_started(
                 &mut store_io(&mut store),
+                &lineage,
                 &key_of(&g1),
-                1,
                 &union(),
             ))
             .expect("owed under Union");
@@ -13192,10 +13218,10 @@ mod tests {
     }
 
     /// A lineage renumbered after the journal was written (a forgotten generation
-    /// inserted ahead): `begin` takes the lineage's generations, so the app's flag,
-    /// which passes the lineage's generation, is accepted.
+    /// inserted ahead): the app's flag goes by the caller's lineage, so it is
+    /// accepted without the stored generations changing.
     #[test]
-    fn begin_takes_a_renumbered_lineages_generations() {
+    fn an_app_flag_after_a_lineage_renumber_goes_by_the_callers_lineage() {
         let (a0, b1) = (entry(0, 10), entry(1, 11));
         let mut store = MemStore::default();
         block_on(begin_migration_journal(
@@ -13204,7 +13230,6 @@ mod tests {
             &union(),
         ))
         .expect("begin");
-        // A forgotten generation is inserted oldest: every generation shifts by one.
         let x0 = entry(0, 9);
         let mut a1 = a0;
         a1.generation = 1;
@@ -13217,25 +13242,26 @@ mod tests {
             &union(),
         ))
         .expect("begin");
-        assert_eq!(
-            stored_journal(&store)
-                .entry(&key_of(&a1))
-                .map(|e| e.generation),
-            Some(1)
-        );
         block_on(note_app_import_started(
             &mut store_io(&mut store),
+            &lineage,
             &key_of(&a1),
-            1,
             &union(),
         ))
-        .expect("the lineage's generation is accepted");
+        .expect("accepted");
+        assert!(matches!(
+            state_of(&store, &a1),
+            JournalState::Pending {
+                import: ImportFlag::Started,
+                ..
+            }
+        ));
     }
 
-    /// A renumber with no new entry (the same keys, numbered differently: a
-    /// registry moving to explicit `V<n>` versions) is stored too.
+    /// A pure renumber (the same keys, numbered differently) stores nothing: two
+    /// builds with different numbering do not rewrite the journal on every load.
     #[test]
-    fn begin_stores_a_pure_renumber() {
+    fn begin_does_not_store_a_pure_renumber() {
         let (a0, b1) = (entry(0, 10), entry(1, 11));
         let mut store = MemStore::default();
         block_on(begin_migration_journal(
@@ -13244,17 +13270,171 @@ mod tests {
             &union(),
         ))
         .expect("begin");
+        let before = store.get_secret(MIGRATION_JOURNAL_KEY);
         let (mut a5, mut b6) = (a0, b1);
         a5.generation = 5;
         b6.generation = 6;
+        for lineage in [[a5, b6], [a0, b1], [a5, b6]] {
+            block_on(begin_migration_journal(
+                &mut store_io(&mut store),
+                &lineage,
+                &union(),
+            ))
+            .expect("begin");
+            assert_eq!(store.get_secret(MIGRATION_JOURNAL_KEY), before);
+        }
+    }
+
+    // ---- round-12 fixes: the snapshot guard reads the caller's lineage ---------
+
+    fn r12_flag(
+        store: &mut MemStore,
+        lineage: &[DelegateLineageEntry],
+        k: &DelegateKey,
+        policy: &SecretSelectionPolicy,
+    ) -> Result<(), JournalError> {
+        block_on(note_app_import_started(
+            &mut store_io(store),
+            lineage,
+            k,
+            policy,
+        ))
+    }
+
+    /// A newer generation's journal flag erased by another session's stale store,
+    /// its own marker still recording the import: an older flag is refused under a
+    /// snapshot policy, and nothing is recorded for it.
+    #[test]
+    fn a_newer_marker_recording_an_import_refuses_an_older_flag() {
+        for make in [newest as fn() -> SecretSelectionPolicy, r10_cpu] {
+            let (g1, g2) = (entry(1, 1), entry(2, 2));
+            let lineage = [g1, g2];
+            let mut store = MemStore::default();
+            block_on(begin_migration_journal(
+                &mut store_io(&mut store),
+                &lineage,
+                &make(),
+            ))
+            .expect("begin");
+            let stale = store.get_secret(MIGRATION_JOURNAL_KEY).unwrap();
+            r12_flag(&mut store, &lineage, &key_of(&g2), &make()).expect("flag g2");
+            store.set_secret(MIGRATION_JOURNAL_KEY, &stale);
+            let before = (
+                store.get_secret(MIGRATION_JOURNAL_KEY),
+                store.get_secret(&pred_wip_marker(&key_of(&g1))),
+            );
+            assert!(matches!(
+                r12_flag(&mut store, &lineage, &key_of(&g1), &make()),
+                Err(JournalError::NotImportable(_))
+            ));
+            assert_eq!(
+                (
+                    store.get_secret(MIGRATION_JOURNAL_KEY),
+                    store.get_secret(&pred_wip_marker(&key_of(&g1))),
+                ),
+                before,
+                "a refusal records nothing"
+            );
+        }
+    }
+
+    /// A newer generation sealed with its data only in its marker (the walk's final
+    /// journal store failed): an older flag is refused under a snapshot policy.
+    #[test]
+    fn a_newer_seal_with_data_refuses_an_older_flag() {
+        let (g1, g2) = (entry(1, 1), entry(2, 2));
+        let lineage = [g1, g2];
+        let mut store = MemStore::default();
         block_on(begin_migration_journal(
             &mut store_io(&mut store),
-            &[a5, b6],
-            &union(),
+            &lineage,
+            &newest(),
         ))
         .expect("begin");
-        let stored = stored_journal(&store);
-        assert_eq!(stored.entry(&key_of(&a5)).map(|e| e.generation), Some(5));
-        assert_eq!(stored.entry(&key_of(&b6)).map(|e| e.generation), Some(6));
+        store.set_secret(&pred_done_marker(&key_of(&g2)), PRED_DONE_MARKER_VALUE_DATA);
+        assert!(matches!(
+            r12_flag(&mut store, &lineage, &key_of(&g1), &newest()),
+            Err(JournalError::NotImportable(_))
+        ));
+        // An empty seal supersedes nothing.
+        store.set_secret(
+            &pred_done_marker(&key_of(&g2)),
+            PRED_DONE_MARKER_VALUE_EMPTY,
+        );
+        r12_flag(&mut store, &lineage, &key_of(&g1), &newest()).expect("not superseded");
+    }
+
+    /// A newer generation imported with permanent rejections, reopened by a higher
+    /// import revision, still holds the rest of its data: an older flag is refused
+    /// under a snapshot policy.
+    #[test]
+    fn a_newer_reopened_rejection_refuses_an_older_flag() {
+        let (g1, g2) = (entry(1, 1), entry(2, 2));
+        let lineage = [g1, g2];
+        let mut w = InspectingWriter::new(&lineage);
+        w.permanent_fail.insert(b"room:x".to_vec());
+        let mut io = MockIo::default()
+            .executable_with(&key_of(&g2), &[(b"room:x", b"NEWX"), (b"room:y", b"Y")])
+            .executable_with(&key_of(&g1), &[(b"room:x", b"OLDX")]);
+        let _ = w.run(&mut io, newest());
+        assert!(matches!(
+            state_of(&w.store, &g2),
+            JournalState::Resolved(JournalResolution::ImportedWithRejections { .. })
+        ));
+        w.permanent_fail.clear();
+        w.revision = 1;
+        assert!(matches!(
+            block_on(note_app_import_started(
+                &mut w,
+                &lineage,
+                &key_of(&g1),
+                &newest()
+            )),
+            Err(JournalError::NotImportable(_))
+        ));
+    }
+
+    /// A newer generation's marker that cannot be read, or a legacy seal whose
+    /// exact read fails, is a plain failure, never "do not import" (a transient
+    /// fault is not a verdict) and never an acceptance.
+    #[test]
+    fn an_unreadable_marker_in_the_guard_is_a_plain_failure() {
+        let (g1, g2) = (entry(1, 1), entry(2, 2));
+        let lineage = [g1, g2];
+        let mut w = InspectingWriter::new(&lineage);
+        block_on(begin_migration_journal(&mut w, &lineage, &newest())).expect("begin");
+        w.fail_marker_read.insert(key_of(&g2).bytes().to_vec());
+        assert!(matches!(
+            block_on(note_app_import_started(
+                &mut w,
+                &lineage,
+                &key_of(&g1),
+                &newest()
+            )),
+            Err(JournalError::Successor(_))
+        ));
+        // A legacy seal for gen 5 covers g3; its exact read fails.
+        let g3 = entry(3, 3);
+        let mut store = MemStore::default();
+        block_on(begin_migration_journal(
+            &mut store_io(&mut store),
+            &[g3],
+            &newest(),
+        ))
+        .expect("begin");
+        store.set_secret(&done_marker(5), b"1");
+        let mut f = FirstExactFails {
+            store,
+            fail_first_exact: 1,
+        };
+        assert!(matches!(
+            block_on(note_app_import_started(
+                &mut f,
+                &[g3],
+                &key_of(&g3),
+                &newest()
+            )),
+            Err(JournalError::Successor(_))
+        ));
     }
 }
