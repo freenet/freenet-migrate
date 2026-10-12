@@ -11771,13 +11771,16 @@ mod tests {
         k: &DelegateKey,
         policy: SecretSelectionPolicy,
     ) {
-        block_on(note_app_import_started(
-            &mut store_io(store),
-            lineage,
-            k,
-            &policy,
-        ))
-        .expect("flag");
+        assert_eq!(
+            block_on(note_app_import_started(
+                &mut store_io(store),
+                lineage,
+                k,
+                &policy,
+            ))
+            .expect("flag"),
+            AppImport::Flagged
+        );
     }
 
     /// The no-CAS recovery must cover every predecessor, not just the first or
@@ -12069,8 +12072,9 @@ mod tests {
         }
     }
 
-    /// Under a snapshot policy: a completed own-generation import is Ok, a
-    /// newer NoData does not supersede, a newer rejection-resolved one does.
+    /// Under a snapshot policy: a completed own-generation import is refused as
+    /// already imported, a newer NoData does not supersede, a newer
+    /// rejection-resolved one does.
     #[test]
     fn r9_p5_note_app_under_a_snapshot_policy() {
         // (a) own generation completed with data
@@ -13794,10 +13798,13 @@ mod tests {
         let mut unsealed = store.clone();
         r12_flag(&mut store, &lineage, &key_of(&g1), &newest()).expect("accepted");
         contradicted.set_secret(&pred_wip_marker(&key_of(&g2)), PRED_DONE_MARKER_VALUE_DATA);
-        assert!(matches!(
-            r12_flag(&mut contradicted, &lineage, &key_of(&g1), &newest()),
-            Err(JournalError::NotImportable(_))
-        ));
+        // The reason matters: plain NSW would also refuse this as "has not answered"
+        // if the data arm were broken, which would hide it.
+        let r = r12_flag(&mut contradicted, &lineage, &key_of(&g1), &newest());
+        assert!(
+            matches!(&r, Err(JournalError::NotImportable(m)) if m.contains("authoritative snapshot")),
+            "{r:?}"
+        );
         // Without its empty seal the walk would ask it again: so does the guard,
         // whatever the journal says.
         unsealed.data.remove(&pred_done_marker(&key_of(&g2)));
@@ -14052,5 +14059,98 @@ mod tests {
         let r = r12_flag(&mut store, &lineage, &key_of(&g1), &union());
         assert!(matches!(r, Ok(AppImport::AlreadyImported)), "{r:?}");
         assert_eq!(store.data, before, "nothing recorded");
+    }
+
+    // ---- round-15 probes --------------------------------------------------------
+
+    fn r15_already_completed(r: &Result<AppImport, JournalError>, ctx: &str) {
+        assert!(
+            matches!(r, Ok(AppImport::AlreadyImported)),
+            "{ctx}: expected AlreadyImported, got {r:?}"
+        );
+    }
+
+    /// Own `Done { had_data: true }` seal, journal entry still pending (the walk's
+    /// final journal store failed), under EVERY policy. The existing
+    /// `..._the_journal_missed_is_already_imported` pin uses Union only, so the
+    /// `AtOrAboveGeneration` arm of the seal branch (the two snapshot policies)
+    /// was reachable only with a resolved journal entry, which the journal check
+    /// refuses first.
+    #[test]
+    fn r15_p1_a_sealed_import_the_journal_missed_is_refused_under_every_policy() {
+        for (name, make) in [
+            ("union", union as fn() -> SecretSelectionPolicy),
+            ("nsw", newest),
+            ("nsw_cpu", r10_cpu),
+        ] {
+            for with_newer_empty in [false, true] {
+                let g1 = entry(1, 1);
+                let g2 = entry(2, 2);
+                let lineage: Vec<_> = if with_newer_empty {
+                    vec![g1, g2]
+                } else {
+                    vec![g1]
+                };
+                let mut store = MemStore::default();
+                block_on(begin_migration_journal(
+                    &mut store_io(&mut store),
+                    &lineage,
+                    &make(),
+                ))
+                .expect("begin");
+                store.set_secret(&pred_done_marker(&key_of(&g1)), PRED_DONE_MARKER_VALUE_DATA);
+                if with_newer_empty {
+                    // The newer generation has answered "nothing" (empty seal), so
+                    // the snapshot guard passes and only the seal can refuse.
+                    store.set_secret(
+                        &pred_done_marker(&key_of(&g2)),
+                        PRED_DONE_MARKER_VALUE_EMPTY,
+                    );
+                }
+                assert!(matches!(
+                    state_of(&store, &g1),
+                    JournalState::Pending { .. }
+                ));
+                let before = store.data.clone();
+                let r = r12_flag(&mut store, &lineage, &key_of(&g1), &make());
+                r15_already_completed(&r, &format!("{name} newer_empty={with_newer_empty}"));
+                assert_eq!(store.data, before, "{name}: nothing recorded");
+            }
+        }
+    }
+
+    /// The journal resolves the predecessor `Imported` but no marker says so (a
+    /// stale store erased the seal). Only `ImportedWithRejections` was pinned
+    /// through the journal check; a plain `Imported` was covered only by its seal.
+    #[test]
+    fn r15_p2_a_journal_resolved_import_without_markers_is_refused_under_every_policy() {
+        for (name, make) in [
+            ("union", union as fn() -> SecretSelectionPolicy),
+            ("nsw", newest),
+            ("nsw_cpu", r10_cpu),
+        ] {
+            let g1 = entry(1, 1);
+            let lineage = [g1];
+            let mut store = MemStore::default();
+            block_on(begin_migration_journal(
+                &mut store_io(&mut store),
+                &lineage,
+                &make(),
+            ))
+            .expect("begin");
+            let mut j = MigrationJournal::new_pending(&lineage);
+            j.record(
+                &key_of(&g1),
+                1,
+                RunOutcome::Resolved(JournalResolution::Imported),
+            );
+            put_journal(&mut store, &j);
+            store.data.remove(&pred_done_marker(&key_of(&g1)));
+            store.data.remove(&pred_wip_marker(&key_of(&g1)));
+            let before = store.data.clone();
+            let r = r12_flag(&mut store, &lineage, &key_of(&g1), &make());
+            r15_already_completed(&r, name);
+            assert_eq!(store.data, before, "{name}: nothing recorded");
+        }
     }
 }
