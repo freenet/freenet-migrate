@@ -1640,7 +1640,7 @@ where
             }
             Err(JournalDecodeError::Corrupt(_)) => MigrationJournal::pessimistic(predecessors),
         },
-        None => MigrationJournal::new_pending(predecessors),
+        None => fresh_journal(successor, predecessors, policy).await,
     };
     successor
         .store_journal(&journal.encode())
@@ -1781,7 +1781,7 @@ where
             }
         },
         Ok(None) => {
-            let journal = MigrationJournal::new_pending(predecessors);
+            let journal = fresh_journal(successor, predecessors, &policy).await;
             if let Err(e) = successor.store_journal(&journal.encode()).await {
                 return refused(format!("journal start failed: {e:?}"));
             }
@@ -1828,6 +1828,37 @@ where
         report: outcome.report,
         journal_error,
     }
+}
+
+/// The journal a successor with none stored starts from: every predecessor
+/// pending, and flagged as possibly partially imported where a surviving
+/// [`MigrationMarker::InProgress`] says an earlier plain walk saw data and did not
+/// finish (or where the marker cannot be read). That is the state of a successor
+/// adopting the journal after an interrupted [`migrate_delegate_secrets`] run.
+async fn fresh_journal<W>(
+    successor: &mut W,
+    predecessors: &[DelegateLineageEntry],
+    policy: &SecretSelectionPolicy,
+) -> MigrationJournal
+where
+    W: JournaledSuccessorIo,
+{
+    let mut journal = MigrationJournal::new_pending(predecessors);
+    for e in predecessors {
+        let key = DelegateKey::new(e.delegate_key, CodeHash::new(e.code_hash));
+        let query = MarkerQuery {
+            predecessor: &key,
+            generation: e.generation,
+            legacy_bridge: policy.legacy_bridge(),
+        };
+        if matches!(
+            successor.migration_marker(&query).await,
+            Ok(Some(MigrationMarker::InProgress { saw_data: true })) | Err(_)
+        ) {
+            journal.mark_data_bearing(&key, e.generation);
+        }
+    }
+    journal
 }
 
 /// Store `journal` after merging in whatever is stored now (read-merge-write),
@@ -5785,7 +5816,8 @@ mod tests {
     struct InspectingWriter {
         store: MemStore,
         lineage: Vec<DelegateLineageEntry>,
-        status_at_first_marker_read: Option<JournalStatus>,
+        /// The stored journal's status at every `migration_marker` call.
+        status_at_marker_reads: Vec<JournalStatus>,
         status_at_first_item: Option<JournalStatus>,
         retryable_fail: BTreeSet<Vec<u8>>,
         permanent_fail: BTreeSet<Vec<u8>>,
@@ -5805,7 +5837,7 @@ mod tests {
             Self {
                 store: MemStore::default(),
                 lineage: lineage.to_vec(),
-                status_at_first_marker_read: None,
+                status_at_marker_reads: Vec::new(),
                 status_at_first_item: None,
                 retryable_fail: BTreeSet::new(),
                 permanent_fail: BTreeSet::new(),
@@ -5844,9 +5876,8 @@ mod tests {
             &mut self,
             query: &MarkerQuery<'_>,
         ) -> Result<Option<MigrationMarker>, Self::Error> {
-            if self.status_at_first_marker_read.is_none() {
-                self.status_at_first_marker_read = Some(stored_status(&self.store, &self.lineage));
-            }
+            let status = stored_status(&self.store, &self.lineage);
+            self.status_at_marker_reads.push(status);
             if self.fail_marker_read.contains(query.predecessor.bytes()) {
                 return Err(SecretStoreWriteFailed {
                     key: query.predecessor.bytes().to_vec(),
@@ -5968,12 +5999,21 @@ mod tests {
         let mut writer = InspectingWriter::new(&lineage);
         let mut io = MockIo::default().executable_with(&key_of(&lineage[0]), &[]);
         writer.run(&mut io, union());
-        let at_first = writer
-            .status_at_first_marker_read
-            .expect("a marker was read");
+        // One read per predecessor seeds the fresh journal; nothing is written
+        // before it is stored. The walk's own first marker read comes next.
+        let reads = &writer.status_at_marker_reads;
+        assert_eq!(
+            reads.len(),
+            2 * lineage.len(),
+            "seed reads, then the walk's"
+        );
+        assert!(reads[..lineage.len()]
+            .iter()
+            .all(|s| *s == JournalStatus::NotStarted));
+        let at_walk = &reads[lineage.len()];
         assert!(
-            matches!(at_first, JournalStatus::Incomplete { .. }),
-            "got {at_first:?}"
+            matches!(at_walk, JournalStatus::Incomplete { .. }),
+            "got {at_walk:?}"
         );
     }
 
@@ -6102,6 +6142,46 @@ mod tests {
             .as_deref()
             .is_some_and(|e| e.contains("journal import flag failed")));
         assert!(!complete(&run));
+    }
+
+    /// A successor adopting the journal after a plain walk was interrupted mid-import
+    /// starts with that predecessor flagged, so `interrupted_import()` is right
+    /// from the first load.
+    #[test]
+    fn adopting_after_an_interrupted_plain_walk_starts_flagged() {
+        let lineage = [entry(1, 1), entry(2, 2)];
+        let mut writer = InspectingWriter::new(&lineage);
+        writer.retryable_fail.insert(b"room:b".to_vec());
+        let mut io = MockIo::default()
+            .executable_with(
+                &key_of(&lineage[1]),
+                &[(b"room:a", b"A"), (b"room:b", b"B")],
+            )
+            .executable_with(&key_of(&lineage[0]), &[]);
+        block_on(migrate_delegate_secrets(
+            &mut writer,
+            &mut io,
+            &lineage,
+            ack(),
+            union(),
+        ));
+        let status =
+            block_on(begin_migration_journal(&mut writer, &lineage, &union())).expect("begin");
+        assert!(status.interrupted_import(), "got {status:?}");
+        assert!(matches!(
+            state_of(&writer.store, &lineage[1]),
+            JournalState::Pending {
+                data_bearing: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            state_of(&writer.store, &lineage[0]),
+            JournalState::Pending {
+                data_bearing: false,
+                ..
+            }
+        ));
     }
 
     /// If the journal cannot even be started, the walk does not run at all.
