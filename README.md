@@ -708,25 +708,28 @@ if !journal_status(stored.as_deref(), DELEGATE_LINEAGE, &binding).is_complete() 
     // `run.status` is what was stored. While it is incomplete, run again on a
     // later load.
 }
-// Gate "is the successor everything the user had?" on `interrupted_import()` of
-// the status as STORED NOW (`run.status`, or, when that is None or the walk did
-// not run, a fresh `journal_status` read after `begin`). Never on
-// `!is_complete()`, and never on a status read before `begin`.
+// `interrupted_import()` of the status as STORED NOW (`run.status`, or, when that
+// is None or the walk did not run, a fresh `journal_status` read after `begin`)
+// true means: do NOT treat the successor as everything the user had. False does
+// not mean it is: check `rejected_items()` and the report's unresponsive rows
+// too. Never gate on `!is_complete()`, and never on a status read before `begin`.
 ```
 
 `successor` implements `JournaledSuccessorIo`: load and store the journal bytes
-under one key the predecessor adapter never offers for import (`SecretStoreIo`
-does this for you), and optionally an `import_revision` to bump when you find and
-fix a wrong permanent rejection. Its marker store must follow the precedence rule
-on `SuccessorSecretsIo::migration_marker` (a data-bearing in-progress marker
-outranks an empty `Done`). Drive the journal calls one at a time within a
-session.
+under one key **in your app's own namespace** (a node refuses non-marker keys in
+the crate's reserved one, so the crate ships no delegate-side journal store),
+reports that key from `journal_key()` so the walk never imports a predecessor's
+journal over yours, and optionally an `import_revision` to bump when you find and
+fix a wrong permanent rejection. Its marker store must follow the three-rule
+marker contract on `SuccessorSecretsIo::migration_marker` / `record_marker` (see
+the CHANGELOG): break it and a lost journal certifies `Complete` over a partial
+copy. The crate refuses, rather than trusts, a store that visibly breaks it.
+Drive the journal calls one at a time within a session.
 
-**Do not adopt the journal unless your `fetch_secrets` fails loudly.** A
+**Do not adopt the journal unless your `fetch_secrets` fails loudly** (a
 resolution is as permanent as a `Done` marker, so an export that can come back
-partial without an `Err` (one that silently skips what it cannot read, or a
-sub-request whose timeout reads as "nothing") gets a partial import certified
-complete.
+partial without an `Err` gets a partial import certified complete), **your
+successor store is durable**, and **your marker store follows the contract**.
 
 What resolves a predecessor is a table in the `journal` module docs. The short
 version: silence and "not installed" never do; a permanent rejection does, with a
@@ -746,8 +749,9 @@ keeps no clock, so a cadence is the app's to count (loads, say, kept in its own
 successor state).
 
 `interrupted_import()` can stay true indefinitely: a predecessor an import
-started from that never answers with data again (it was unregistered, or it
-really did become empty) is never resolved, and the crate has no call to abandon
+started from that never answers with data again (it was unregistered, it really
+did become empty, or a snapshot policy later superseded it; a rejection reopened
+by a higher `import_revision` counts too) is never resolved, and the crate has no call to abandon
 it yet ([#39](https://github.com/freenet/freenet-migrate/issues/39)). An app that
 gates something on `interrupted_import()` must be able to live with that.
 

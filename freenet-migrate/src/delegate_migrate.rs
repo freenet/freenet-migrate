@@ -97,7 +97,7 @@
 //! for predecessor in newest_first(predecessors) {   // stop early per policy
 //!     match successor.migration_marker(..).await {              // §0 marker
 //!         Err(..)              => record WriterUnavailable; STOP
-//!         Ok(Some(Done { .. })) => { record AlreadyMigrated; maybe stop }
+//!         Ok(Some(Done { .. })) => { record AlreadyMigrated; maybe stop }  // (*)
 //!         Ok(in_progress_or_none) => {
 //!             match io.probe_verdict(predecessor).await {       // G1.8 preflight
 //!                 NoReply | NotInstalled | Err(_) => { record Unresponsive; maybe stop }
@@ -117,6 +117,10 @@
 //!     }
 //! }
 //! ```
+//!
+//! (*) A journaled walk also skips a predecessor its journal resolved with its
+//! data in the successor, and re-asks one sealed empty that its journal says an
+//! import started from.
 //!
 //! Cross-generation selection is an explicit [`SecretSelectionPolicy`]
 //! (`NewestSnapshotWins` default, or `UnionAllGenerations`), the delegate-side

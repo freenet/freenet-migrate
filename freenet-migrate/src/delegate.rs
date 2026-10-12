@@ -817,8 +817,10 @@ pub(crate) fn pred_done_marker(predecessor: &DelegateKey) -> Vec<u8> {
 /// `pred-done` marker means "this exact migration completed," never "an ancestor's
 /// data is transitively present"), so a later chained migration behaves the same
 /// however each generation was migrated. (The app path additionally leaves a
-/// crate-internal `pred-wip` marker behind; that is not part of the shared
-/// completion contract and is never read once the `pred-done` marker exists.)
+/// crate-internal `pred-wip` marker behind. It is read beside an EMPTY
+/// `pred-done` marker: a `pred-wip` that saw data there means an import started
+/// after the empty seal, which the seal does not outrank — see
+/// [`crate::SuccessorSecretsIo::migration_marker`].)
 pub fn predecessor_done_marker(predecessor: &DelegateKey, had_data: bool) -> (Vec<u8>, Vec<u8>) {
     let value = if had_data {
         PRED_DONE_MARKER_VALUE_DATA

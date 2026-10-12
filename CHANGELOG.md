@@ -114,28 +114,46 @@ of 4 rooms on every later load. Four review rounds of in-session fixes
 `JournaledSuccessorIo` trait, lists every predecessor as `Pending` or
 `Resolved`:
 
-* `begin_migration_journal` stores it, every predecessor pending, before the app's
-  first migration write. It never resets a readable journal, and a fresh one
-  flags an import `Started` for any predecessor an earlier plain walk left
-  mid-import (`InProgress { saw_data: true }`).
+* `begin_migration_journal` stores it before the app's first migration write.
+  It never resets a readable journal. A fresh one, and any lineage entry an
+  existing one has never seen, is read off the migration markers: a `Done`
+  resolves as the walk would, and `InProgress { saw_data: true }` is an import
+  `Started`.
 * `migrate_delegate_secrets_journaled` runs the ordinary walk, durably flags a
   data-bearing predecessor's import as started before its first item, and
-  records what each predecessor resolved to.
+  records what each predecessor resolved to. It does not walk a predecessor
+  again once the journal resolves it with its data in the successor (an import
+  whose only blemish was permanent rejections has no `Done` marker). A refused
+  run reports every predecessor `WriterUnavailable`
+  (`WriterStage::JournalUnavailable`), so it never reads complete.
 * `note_app_import_started` raises the same flag for an app that writes migrated
   data outside the walk (River's hand-rolled sweep), once it holds data read
   from the predecessor and before it writes or merges it.
 * `journal_status` is the app's pure load-time read: `NotStarted`, `Unreadable`,
   `Incomplete { pending, rejected_items }` (re-run the walk) or
   `Complete { rejected_items }` (nothing left to probe, durably).
-  `interrupted_import()` says the successor may hold a partial copy right now;
-  gate "is the successor everything the user had?" on that, not on
-  `!is_complete()`.
+  `interrupted_import()` says the successor may hold a partial copy right now.
+  True means "do not treat the successor as everything the user had"; false
+  does not mean it is (a silent predecessor, or `rejected_items() > 0`, still
+  says otherwise). Never gate on `!is_complete()`, which absent generations keep
+  true for ever.
 
-**Do not adopt the journal unless your `fetch_secrets` fails loudly.** A
-resolution is as permanent as a `Done` marker, so an export that can come back
-partial without an `Err` (an export that silently skips what it cannot read, or
-a sub-request whose timeout reads as "nothing", as in freenet/delta#100) gets a
-partial import certified complete.
+**Store it in the successor, under a key in your app's own namespace.** The
+crate ships no delegate-side journal store: a node refuses any key in the
+reserved `\0freenet-migrate/` namespace that is not a migration marker. Report
+the key from `JournaledSuccessorIo::journal_key` so the journaled walk never
+imports a predecessor's journal over yours, and keep it out of anything else
+that copies predecessor data (a hand-rolled sweep).
+
+**Do not adopt the journal unless:**
+
+* **your `fetch_secrets` fails loudly.** A resolution is as permanent as a `Done`
+  marker, so an export that can come back partial without an `Err` (one that
+  silently skips what it cannot read, or a sub-request whose timeout reads as
+  "nothing", as in freenet/delta#100) gets a partial import certified complete;
+* **your successor store is durable** (a page-memory marker store cannot hold a
+  journal); and
+* **your marker store follows the new contract** below.
 
 `Complete` needs every predecessor resolved, and a predecessor that is not
 installed on the node never resolves. An account whose lineage includes
@@ -168,13 +186,32 @@ The rules the data-loss argument rests on:
   predecessor is written. A journal from a different encoding version is never
   overwritten; a corrupt or lost one is rebuilt from the migration markers.
 * **Markers back every started import.** `note_app_import_started` also writes
-  the predecessor's `InProgress { saw_data: true }` marker, and a data-bearing
-  in-progress marker outranks an empty `Done` seal (a new rule in the
-  `SuccessorSecretsIo::migration_marker` contract that every marker store must
-  follow; `SecretStoreIo` does). So a rebuilt journal still knows about every
-  import that started, the app's included.
+  the predecessor's `InProgress { saw_data: true }` marker, so a rebuilt journal
+  still knows about every import that started, the app's included.
 
-The new `WriterStage::JournalFlag` names a failed import-flag store.
+**The marker-store contract, for journal adopters** (on
+`SuccessorSecretsIo::migration_marker` / `record_marker`; `SecretStoreIo`
+follows it). The compiler does not check it, and River's, Harvest's and Delta's
+own stores do not follow it today:
+
+1. `InProgress { saw_data: true }` stored beside `Done { had_data: false }` reads
+   as `InProgress { saw_data: true }`.
+2. Recording `InProgress` never erases a stored `Done` (keep them separate).
+3. `InProgress { saw_data: false }` never downgrades a stored
+   `InProgress { saw_data: true }`.
+
+Break rule 1 and a lost or corrupt journal certifies `Complete` over a partial
+copy. The crate checks it where it matters: `note_app_import_started` and a walk
+re-asking an empty seal read the marker back after recording it, and refuse
+(nothing written) if it does not read as recorded.
+
+`predecessor_already_migrated` and the public `predecessor_migration_had_data`
+follow rule 1 too: an empty seal contradicted by a data in-progress marker reads
+as not migrated (`None`).
+
+New `WriterStage` variants: `JournalFlag` (a failed import-flag store; nothing
+of that predecessor was written) and `JournalUnavailable` (the journaled walk was
+refused).
 
 **`ProbeVerdict` and `PredecessorSecretsIo::probe_verdict`.** A new default trait
 method with a third answer, `NotInstalled`, for an adapter whose transport can tell
@@ -184,9 +221,6 @@ answers `NotInstalled`, so existing adapters are unaffected. The walk treats
 `NotInstalled` exactly like silence (`Unresponsive`, same termination rule under
 every policy); the only difference is the journal's absent streak.
 
-**`SecretStoreIo`** implements `JournaledSuccessorIo`, storing the journal under
-`MIGRATION_JOURNAL_KEY`, inside the crate's reserved namespace (filtered from
-every export). Its `import_revision` is 0.
 
 ### An empty answer after data is a silence (behaviour change, every adopter)
 
@@ -214,19 +248,25 @@ is not there (freenet/freenet-core#5857).
   * `UnionAllGenerations` goes on to older generations, as for any unresponsive
     predecessor, and a never-clobber writer may then keep an older generation's
     value for a key the newer one also holds.
-* **If your app relies on the walk halting there**, halt inside your adapter:
-  return `Err` from `fetch_secrets` for an empty export when the successor's
-  marker for that predecessor says `InProgress { saw_data: true }`.
-  `exported_nothing_after_data()` reports the case afterwards, by which time an
-  older generation may already have been written.
+* **If your app relies on the walk halting there under Union**, it has to do it
+  in its adapter: once a predecessor exports nothing while the successor's
+  marker for it says `InProgress { saw_data: true }`, return `Err` from
+  `fetch_secrets` for every OLDER predecessor for the rest of that run. (Erring
+  for the empty one alone changes nothing: Union walks past any unresponsive
+  predecessor.) `exported_nothing_after_data()` reports the case afterwards, by
+  which time an older generation may already have been written.
 * **If your app keys anything off the predecessor's `Done` marker** (promoting
   staged records when it is written, say), that now waits until the predecessor
   answers with data again.
 * **Seals written by earlier releases stay as they are,** and an older build
   still running against the same successor (an old tab during a UI-only
-  rollout) keeps writing them. A predecessor sealed `Done { had_data: true }`
-  over a partial copy cannot be told apart from a complete one. Ship the journal
-  with a delegate re-key, or accept that window knowingly.
+  rollout) keeps writing them, and reads the new contradicted-seal pair as a
+  plain empty `Done`. A predecessor sealed `Done { had_data: true }` over a
+  partial copy cannot be told apart from a complete one. Ship the journal with
+  a delegate re-key, or accept that window knowingly.
+* **A legacy generation-keyed import (`import_secrets_once`) interrupted part-way
+  is invisible to the journal,** which reads only the per-predecessor markers.
+  Do not mix the two APIs on one successor.
 * **A re-asked predecessor cannot undo what ran in the meantime.** Under a
   snapshot policy, a predecessor first answering empty lets the same run import
   an older generation; when the newer one is later re-asked (it held data after

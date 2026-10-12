@@ -66,7 +66,8 @@
 //! | `Superseded` behind a resolved, data-bearing newer predecessor, under a `NewestSnapshotWins` policy | [`JournalResolution::SupersededByAuthoritative`] |
 //! | `Unresponsive` — silence, a timeout, a transport fault, **a definitive "not installed"**, or an empty export from a predecessor an earlier attempt saw data in | stays pending; `attempts + 1` |
 //! | `Incomplete` with a retryable failure, a withheld key, or a flush or marker fault | stays pending; `attempts + 1` |
-//! | `WriterUnavailable`, or `Superseded` behind an unresolved predecessor or under Union (not examined) | stays pending; unchanged |
+//! | `WriterUnavailable`, or `Superseded` behind an unresolved predecessor or under Union (not examined) | stays pending; attempts unchanged (a `JournalFlag` failure may still record the import as started: the predecessor did hold data) |
+//! | `AlreadyMigrated` because the journal already resolved it with its data in the successor (not walked again) | unchanged |
 //!
 //! The rules the data-loss argument rests on:
 //!
