@@ -255,7 +255,9 @@ predecessor rule is manual-only today — a real hardening). Its "cover every
 ## Status
 
 Published: `freenet-migrate` **0.6.0** and `freenet-migrate-build` **0.2.0**;
-0.7.0 (unreleased) adds the completeness journal.
+0.7.0 (unreleased) adds `NewestSnapshotWinsContinuePastUnresponsive`, the
+completeness journal, and one behaviour change in the delegate walk (an empty
+export after data was seen is a silence, not a seal).
 The two halves version independently. The reusable core machinery + tests,
 **field-validated by River's 0.6 → 0.8 re-key** (above).
 
@@ -271,6 +273,6 @@ retirement. Both apps run the crate alongside their pre-existing hand-rolled
 sweeps during a deliberate dual-running period rather than replacing them
 outright.
 
-There are five adopters in total. `README.md`'s Status section carries the
+There are six adopters in total. `README.md`'s Status section carries the
 per-app breakdown of which half each one takes. Targets current stdlib
 **0.8.x**.

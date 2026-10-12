@@ -122,13 +122,20 @@ of 4 rooms on every later load. Four review rounds of in-session fixes
   data-bearing predecessor's import as started before its first item, and
   records what each predecessor resolved to.
 * `note_app_import_started` raises the same flag for an app that writes migrated
-  data outside the walk (River's hand-rolled sweep).
+  data outside the walk (River's hand-rolled sweep), once it holds data read
+  from the predecessor and before it writes or merges it.
 * `journal_status` is the app's pure load-time read: `NotStarted`, `Unreadable`,
   `Incomplete { pending, rejected_items }` (re-run the walk) or
   `Complete { rejected_items }` (nothing left to probe, durably).
   `interrupted_import()` says the successor may hold a partial copy right now;
   gate "is the successor everything the user had?" on that, not on
   `!is_complete()`.
+
+**Do not adopt the journal unless your `fetch_secrets` fails loudly.** A
+resolution is as permanent as a `Done` marker, so an export that can come back
+partial without an `Err` (an export that silently skips what it cannot read, or
+a sub-request whose timeout reads as "nothing", as in freenet/delta#100) gets a
+partial import certified complete.
 
 `Complete` needs every predecessor resolved, and a predecessor that is not
 installed on the node never resolves. An account whose lineage includes
@@ -159,8 +166,13 @@ The rules the data-loss argument rests on:
   predecessor's marker while starting one, cannot be read, or the journal cannot
   be started or (before a predecessor's first item) flagged, nothing of that
   predecessor is written. A journal from a different encoding version is never
-  overwritten; a corrupt one is replaced by a pessimistic one (every predecessor
-  pending, an import `Suspected` until it resolves).
+  overwritten; a corrupt or lost one is rebuilt from the migration markers.
+* **Markers back every started import.** `note_app_import_started` also writes
+  the predecessor's `InProgress { saw_data: true }` marker, and a data-bearing
+  in-progress marker outranks an empty `Done` seal (a new rule in the
+  `SuccessorSecretsIo::migration_marker` contract that every marker store must
+  follow; `SecretStoreIo` does). So a rebuilt journal still knows about every
+  import that started, the app's included.
 
 The new `WriterStage::JournalFlag` names a failed import-flag store.
 
@@ -202,11 +214,25 @@ is not there (freenet/freenet-core#5857).
   * `UnionAllGenerations` goes on to older generations, as for any unresponsive
     predecessor, and a never-clobber writer may then keep an older generation's
     value for a key the newer one also holds.
-* **If your app relied on the walk halting there, or keyed anything off the
-  predecessor's `Done` marker** (promoting staged records when it is written,
-  say), check `exported_nothing_after_data()`.
-* **Seals written by earlier releases stay as they are.** A predecessor already
-  sealed `Done { had_data: true }` over a partial copy cannot be told apart.
+* **If your app relies on the walk halting there**, halt inside your adapter:
+  return `Err` from `fetch_secrets` for an empty export when the successor's
+  marker for that predecessor says `InProgress { saw_data: true }`.
+  `exported_nothing_after_data()` reports the case afterwards, by which time an
+  older generation may already have been written.
+* **If your app keys anything off the predecessor's `Done` marker** (promoting
+  staged records when it is written, say), that now waits until the predecessor
+  answers with data again.
+* **Seals written by earlier releases stay as they are,** and an older build
+  still running against the same successor (an old tab during a UI-only
+  rollout) keeps writing them. A predecessor sealed `Done { had_data: true }`
+  over a partial copy cannot be told apart from a complete one. Ship the journal
+  with a delegate re-key, or accept that window knowingly.
+* **A re-asked predecessor cannot undo what ran in the meantime.** Under a
+  snapshot policy, a predecessor first answering empty lets the same run import
+  an older generation; when the newer one is later re-asked (it held data after
+  all), a never-clobber writer keeps the older values. That is the first-attempt
+  residual (freenet/freenet-core#5857): only an attempt that has already seen
+  data is protected.
 
 ## freenet-migrate 0.6.0
 

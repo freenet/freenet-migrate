@@ -6639,8 +6639,8 @@ mod tests {
         assert!(!store.has_secret(b"room:a"));
     }
 
-    /// A corrupt journal is replaced pessimistically: everything pending AND
-    /// flagged as possibly partial, since the corrupt one may have said so.
+    /// A corrupt journal is rebuilt from the markers, which record every import
+    /// that started.
     #[test]
     fn a_corrupt_journal_is_rebuilt_from_the_markers() {
         let (partial, untouched) = (entry(1, 1), entry(2, 2));
@@ -7581,7 +7581,7 @@ mod tests {
         assert!(complete(&run), "{:?}", run.status);
     }
 
-    /// The walk, like `begin`, replaces a corrupt journal with a pessimistic one.
+    /// The walk, like `begin`, rebuilds a corrupt journal from the markers.
     #[test]
     fn the_walk_rebuilds_a_corrupt_journal_from_the_markers() {
         let (partial, absent) = (entry(1, 1), entry(2, 2));

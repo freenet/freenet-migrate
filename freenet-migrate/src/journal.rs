@@ -61,7 +61,7 @@
 //! | Walk outcome | Journal |
 //! |---|---|
 //! | `Imported`, or `AlreadyMigrated` with a data-bearing marker | [`JournalResolution::Imported`] |
-//! | `NoData` (it answered "nothing"), or `AlreadyMigrated` with an empty marker | [`JournalResolution::NoData`] |
+//! | `NoData` (it answered "nothing"), or `AlreadyMigrated` with an empty marker | [`JournalResolution::NoData`] — but an empty marker contradicted by a started import is not believed: the predecessor is asked again |
 //! | `Incomplete` whose only blemish is permanently rejected items | [`JournalResolution::ImportedWithRejections`], stamped with the writer's [`import_revision`](JournaledSuccessorIo::import_revision) |
 //! | `Superseded` behind a resolved, data-bearing newer predecessor, under a `NewestSnapshotWins` policy | [`JournalResolution::SupersededByAuthoritative`] |
 //! | `Unresponsive` — silence, a timeout, a transport fault, **a definitive "not installed"**, or an empty export from a predecessor an earlier attempt saw data in | stays pending; `attempts + 1` |
