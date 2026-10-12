@@ -586,8 +586,10 @@ pub enum ProbeVerdict {
     /// [`PredecessorMigration::Unresponsive`].
     NoReply,
     /// The node answered, definitively, that it has no such delegate installed.
-    /// Only for a typed node answer, never for a timeout. See
-    /// [`PredecessorSecretsIo::probe_verdict`] for what this licenses.
+    /// Only for a typed node answer, never for a timeout or an empty reply.
+    /// Recorded as [`PredecessorMigration::Unresponsive`] exactly like
+    /// [`NoReply`](Self::NoReply): it resolves nothing. A journal counts it in the
+    /// predecessor's absent streak (see [`PredecessorSecretsIo::probe_verdict`]).
     NotInstalled,
 }
 
@@ -1600,13 +1602,18 @@ where
 ///
 /// Call it as soon as the app has decided this load migrates, and **before**
 /// anything — the walk, or an app's own sweep — writes migrated data to the
-/// successor. From then on an interruption at any point leaves a pending journal
-/// behind, which is how the next load knows the migration must run again. See the
-/// [`crate::journal`] module docs.
+/// successor, or merges it into state a later save would persist. From then on
+/// an interruption at any point leaves a pending journal behind, which is how
+/// the next load knows the migration must run again. See the [`crate::journal`]
+/// module docs.
 ///
-/// * Nothing stored: stores a journal with every predecessor pending.
+/// * Nothing stored: stores a journal with every predecessor pending, flagging
+///   an import [`Started`](crate::ImportFlag::Started) for any predecessor an
+///   earlier plain walk left mid-import (a surviving
+///   [`MigrationMarker::InProgress`] that saw data). This reads one marker per
+///   predecessor, once.
 /// * A corrupt journal stored: replaces it with a pessimistic one (every
-///   predecessor pending and flagged as possibly partially imported).
+///   predecessor pending, an import [`Suspected`](crate::ImportFlag::Suspected)).
 /// * A readable journal stored: writes nothing. It is never reset, so resolutions
 ///   and import flags survive.
 ///
@@ -1615,9 +1622,10 @@ where
 ///
 /// # Errors
 ///
-/// The journal could not be read or stored, or was written by a build with a
-/// different journal encoding version (which this build never overwrites). Do
-/// not proceed with a migration write: nothing durable would record it.
+/// The journal (or, starting one, a predecessor's marker) could not be read or
+/// stored, or the journal was written by a build with a different journal
+/// encoding version (which this build never overwrites). Do not proceed with a
+/// migration write: nothing durable would record it.
 pub async fn begin_migration_journal<W>(
     successor: &mut W,
     predecessors: &[DelegateLineageEntry],
@@ -1628,38 +1636,28 @@ where
     W::Error: core::fmt::Debug,
 {
     let binding = JournalBinding::new(policy, successor.import_revision());
-    let journal = match successor
-        .load_journal()
-        .await
-        .map_err(|e| JournalError::Successor(format!("journal load failed: {e:?}")))?
-    {
-        Some(bytes) => match MigrationJournal::decode(&bytes) {
-            Ok(journal) => return Ok(journal.status(predecessors, &binding)),
-            Err(JournalDecodeError::UnknownVersion(v)) => {
-                return Err(JournalError::ForeignVersion(v))
-            }
-            Err(JournalDecodeError::Corrupt(_)) => MigrationJournal::pessimistic(predecessors),
-        },
-        None => fresh_journal(successor, predecessors, policy).await,
+    let mut journal = match start_journal(successor, predecessors, policy).await? {
+        Started::Existing(journal) => return Ok(journal.status(predecessors, &binding)),
+        Started::New(journal) => journal,
     };
-    successor
-        .store_journal(&journal.encode())
-        .await
-        .map_err(|e| JournalError::Successor(format!("journal store failed: {e:?}")))?;
+    store_merged(successor, &mut journal, Some(&binding), Some(predecessors)).await?;
     Ok(journal.status(predecessors, &binding))
 }
 
-/// Durably flag `predecessor` as **import in progress** before the app writes
-/// data migrated from it **outside** the walk (River's hand-rolled sweep).
+/// Durably flag `predecessor` as having an import
+/// [`Started`](crate::ImportFlag::Started) before the app writes data migrated
+/// from it **outside** the walk (River's hand-rolled sweep), or merges it into
+/// state a later save would persist.
 ///
-/// Until a journaled walk resolves the predecessor,
+/// Until a journaled walk resolves the predecessor as imported,
 /// [`JournalStatus::interrupted_import`] then reports that the successor may hold
 /// a partial copy. Call [`begin_migration_journal`] first.
 ///
 /// # Errors
 ///
-/// The flag could not be stored. Do not write: a kill mid-write would leave a
-/// partial copy nothing records.
+/// The journal could not be read, is corrupt or from a different encoding
+/// version, or the flag could not be stored. Do not write: a kill mid-write would
+/// leave a partial copy nothing records.
 pub async fn note_app_import_started<W>(
     successor: &mut W,
     predecessor: &DelegateKey,
@@ -1687,8 +1685,8 @@ where
         },
         None => MigrationJournal::default(),
     };
-    if journal.mark_data_bearing(predecessor, generation) {
-        store_merged(successor, &mut journal).await?;
+    if journal.mark_import_started(predecessor, generation) {
+        store_merged(successor, &mut journal, None, None).await?;
     }
     Ok(())
 }
@@ -1700,21 +1698,20 @@ pub struct JournaledMigrationReport {
     /// What the walk did, exactly as [`migrate_delegate_secrets`] reports it. Empty
     /// when the walk was refused (see [`journal_error`](Self::journal_error)).
     pub report: DelegateMigrationReport,
-    /// The journal's completeness after this run, under the run's policy and the
-    /// successor's import revision. `None` when the journal could not be
-    /// established, in which case nothing was migrated.
+    /// The stored journal's completeness after this run, under the run's policy
+    /// and the successor's import revision. `None` when it is not known to be
+    /// stored: the walk was refused, or the final store failed.
     pub status: Option<JournalStatus>,
     /// The first journal failure, if any.
     ///
-    /// * The journal could not be read, could not be started, or is from a
-    ///   different encoding version: **the walk was refused** (nothing written),
-    ///   `report` is empty and `status` is `None`.
-    /// * A predecessor's import-in-progress flag could not be stored: that
-    ///   predecessor is `WriterUnavailable` (stage
-    ///   [`WriterStage::JournalFlag`]) and nothing of it was written.
-    /// * The final store failed: the migration ran, but `status` is this run's
-    ///   view and was not stored; the stored journal still reads pending for
-    ///   whatever this run resolved, so the next load re-runs.
+    /// * The journal could not be read or started, or is from a different
+    ///   encoding version: **the walk was refused** (nothing written), `report` is
+    ///   empty and `status` is `None`.
+    /// * A predecessor's import flag could not be stored: that predecessor is
+    ///   `WriterUnavailable` (stage [`WriterStage::JournalFlag`]), nothing of it
+    ///   was written, and the walk stopped there.
+    /// * The final store failed: the migration ran, but what it resolved was not
+    ///   recorded, so `status` is `None` and the next load re-runs.
     pub journal_error: Option<String>,
 }
 
@@ -1726,10 +1723,11 @@ pub struct JournaledMigrationReport {
 ///
 /// 1. The journal is loaded, or started (as [`begin_migration_journal`] does),
 ///    before the walk writes anything. If that fails the walk does not run.
-/// 2. Resolutions made under a different policy family or an older
+/// 2. Resolutions that do not hold under this run's policy family and
 ///    [`import_revision`](JournaledSuccessorIo::import_revision) are reopened.
 /// 3. Before a data-bearing predecessor's first item its entry is durably flagged
-///    as import in progress; if that store fails, the predecessor is not imported.
+///    as an import started; if that store fails, the walk stops before writing
+///    anything of it.
 /// 4. After the walk each predecessor's outcome resolves its entry or counts an
 ///    unresolved attempt (table in the [`crate::journal`] module docs), and the
 ///    journal is stored with read-merge-write.
@@ -1763,39 +1761,28 @@ where
     let binding = JournalBinding::new(&policy, successor.import_revision());
 
     // 1. Load or start, failing closed.
-    let mut journal = match successor.load_journal().await {
-        Err(e) => return refused(format!("journal load failed: {e:?}")),
-        Ok(Some(bytes)) => match MigrationJournal::decode(&bytes) {
-            Ok(journal) => journal,
-            Err(JournalDecodeError::UnknownVersion(v)) => {
-                return refused(format!(
-                    "stored journal has encoding version {v}; this build does not overwrite it"
-                ))
-            }
-            Err(JournalDecodeError::Corrupt(_)) => {
-                let journal = MigrationJournal::pessimistic(predecessors);
-                if let Err(e) = successor.store_journal(&journal.encode()).await {
-                    return refused(format!("journal start failed: {e:?}"));
-                }
-                journal
-            }
-        },
-        Ok(None) => {
-            let journal = fresh_journal(successor, predecessors, &policy).await;
-            if let Err(e) = successor.store_journal(&journal.encode()).await {
-                return refused(format!("journal start failed: {e:?}"));
+    let mut journal = match start_journal(successor, predecessors, &policy).await {
+        Err(e) => return refused(e.to_string()),
+        Ok(Started::Existing(journal)) => journal,
+        Ok(Started::New(mut journal)) => {
+            if let Err(e) =
+                store_merged(successor, &mut journal, Some(&binding), Some(predecessors)).await
+            {
+                return refused(format!("journal start failed: {e}"));
             }
             journal
         }
     };
 
-    // 2. Reopen what no longer holds under this run's policy and import revision.
+    // 2. The working copy, as it applies under this run's binding.
     journal.rebind(&binding);
 
     // 3. The walk, flagging each data-bearing import durably before it writes.
     let mut journal_error: Option<String> = None;
     let mut observer = JournalObserver {
         journal: &mut journal,
+        binding,
+        predecessors,
         first_error: &mut journal_error,
     };
     let mut transport = AppSideRoundTrip { io };
@@ -1817,31 +1804,75 @@ where
     )) {
         journal.record(row.key(), row.generation(), run_outcome);
     }
-    if let Err(e) = store_merged(successor, &mut journal).await {
-        if journal_error.is_none() {
-            journal_error = Some(e.to_string());
-        }
-    }
+    let status =
+        match store_merged(successor, &mut journal, Some(&binding), Some(predecessors)).await {
+            Ok(()) => Some(journal.status(predecessors, &binding)),
+            Err(e) => {
+                if journal_error.is_none() {
+                    journal_error = Some(e.to_string());
+                }
+                None
+            }
+        };
 
     JournaledMigrationReport {
-        status: Some(journal.status(predecessors, &binding)),
+        status,
         report: outcome.report,
         journal_error,
     }
 }
 
+/// What [`start_journal`] found.
+enum Started {
+    /// A readable journal is stored. Nothing to store.
+    Existing(MigrationJournal),
+    /// None (or a corrupt one) is stored: this one must be stored before any
+    /// migration write.
+    New(MigrationJournal),
+}
+
+/// Load the stored journal, or build the one to start with, for `begin` and the
+/// journaled walk alike. Never stores anything.
+async fn start_journal<W>(
+    successor: &mut W,
+    predecessors: &[DelegateLineageEntry],
+    policy: &SecretSelectionPolicy,
+) -> Result<Started, JournalError>
+where
+    W: JournaledSuccessorIo,
+    W::Error: core::fmt::Debug,
+{
+    match successor
+        .load_journal()
+        .await
+        .map_err(|e| JournalError::Successor(format!("journal load failed: {e:?}")))?
+    {
+        Some(bytes) => match MigrationJournal::decode(&bytes) {
+            Ok(journal) => Ok(Started::Existing(journal)),
+            Err(JournalDecodeError::UnknownVersion(v)) => Err(JournalError::ForeignVersion(v)),
+            Err(JournalDecodeError::Corrupt(_)) => {
+                Ok(Started::New(MigrationJournal::pessimistic(predecessors)))
+            }
+        },
+        None => Ok(Started::New(
+            fresh_journal(successor, predecessors, policy).await?,
+        )),
+    }
+}
+
 /// The journal a successor with none stored starts from: every predecessor
-/// pending, and flagged as possibly partially imported where a surviving
-/// [`MigrationMarker::InProgress`] says an earlier plain walk saw data and did not
-/// finish (or where the marker cannot be read). That is the state of a successor
-/// adopting the journal after an interrupted [`migrate_delegate_secrets`] run.
+/// pending, with an import [`Started`](crate::ImportFlag::Started) where a
+/// surviving [`MigrationMarker::InProgress`] says an earlier plain walk saw data
+/// and did not finish. That is the state of a successor adopting the journal
+/// after an interrupted [`migrate_delegate_secrets`] run.
 async fn fresh_journal<W>(
     successor: &mut W,
     predecessors: &[DelegateLineageEntry],
     policy: &SecretSelectionPolicy,
-) -> MigrationJournal
+) -> Result<MigrationJournal, JournalError>
 where
     W: JournaledSuccessorIo,
+    W::Error: core::fmt::Debug,
 {
     let mut journal = MigrationJournal::new_pending(predecessors);
     for e in predecessors {
@@ -1851,23 +1882,37 @@ where
             generation: e.generation,
             legacy_bridge: policy.legacy_bridge(),
         };
-        if matches!(
-            successor.migration_marker(&query).await,
-            Ok(Some(MigrationMarker::InProgress { saw_data: true })) | Err(_)
-        ) {
-            journal.mark_data_bearing(&key, e.generation);
+        // A marker that cannot be read leaves the start undecidable: fail closed
+        // rather than guess, as the walk itself does on a marker fault.
+        match successor.migration_marker(&query).await {
+            Ok(Some(MigrationMarker::InProgress { saw_data: true })) => {
+                journal.mark_import_started(&key, e.generation);
+            }
+            Ok(_) => {}
+            Err(err) => {
+                return Err(JournalError::Successor(format!(
+                    "marker read failed while starting the journal: {err:?}"
+                )))
+            }
         }
     }
-    journal
+    Ok(journal)
 }
 
 /// Store `journal` after merging in whatever is stored now (read-merge-write),
-/// so a concurrent session's flags and resolutions are not erased. Refuses to
-/// overwrite a journal from a different encoding version, and to store over one
-/// that could not be read.
+/// so a concurrent session's flags and resolutions are not erased.
+///
+/// With a `binding`, both sides merge as they apply under it, so a resolution
+/// that no longer holds cannot win. Refuses to overwrite a journal from a
+/// different encoding version, and to store over one that could not be read. A
+/// journal found corrupt at the re-read may have held another session's flags: it
+/// merges in as a pessimistic one if the `lineage` is known, and otherwise the
+/// store is refused.
 async fn store_merged<W>(
     successor: &mut W,
     journal: &mut MigrationJournal,
+    binding: Option<&JournalBinding>,
+    lineage: Option<&[DelegateLineageEntry]>,
 ) -> Result<(), JournalError>
 where
     W: JournaledSuccessorIo,
@@ -1880,13 +1925,20 @@ where
             )))
         }
         Ok(Some(bytes)) => match MigrationJournal::decode(&bytes) {
-            Ok(stored) => journal.merge_stored(&stored),
+            Ok(stored) => journal.merge_stored(&stored, binding),
             Err(JournalDecodeError::UnknownVersion(v)) => {
                 return Err(JournalError::ForeignVersion(v))
             }
-            // Ours is at least as conservative as a corrupt value can be trusted
-            // to be: replace it.
-            Err(JournalDecodeError::Corrupt(_)) => {}
+            Err(JournalDecodeError::Corrupt(e)) => match lineage {
+                Some(lineage) => {
+                    journal.merge_stored(&MigrationJournal::pessimistic(lineage), binding)
+                }
+                None => {
+                    return Err(JournalError::Successor(format!(
+                        "stored journal is corrupt ({e}); call begin_migration_journal first"
+                    )))
+                }
+            },
         },
         Ok(None) => {}
     }
@@ -1898,6 +1950,8 @@ where
 
 struct JournalObserver<'j> {
     journal: &'j mut MigrationJournal,
+    binding: JournalBinding,
+    predecessors: &'j [DelegateLineageEntry],
     first_error: &'j mut Option<String>,
 }
 
@@ -1912,10 +1966,17 @@ where
         predecessor: &DelegateKey,
         generation: u32,
     ) -> Result<(), String> {
-        if !self.journal.mark_data_bearing(predecessor, generation) {
+        if !self.journal.mark_import_started(predecessor, generation) {
             return Ok(());
         }
-        match store_merged(successor, self.journal).await {
+        match store_merged(
+            successor,
+            self.journal,
+            Some(&self.binding),
+            Some(self.predecessors),
+        )
+        .await
+        {
             Ok(()) => Ok(()),
             Err(e) => {
                 let e = format!("journal import flag failed: {e}");
@@ -1986,9 +2047,15 @@ fn resolve_outcomes(
             }
             _ => None,
         };
-        outcomes.push(match resolution {
-            Some(r) => RunOutcome::Resolved(r),
-            None => RunOutcome::Unresolved {
+        outcomes.push(match (resolution, row) {
+            (Some(r), _) => RunOutcome::Resolved(r),
+            // Never asked: behind a halt, or the successor failed before the probe.
+            (
+                None,
+                PredecessorMigration::Superseded { .. }
+                | PredecessorMigration::WriterUnavailable { .. },
+            ) => RunOutcome::Unexamined,
+            (None, _) => RunOutcome::Unresolved {
                 absent: matches!(row, PredecessorMigration::Unresponsive { .. })
                     && outcome.not_installed.contains(&key),
             },
@@ -2145,7 +2212,7 @@ impl<W> WalkObserver<W> for NoObserver {
 pub(crate) struct WalkOutcome {
     pub(crate) report: DelegateMigrationReport,
     /// Predecessors whose probe answered [`ProbeVerdict::NotInstalled`] (reported
-    /// as `NoData`).
+    /// as `Unresponsive`).
     pub(crate) not_installed: BTreeSet<[u8; 32]>,
     /// Predecessors short-circuited as `AlreadyMigrated` by a data-bearing
     /// completion marker.
@@ -2323,6 +2390,23 @@ where
             // (or forge) a migration marker.
             let items: Vec<&SecretPair> = secrets.iter().filter(|(k, _)| !is_marker(k)).collect();
             let saw_data = prior_saw_data || !items.is_empty();
+
+            // An earlier attempt saw data and this one exports nothing. A frozen
+            // predecessor does not lose data, so the empty answer is the fault (a
+            // secret the node failed to read, an unreliable reply). Believing it
+            // would seal `Done { had_data: true }` over whatever the interrupted
+            // attempt left partially written, and the rest would never be asked
+            // for again. Treat it as a silence: no marker change, so the in-progress
+            // marker survives and a later run asks again.
+            if prior_saw_data && items.is_empty() {
+                results.push(PredecessorMigration::Unresponsive {
+                    key,
+                    generation,
+                    error: Some("exported nothing, but an earlier attempt saw data".to_string()),
+                });
+                terminated = policy.unresponsive_terminates(prior_saw_data);
+                continue;
+            }
 
             // A data-bearing import is about to write: let the journal (if any)
             // record durably that this predecessor may be partially imported from
@@ -3840,7 +3924,7 @@ mod tests {
     }
 
     #[test]
-    fn data_then_empty_retry_keeps_the_data_flag_and_still_supersedes_older() {
+    fn data_then_empty_retry_is_not_believed_and_still_supersedes_older() {
         // The OTHER sticky-data direction, and the dangerous one. B (newest) is
         // data-bearing on attempt 1 but a write fails, so it stays unsealed. On the
         // retry B answers EMPTY. If the flag were recomputed from this attempt alone,
@@ -3873,8 +3957,10 @@ mod tests {
             "the in-progress marker records that this attempt saw data"
         );
 
-        // Run 2: B now answers EMPTY. The flag is sticky, so B is still the
-        // authoritative data-bearing snapshot and A is never imported.
+        // Run 2: B now answers EMPTY. An empty answer after data was seen is not
+        // believed (a frozen predecessor does not lose data): B stays unsealed, as
+        // a silence, with its in-progress flag intact, and A is still never
+        // imported.
         store.stop_failing();
         let mut io2 = MockIo::default()
             .executable_with(&key_of(&b), &[])
@@ -3887,16 +3973,23 @@ mod tests {
             newest(),
         ));
         assert!(
-            matches!(r2.predecessors[0], PredecessorMigration::Imported { .. }),
-            "a data-then-empty retry stays Imported, never NoData; got {:?}",
+            matches!(
+                r2.predecessors[0],
+                PredecessorMigration::Unresponsive { .. }
+            ),
+            "a data-then-empty retry is neither Imported nor NoData; got {:?}",
             r2.predecessors[0]
         );
-        assert_eq!(
+        assert!(
             store
                 .get_secret(&predecessor_done_marker(&key_of(&b), true).0)
-                .unwrap(),
+                .is_none(),
+            "an empty answer must not seal the predecessor over the missing `x`"
+        );
+        assert_eq!(
+            store.get_secret(&pred_wip_marker(&key_of(&b))).unwrap(),
             PRED_DONE_MARKER_VALUE_DATA,
-            "the sealed marker must keep the data flag"
+            "the in-progress marker keeps the data flag"
         );
         assert!(
             matches!(r2.predecessors[1], PredecessorMigration::Superseded { .. }),
@@ -3907,6 +4000,24 @@ mod tests {
             store.get_secret(b"a_only").is_none(),
             "a data-then-empty retry must not resurrect the older generation's keys"
         );
+
+        // Run 3: B answers with its data again, and `x` finally lands.
+        let mut io3 = MockIo::default()
+            .executable_with(&key_of(&b), &[(b"x", b"NEW")])
+            .executable_with(&key_of(&a), &[(b"a_only", b"va")]);
+        let r3 = block_on(migrate_delegate_secrets(
+            &mut store_io(&mut store),
+            &mut io3,
+            &[a, b],
+            ack(),
+            newest(),
+        ));
+        assert!(matches!(
+            r3.predecessors[0],
+            PredecessorMigration::Imported { .. }
+        ));
+        assert_eq!(store.get_secret(b"x").as_deref(), Some(&b"NEW"[..]));
+        assert!(store.get_secret(b"a_only").is_none());
     }
 
     #[test]
@@ -5747,8 +5858,9 @@ mod tests {
     // #38 review, or for a property the journal's data-loss argument rests on.
 
     use crate::journal::{
-        journal_status, JournalBinding, JournalDecodeError, JournalError, JournalResolution,
-        JournalState, JournalStatus, MigrationJournal, RunOutcome, MIGRATION_JOURNAL_KEY,
+        journal_status, ImportFlag, JournalBinding, JournalDecodeError, JournalError,
+        JournalResolution, JournalState, JournalStatus, MigrationJournal, RunOutcome,
+        MIGRATION_JOURNAL_KEY,
     };
 
     fn union_binding() -> JournalBinding {
@@ -5963,7 +6075,9 @@ mod tests {
             &union(),
         ))
         .expect("begin");
-        assert!(matches!(status, JournalStatus::Incomplete { ref pending } if pending.len() == 2));
+        assert!(
+            matches!(status, JournalStatus::Incomplete { ref pending, .. } if pending.len() == 2)
+        );
         assert_eq!(stored_status(&store, &lineage), status);
         assert_eq!(store.data.len(), 1, "only the journal was written");
     }
@@ -5976,7 +6090,7 @@ mod tests {
         let k = key_of(&lineage[0]);
         let mut store = MemStore::default();
         let mut journal = MigrationJournal::new_pending(&lineage);
-        journal.mark_data_bearing(&k, 1);
+        journal.mark_import_started(&k, 1);
         store.set_secret(MIGRATION_JOURNAL_KEY, &journal.encode());
         let status = block_on(begin_migration_journal(
             &mut store_io(&mut store),
@@ -6171,14 +6285,14 @@ mod tests {
         assert!(matches!(
             state_of(&writer.store, &lineage[1]),
             JournalState::Pending {
-                data_bearing: true,
+                import: ImportFlag::Started,
                 ..
             }
         ));
         assert!(matches!(
             state_of(&writer.store, &lineage[0]),
             JournalState::Pending {
-                data_bearing: false,
+                import: ImportFlag::None,
                 ..
             }
         ));
@@ -6219,7 +6333,7 @@ mod tests {
         let k = key_of(&lineage[0]);
         let mut writer = InspectingWriter::new(&lineage);
         let mut journal = MigrationJournal::new_pending(&lineage);
-        journal.mark_data_bearing(&k, 1);
+        journal.mark_import_started(&k, 1);
         let before = journal.encode();
         writer.store.set_secret(MIGRATION_JOURNAL_KEY, &before);
         writer.fail_journal_load = true;
@@ -6397,8 +6511,13 @@ mod tests {
             &JournalBinding::new(&union(), 1),
         );
         assert!(
-            reopened.interrupted_import(),
-            "reopened as a partial import"
+            !reopened.is_complete(),
+            "reopened under the higher revision"
+        );
+        assert_eq!(reopened.rejected_items(), 1, "the count is still reported");
+        assert!(
+            !reopened.interrupted_import(),
+            "the rest of its data is in the successor: not a partial import"
         );
         let run = writer.run(&mut io, union());
         assert_eq!(
@@ -6552,7 +6671,7 @@ mod tests {
         // A predecessor that may hold a partial import is never "absent", however
         // long its streak: the successor may already hold part of it.
         let mut flagged = stored_journal(&store);
-        flagged.mark_data_bearing(&k, 1);
+        flagged.mark_import_started(&k, 1);
         flagged.record(&k, 1, RunOutcome::Unresolved { absent: true });
         assert!(!flagged
             .status(&lineage, &union_binding())
@@ -6694,6 +6813,9 @@ mod tests {
         let (g1, g2, g3) = (entry(1, 1), entry(2, 2), entry(3, 3));
         let lineage = [g1, g2, g3];
         let mut writer = InspectingWriter::new(&lineage);
+        // Started first: a marker fault while STARTING the journal refuses the
+        // walk outright (`a_marker_fault_while_starting_the_journal_refuses`).
+        block_on(begin_migration_journal(&mut writer, &lineage, &union())).expect("begin");
         writer.fail_marker_read.insert(key_of(&g2).bytes().to_vec());
         let mut io = MockIo::default()
             .executable_with(&key_of(&g3), &[(b"room:3", b"3")])
@@ -6798,7 +6920,7 @@ mod tests {
         let lineage = [ours, theirs];
         let mut writer = InspectingWriter::new(&lineage);
         let mut other = MigrationJournal::new_pending(&lineage);
-        other.mark_data_bearing(&key_of(&theirs), 2);
+        other.mark_import_started(&key_of(&theirs), 2);
         writer.inject_at_first_item = Some(other.encode());
         let mut io = MockIo::default()
             .executable_with(&key_of(&ours), &[(b"room:a", b"A")])
@@ -6807,7 +6929,7 @@ mod tests {
         assert!(matches!(
             state_of(&writer.store, &theirs),
             JournalState::Pending {
-                data_bearing: true,
+                import: ImportFlag::Started,
                 ..
             }
         ));
@@ -6841,7 +6963,7 @@ mod tests {
         let k = key_of(&lineage[0]);
         let mut journal = MigrationJournal::new_pending(&lineage);
         journal.record(&k, 1, resolved(JournalResolution::NoData));
-        assert!(journal.mark_data_bearing(&k, 1));
+        assert!(journal.mark_import_started(&k, 1));
         assert!(journal
             .status(&lineage, &union_binding())
             .interrupted_import());
@@ -6901,7 +7023,7 @@ mod tests {
         for (e, o) in lineage.iter().zip(outcomes) {
             journal.record(&key_of(e), e.generation, o);
         }
-        journal.mark_data_bearing(&key_of(&lineage[4]), 5);
+        journal.mark_import_started(&key_of(&lineage[4]), 5);
         assert_eq!(
             MigrationJournal::decode(&journal.encode()).unwrap(),
             journal
@@ -6917,8 +7039,19 @@ mod tests {
             }
             assert_eq!(
                 MigrationJournal::decode(&w),
-                Err(JournalDecodeError::UnknownVersion(v)),
+                Err(JournalDecodeError::UnknownVersion(u64::from(v))),
                 "version {v}"
+            );
+        }
+        // A version that does not fit the byte this build writes is still a
+        // version, never "corrupt" (which would license overwriting it).
+        {
+            let mut w = wire.clone();
+            let pos = w.windows(2).position(|x| x == [0x61, b'v']).unwrap() + 2;
+            w.splice(pos..=pos, [0x19, 0x01, 0x00]);
+            assert_eq!(
+                MigrationJournal::decode(&w),
+                Err(JournalDecodeError::UnknownVersion(256))
             );
         }
         let mut trailing = wire.clone();
@@ -6965,12 +7098,12 @@ mod tests {
         );
 
         let mut flagged = MigrationJournal::new_pending(&[e]);
-        flagged.mark_data_bearing(&k, 1);
+        flagged.mark_import_started(&k, 1);
         flagged.record(&k, 1, resolved(JournalResolution::NoData));
         assert!(matches!(
             flagged.entry(&k).unwrap().state,
             JournalState::Pending {
-                data_bearing: true,
+                import: ImportFlag::Started,
                 ..
             }
         ));
