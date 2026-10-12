@@ -6142,6 +6142,8 @@ mod tests {
         offered: Vec<Vec<u8>>,
         /// `RecoveredSecret::retry` of each offered item.
         retries: Vec<bool>,
+        /// Every `record_marker` call.
+        markers_recorded: Vec<MigrationMarker>,
         fail_marker_read: BTreeSet<Vec<u8>>,
         fail_flush: bool,
         journal_stores: usize,
@@ -6167,6 +6169,7 @@ mod tests {
                 permanent_fail: BTreeSet::new(),
                 offered: Vec::new(),
                 retries: Vec::new(),
+                markers_recorded: Vec::new(),
                 fail_marker_read: BTreeSet::new(),
                 fail_flush: false,
                 journal_stores: 0,
@@ -6221,6 +6224,7 @@ mod tests {
             predecessor: &DelegateKey,
             marker: MigrationMarker,
         ) -> Result<(), Self::Error> {
+            self.markers_recorded.push(marker);
             self.raw().record_marker(predecessor, marker).await
         }
         async fn write_secret(&mut self, item: &RecoveredSecret<'_>) -> ItemWrite<Self::Error> {
@@ -9062,5 +9066,20 @@ mod tests {
             MigrationJournal::decode(&w),
             Err(JournalDecodeError::UnknownVersion(257))
         );
+    }
+
+    /// `note_app_import_started` writes no marker over a completed data import (a
+    /// store keeping one marker per predecessor would otherwise demote `Done`, and
+    /// a later walk would re-import, resurrecting deleted keys).
+    #[test]
+    fn an_app_flag_writes_no_marker_over_a_completed_import() {
+        let lineage = [entry(1, 1)];
+        let k = key_of(&lineage[0]);
+        let mut writer = InspectingWriter::new(&lineage);
+        let mut io = MockIo::default().executable_with(&k, &[(b"room:a", b"A")]);
+        assert!(complete(&writer.run(&mut io, union())));
+        let before = writer.markers_recorded.len();
+        block_on(note_app_import_started(&mut writer, &k, 1, &union())).expect("ok");
+        assert_eq!(writer.markers_recorded.len(), before);
     }
 }
