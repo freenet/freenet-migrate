@@ -2,6 +2,9 @@
 
 ## freenet-migrate 0.7.0
 
+**Unreleased; publish gated on #43** (River's real-node rehearsal, the #41
+marker-store conformance check, and #39 or an app override).
+
 **Delegate half only.** Two features and one behaviour change:
 
 * `SecretSelectionPolicy::NewestSnapshotWinsContinuePastUnresponsive`
@@ -129,7 +132,14 @@ of 4 rooms on every later load. Four review rounds of in-session fixes
   (`WriterStage::JournalUnavailable`), so it never reads complete.
 * `note_app_import_started` raises the same flag for an app that writes migrated
   data outside the walk (River's hand-rolled sweep), once it holds data read
-  from the predecessor and before it writes or merges it.
+  from the predecessor and before it writes or merges it. It refuses
+  (`JournalError::NotImportable`) a predecessor outside the lineage, or one a
+  snapshot policy supersedes, where a flag could never resolve.
+* Inside the no-compare-and-swap window between two sessions' stores, a stale
+  session can overwrite an app's flag on a predecessor resolved as holding
+  nothing, and the journal can then read `Complete` over the app's partial copy.
+  The predecessor's marker still records the import, and the next
+  `begin_migration_journal` reopens it: call `begin` on every load.
 * `journal_status` is the app's pure load-time read: `NotStarted`, `Unreadable`,
   `Incomplete { pending, rejected_items }` (re-run the walk) or
   `Complete { rejected_items }` (nothing left to probe, durably).
@@ -159,11 +169,10 @@ key beginning with `\0freenet-migrate-journal/` is never exported or imported.
   silently skips what it cannot read, or a sub-request whose timeout reads as
   "nothing", as in freenet/delta#100) gets a partial import certified complete;
 * **your successor store is durable** (a page-memory marker store cannot hold a
-  journal); and
+  journal);
 * **your marker store follows the new contract** below;
 * **your predecessors are frozen**: nothing writes to an old generation once its
   successor is in use, or `Imported` and `NoData` seal over data written later;
-  and
 * **no older build of your app walks the same successor** while the journaled
   one is in use (old tabs during a UI-only rollout): it still seals over partial
   copies the journal then believes. Ship the journal with a delegate re-key.
@@ -226,10 +235,10 @@ own stores do not follow it today:
    `InProgress { saw_data: true }`.
 
 Break rule 1 and a lost or corrupt journal certifies `Complete` over a partial
-copy. The crate checks rule 1 by reading the marker back where it matters; it
-checks rule 3 nowhere. A conformance check adopters can run is tracked in #41. The crate checks it where it matters: `note_app_import_started` and a walk
-re-asking an empty seal read the marker back after recording it, and refuse
-(nothing written) if it does not read as recorded.
+copy. The crate checks rule 1 where it matters (`note_app_import_started` and a
+walk re-asking an empty seal read the marker back after recording it, and refuse
+with nothing written if it does not read as recorded); it checks rule 3
+nowhere. A conformance check adopters can run is tracked in #41.
 
 `predecessor_already_migrated` and the public `predecessor_migration_had_data`
 follow rule 1 too: an empty seal contradicted by a data in-progress marker reads

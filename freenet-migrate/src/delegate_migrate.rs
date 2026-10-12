@@ -553,14 +553,18 @@ pub trait PredecessorSecretsIo {
 
     /// Enumerate `predecessor`'s secrets as raw `(key, value)` pairs, via the
     /// app's own delegate protocol. Called only after
-    /// [`probe_executable`](Self::probe_executable) returned `Ok(true)`.
+    /// [`probe_verdict`](Self::probe_verdict) answered
+    /// [`ProbeVerdict::Executable`].
     ///
-    /// **`Ok(vec![])` is a positive claim: "I asked, and it has nothing."** It
-    /// seals the predecessor with a `Done { had_data: false }` marker that is
-    /// never revisited, so returning it for a request that merely went
-    /// unanswered records a slow or temporarily unreachable predecessor as
-    /// permanently empty — silently, with the report reading complete. That is
-    /// the data-loss default freenet/freenet-migrate#19 exists to stop.
+    /// **`Ok(vec![])` is a positive claim: "I asked, and it has nothing."** On a
+    /// predecessor no earlier attempt saw data in, it seals the predecessor with a
+    /// `Done { had_data: false }` marker that is never revisited, so returning it
+    /// for a request that merely went unanswered records a slow or temporarily
+    /// unreachable predecessor as permanently empty — silently, with the report
+    /// reading complete. That is the data-loss default
+    /// freenet/freenet-migrate#19 exists to stop. (After an attempt that saw data,
+    /// the walk does not believe it: see
+    /// [`PredecessorMigration::exported_nothing_after_data`].)
     ///
     /// * `Ok(pairs)` / `Ok(vec![])` — the predecessor **answered**. Only an
     ///   answer.
@@ -7896,7 +7900,7 @@ mod tests {
     }
 
     /// After a corrupt journal, a predecessor that answers "nothing" resolves:
-    /// the corrupt journal only made an import suspected, not known.
+    /// a corrupt journal is rebuilt from the markers, and nothing marked it.
     #[test]
     fn a_corrupt_journal_then_an_empty_predecessor_converges() {
         let (empty, holder) = (entry(1, 1), entry(2, 2));

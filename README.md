@@ -688,16 +688,13 @@ a tab can die between any two writes, so that answer cannot come from session
 state (freenet/river#760). Store a `MigrationJournal` in the successor instead:
 
 ```rust,ignore
-// Load path. One read of the stored journal decides whether the walk runs.
-// `load_journal` must answer Err (not None) for a read that timed out.
-let binding = JournalBinding::new(&policy, successor.import_revision());
-let stored = successor.load_journal().await?;
-if !journal_status(stored.as_deref(), DELEGATE_LINEAGE, &binding).is_complete() {
-    // Durable intent BEFORE the first migration write (yours or the walk's).
-    // An Err means: do not write anything migrated this load. On a first load
-    // after upgrading, its status (not the one above) knows about a partial copy
-    // an earlier plain walk left behind.
-    begin_migration_journal(&mut successor, DELEGATE_LINEAGE, &policy).await?;
+// Load path. `begin` on EVERY load, before anything migrated is written: it
+// starts the journal, adds lineage entries it has never seen, and reopens a
+// resolution a lost flag left wrong (all read off the markers). An Err means: do
+// not write anything migrated this load. `load_journal` must answer Err (not
+// None) for a read that timed out.
+let begun = begin_migration_journal(&mut successor, DELEGATE_LINEAGE, &policy).await?;
+if !begun.is_complete() {
     // Writing migrated data yourself, outside the walk? Flag it first, once you
     // hold data read from the predecessor and before you write or merge it, and
     // skip the write if this errs:
@@ -708,12 +705,11 @@ if !journal_status(stored.as_deref(), DELEGATE_LINEAGE, &binding).is_complete() 
     // `run.status` is what was stored. While it is incomplete, run again on a
     // later load.
 }
-// `interrupted_import()` of the status as STORED NOW (`run.status`, or, when that
-// is None or the walk did not run, a fresh `journal_status` read after the last
-// journal call)
-// true means: do NOT treat the successor as everything the user had. False does
-// not mean it is: check `rejected_items()` and the report's unresponsive rows
-// too. Never gate on `!is_complete()`, and never on a status read before `begin`.
+// `interrupted_import()` of the status as STORED NOW (`run.status`, or `begun`
+// when the walk did not run, or a fresh `journal_status` read after the last
+// journal call) true means: do NOT treat the successor as everything the user
+// had. False does not mean it is: check `rejected_items()` and the pending
+// list too. Never gate on `!is_complete()`.
 ```
 
 `successor` implements `JournaledSuccessorIo`: load and store the journal bytes
@@ -731,8 +727,9 @@ Drive the journal calls one at a time within a session.
 resolution is as permanent as a `Done` marker, so an export that can come back
 partial without an `Err` gets a partial import certified complete), your
 successor store is durable, your marker store follows the contract, your
-predecessors are frozen, and no older build of your app walks the same
-successor (see the CHANGELOG).
+predecessors are frozen, no older build of your app walks the same successor,
+and, under a snapshot policy, every predecessor finished its own migration
+before it became one (see the CHANGELOG).
 
 Compose "the successor may not be everything the user had" from: a walk in
 flight, a status not read yet, `begin_migration_journal` erring, or
@@ -772,8 +769,10 @@ may hold everything the user had, with nothing partially written. It shows as a
 pending entry with no import flag (`absent_streak` 0 if it was silent rather
 than "not installed"). Whether that blocks anything (a fresh install, say) is the
 app's rule to state, from the pending list. Inside the no-compare-and-swap window
-between two sessions' journal stores, `interrupted_import()` can also be briefly
-false over a partial copy; `Complete` is still never claimed then.
+between two sessions' journal stores, a stale session can also overwrite an
+app's flag: `interrupted_import()` can then be false over a partial copy, and if
+the predecessor had been resolved as holding nothing, the journal can even read
+`Complete`. Its marker still records the import, and the next `begin` reopens it.
 
 ### Known limitations
 
@@ -848,7 +847,8 @@ Targets current stdlib **0.8.x**.
 is no longer absence ([#19]). See [Upgrading to 0.6.0](#upgrading-to-060) and the
 CHANGELOG.
 
-**Unreleased: 0.7.0**, on the **delegate** half: the new
+**Unreleased: 0.7.0** (publish gated on
+[#43](https://github.com/freenet/freenet-migrate/issues/43)), on the **delegate** half: the new
 `NewestSnapshotWinsContinuePastUnresponsive` policy variant ([#14]) and the
 opt-in completeness journal ([#37]), both optional per app, plus one behaviour
 change every adopter of the delegate walk gets. A predecessor that exports

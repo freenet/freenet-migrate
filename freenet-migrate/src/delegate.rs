@@ -850,7 +850,9 @@ pub(crate) fn is_marker(key: &[u8]) -> bool {
 /// Whether `key` is reserved by the crate (a migration marker, or the
 /// migration journal): never an app's data, never exported, never imported. An
 /// app that copies predecessor data itself (a hand-rolled sweep, an adapter
-/// listing a predecessor's keys) should skip these too.
+/// listing a predecessor's keys) should skip these too. It knows only the
+/// crate's namespaces: an app storing its journal under its own key (overriding
+/// [`crate::JournaledSuccessorIo::journal_key`]) must skip that key itself.
 pub fn is_reserved_key(key: &[u8]) -> bool {
     is_marker(key)
 }

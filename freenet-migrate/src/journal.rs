@@ -61,6 +61,7 @@
 //! | Walk outcome | Journal |
 //! |---|---|
 //! | `Imported`, or `AlreadyMigrated` with a data-bearing marker | [`JournalResolution::Imported`] |
+//! | `AlreadyMigrated` only through a legacy marker for a NEWER generation (snapshot policies) | [`JournalResolution::SupersededByAuthoritative`] — or an import [`Started`](ImportFlag::Started) if this generation's own marker says one is under way |
 //! | `NoData` (it answered "nothing"), or `AlreadyMigrated` with an empty marker | [`JournalResolution::NoData`] — but an empty marker contradicted by a started import is not believed: the predecessor is asked again |
 //! | `Incomplete` whose only blemish is permanently rejected items | [`JournalResolution::ImportedWithRejections`], stamped with the writer's [`import_revision`](JournaledSuccessorIo::import_revision) |
 //! | `Superseded` behind a resolved, data-bearing newer predecessor, under a `NewestSnapshotWins` policy | [`JournalResolution::SupersededByAuthoritative`] |
@@ -118,6 +119,16 @@
 //! the predecessor's in-progress marker), so nothing it said about a partial copy
 //! is lost.
 //!
+//! # When not to adopt it
+//!
+//! Do not adopt the journal unless the app's `fetch_secrets` fails loudly (a
+//! partial export that returns `Ok` is certified complete), its successor store
+//! is durable, its marker store follows the contract on
+//! [`crate::SuccessorSecretsIo::migration_marker`], its predecessors are frozen
+//! once superseded, and no older build of it walks the same successor. Under a
+//! snapshot policy, every predecessor must also have finished its own migration
+//! before it became one. The CHANGELOG has the reasons.
+//!
 //! # What this does not do
 //!
 //! * It does not cover data the app writes outside the walk *unless* the app
@@ -174,9 +185,10 @@ pub enum JournalResolution {
         revision: u32,
     },
     /// It was not imported because a newer predecessor, itself resolved and
-    /// data-bearing, supplied the authoritative snapshot under a
-    /// `NewestSnapshotWins` policy. Holds only while the app migrates under that
-    /// policy family; under `UnionAllGenerations` it reads as pending.
+    /// data-bearing (or a legacy generation-keyed seal for one), supplied the
+    /// authoritative snapshot under a `NewestSnapshotWins` policy. Holds only
+    /// while the app migrates under that policy family; under
+    /// `UnionAllGenerations` it reads as pending.
     SupersededByAuthoritative,
 }
 
