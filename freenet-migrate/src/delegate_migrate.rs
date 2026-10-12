@@ -11490,7 +11490,12 @@ mod tests {
             Err(JournalError::NotImportable(_))
         ));
         assert!(
-            stored_status(&store, &lineage).is_complete(),
+            journal_status(
+                store.get_secret(MIGRATION_JOURNAL_KEY).as_deref(),
+                &lineage,
+                &JournalBinding::new(&newest(), 0),
+            )
+            .is_complete(),
             "nothing recorded"
         );
         // Under Union the older generation is owed, and the flag is recorded.
