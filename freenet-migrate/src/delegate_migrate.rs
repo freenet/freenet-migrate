@@ -14443,4 +14443,80 @@ mod tests {
             JournalState::Resolved(JournalResolution::ImportedWithRejections { .. })
         ));
     }
+
+    // ---- round-17 probes ----------------------------------------------------------
+
+    /// Another session's completion brought in by the flag's own store is
+    /// `AlreadyImported` whichever data-bearing resolution it is (the round-16 test
+    /// pins only `ImportedWithRejections`, so a check narrowed to it passed), under
+    /// every policy. A rejection resolution from a LOWER revision is reopened by the
+    /// store's merge under the binding, so it is flagged and the marker is recorded.
+    #[test]
+    fn r17_p1_a_completion_brought_in_by_the_flags_own_store_is_already_imported_whatever_its_kind()
+    {
+        for (name, make) in [
+            ("union", union as fn() -> SecretSelectionPolicy),
+            ("nsw", newest),
+            ("nsw_cpu", r10_cpu),
+        ] {
+            for kind in ["imported", "rejections", "stale_rejections"] {
+                let g1 = entry(1, 1);
+                let lineage = [g1];
+                let k = key_of(&g1);
+                let mut w = InspectingWriter::new(&lineage);
+                block_on(begin_migration_journal(&mut w, &lineage, &make())).expect("begin");
+                if kind == "stale_rejections" {
+                    w.revision = 1;
+                }
+                let resolution = match kind {
+                    "imported" => JournalResolution::Imported,
+                    _ => JournalResolution::ImportedWithRejections {
+                        rejected: 1,
+                        revision: 0,
+                    },
+                };
+                let mut theirs = MigrationJournal::new_pending(&lineage);
+                theirs.record(&k, 1, RunOutcome::Resolved(resolution));
+                w.inject_at_first_marker_read = Some(theirs.encode());
+                let markers_before = w.markers_recorded.len();
+                let r = block_on(note_app_import_started(&mut w, &lineage, &k, &make()));
+                if kind == "stale_rejections" {
+                    assert!(matches!(r, Ok(AppImport::Flagged)), "{name}/{kind}: {r:?}");
+                    assert!(w.markers_recorded.len() > markers_before, "{name}/{kind}");
+                    assert!(
+                        matches!(state_of(&w.store, &g1), JournalState::Pending { .. }),
+                        "{name}/{kind}"
+                    );
+                } else {
+                    assert!(
+                        matches!(r, Ok(AppImport::AlreadyImported)),
+                        "{name}/{kind}: {r:?}"
+                    );
+                    assert_eq!(w.markers_recorded.len(), markers_before, "{name}/{kind}");
+                    assert!(
+                        matches!(state_of(&w.store, &g1), JournalState::Resolved(r) if r.is_data_bearing()),
+                        "{name}/{kind}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// `AppImport` stays `#[must_use]`: dropping the outcome of
+    /// `note_app_import_started(..)` (`.await?;`, `.expect("..");`) must trip
+    /// `unused_must_use`. `#[expect]` fails the build if the lint does not fire.
+    #[test]
+    fn r17_p2_dropping_an_app_import_trips_unused_must_use() {
+        #[deny(unfulfilled_lint_expectations)]
+        #[expect(unused_must_use)]
+        fn drops(f: fn() -> AppImport) {
+            f();
+        }
+        #[deny(unfulfilled_lint_expectations)]
+        #[expect(unused_must_use)]
+        fn drops_call(w: &mut InspectingWriter, l: &[DelegateLineageEntry], k: &DelegateKey) {
+            block_on(note_app_import_started(w, l, k, &union())).expect("flag");
+        }
+        let _ = (drops, drops_call);
+    }
 }

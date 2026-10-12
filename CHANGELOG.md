@@ -159,7 +159,7 @@ of 4 rooms on every later load. Four review rounds of in-session fixes
   writes during a rollout; items the import path rejected; a legacy seal that
   never covered it). Writing it again, unflagged, fills that gap but also
   brings back keys deleted since; skipping it leaves the gap for good, and no
-  status reports it. An app whose merge cannot resurrect a deleted key writes
+  status reports it (except rejected items, which `rejected_items()` counts). An app whose merge cannot resurrect a deleted key writes
   it again, as should one that can tolerate a resurrected key; any other skips
   it and logs that it did. `AppImport` is `#[must_use]` and `#[non_exhaustive]`:
   treat a variant you do not know as "do not write".
@@ -172,6 +172,12 @@ of 4 rooms on every later load. Four review rounds of in-session fixes
   any whose marker neither it nor the start read (behind a halt, a failed read,
   a legacy seal, a supersession). Call `begin` on every load, and decide from
   the status the last call returned, never from a raw `journal_status` read.
+  The same window lets a walk's flag store bring in another session's
+  completion and still write its items (under a never-clobber writer, the same
+  data; only a key deleted inside the window comes back), and lets
+  `note_app_import_started` flag a predecessor another session made superseded
+  in the meantime under a snapshot policy (the app's write can shadow the newer
+  values, and the flag never clears).
 * `begin` costs one marker read per predecessor resolved as holding nothing, per
   call. A marker it cannot read there refuses nothing: the predecessor reads as
   an import under way for that load, nothing is stored, and the read is retried

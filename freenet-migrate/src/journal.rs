@@ -124,7 +124,13 @@
 //! from a raw [`journal_status`] read. The same window lets a walk's import
 //! flag store bring in another session's completion of that predecessor and
 //! still write its items: under a never-clobber writer that rewrites the same
-//! data, and brings back only a key deleted inside the window. Every store a walk relies on **fails closed**:
+//! data, and brings back only a key deleted inside the window. And it lets
+//! [`crate::note_app_import_started`] flag a predecessor that another session
+//! made superseded in the meantime, under a snapshot policy: the app's write
+//! can then shadow the newer generation's values, and the flag never clears
+//! ([`JournalStatus::interrupted_import`] stays true).
+//!
+//! Every store a walk relies on **fails closed**:
 //! if the journal cannot be read or established, or the import flag cannot be
 //! stored before a predecessor's first item, that predecessor is not imported
 //! this run. A journal from a different encoding version is never overwritten.
@@ -1105,7 +1111,9 @@ pub enum AppImport {
     /// during a rollout, the items an import path rejected, or a legacy
     /// generation-keyed seal that never covered this data. Writing it again
     /// (unflagged) fills such a gap, and also brings back any key the user deleted
-    /// since. Skipping it leaves the gap for good, and no status reports it. So an
+    /// since. Skipping it leaves the gap for good, and no status reports it
+    /// (except rejected items, which `rejected_items()` counts and a higher
+    /// import revision reopens). So an
     /// app whose merge cannot resurrect a deleted key (ranked tombstones, say)
     /// writes it again; an app that can tolerate a resurrected key should too; any
     /// other skips it, and should at least log that it did. (Under the
