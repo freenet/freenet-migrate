@@ -15571,4 +15571,28 @@ mod tests {
         assert!(status.is_complete(), "{status:?}");
         assert_eq!(w.store.get_secret(b"room:x").as_deref(), Some(&b"X"[..]));
     }
+
+    /// #48: an empty in-progress marker beside a counted, reopened rejection does
+    /// not make an empty retry believable.
+    #[test]
+    fn an_empty_in_progress_marker_beside_a_counted_rejection_is_not_believed() {
+        let g1 = entry(1, 1);
+        let lineage = [g1];
+        let k = key_of(&g1);
+        let mut w = InspectingWriter::new(&lineage);
+        w.permanent_fail.insert(b"room:x".to_vec());
+        let _ = w.run(
+            &mut MockIo::default().executable_with(&k, &[(b"room:a", b"A"), (b"room:x", b"X")]),
+            union(),
+        );
+        w.store
+            .set_secret(&pred_wip_marker(&k), PRED_DONE_MARKER_VALUE_EMPTY);
+        w.permanent_fail.clear();
+        w.revision = 1;
+        let run = w.run(&mut MockIo::default().executable_with(&k, &[]), union());
+        assert!(
+            run.report.predecessors[0].exported_nothing_after_data(),
+            "{run:?}"
+        );
+    }
 }
