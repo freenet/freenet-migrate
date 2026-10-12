@@ -1765,6 +1765,10 @@ where
 /// read, is corrupt or from a different encoding version, the marker cannot be
 /// read, or the flag or the marker could not be stored. Do not write: a kill
 /// mid-write would leave a partial copy nothing records.
+///
+/// [`JournalError::NotImportable`]: the predecessor is not in the lineage, or the
+/// snapshot policy supersedes it (a newer generation's data, or a legacy seal for
+/// one, is the authoritative snapshot). Do not import from it.
 pub async fn note_app_import_started<W>(
     successor: &mut W,
     predecessor: &DelegateKey,
@@ -1794,6 +1798,29 @@ where
         // Starting one here would skip `begin`'s marker seeding.
         None => return Err(begin_first("no journal is stored")),
     };
+    // `begin` enters every lineage predecessor: one the journal does not know is
+    // not in the lineage, and a flag there would be read by nothing.
+    if journal.entry(predecessor).is_none() {
+        return Err(JournalError::NotImportable(
+            "the predecessor is not in the lineage the journal was begun with".to_string(),
+        ));
+    }
+    let binding = JournalBinding::new(policy, successor.import_revision());
+    journal.rebind(&binding);
+    // Under a snapshot policy a newer generation resolved with its data in the
+    // successor is the authoritative snapshot: this one is superseded, and a flag
+    // on it could never resolve.
+    if binding.policy == crate::journal::PolicyFamily::NewestSnapshot
+        && journal.entries().any(|(_, e)| {
+            e.generation > generation
+                && matches!(e.state, JournalState::Resolved(r) if r.is_data_bearing())
+        })
+    {
+        return Err(JournalError::NotImportable(
+            "a newer generation is the authoritative snapshot under the snapshot policy"
+                .to_string(),
+        ));
+    }
     let query = MarkerQuery {
         predecessor,
         generation,
@@ -1809,9 +1836,9 @@ where
             // this generation is superseded, not imported. Writing its data would
             // leave a partial copy nothing can record (the flag's read-back would
             // read the seal again).
-            return Err(JournalError::Successor(
-                "this predecessor is superseded under the snapshot policy (a legacy \
-                 seal for a newer generation); do not import it"
+            return Err(JournalError::NotImportable(
+                "a legacy seal for a newer generation supersedes it under the snapshot \
+                 policy"
                     .to_string(),
             ));
         }
@@ -1820,8 +1847,6 @@ where
     // The journal first: a kill before the marker leaves the flag, which the walk
     // honours on its own; the other order would leave a journal still reading the
     // predecessor resolved.
-    let binding = JournalBinding::new(policy, successor.import_revision());
-    journal.rebind(&binding);
     if journal.mark_import_started(predecessor, generation) {
         store_merged(successor, &mut journal, Some(&binding), None).await?;
     }
@@ -2041,10 +2066,11 @@ async fn exact_marker<W: SuccessorSecretsIo>(
 
 /// What [`start_journal`] found.
 enum Started {
-    /// A readable journal is stored. Nothing to store.
+    /// A readable journal is stored, and nothing in it needs changing.
     Existing(MigrationJournal),
-    /// None (or a corrupt one) is stored: this one, built from the markers, must
-    /// be stored before any migration write.
+    /// None (or a corrupt one) is stored, or the stored one needed entries added
+    /// or reopened from the markers: this one must be stored before any migration
+    /// write.
     New(MigrationJournal),
 }
 
@@ -2066,7 +2092,33 @@ where
         .map_err(|e| JournalError::Successor(format!("journal load failed: {e:?}")))?
     {
         Some(bytes) => match MigrationJournal::decode(&bytes) {
-            Ok(journal) => {
+            Ok(mut journal) => {
+                // A resolution saying the predecessor's data is NOT in the
+                // successor, contradicted by its marker (an import started since,
+                // whose journal flag another session's store overwrote): reopen it.
+                // Only such entries are read, once each.
+                let mut reopened = false;
+                for e in predecessors {
+                    let key = DelegateKey::new(e.delegate_key, CodeHash::new(e.code_hash));
+                    let non_data = matches!(
+                        journal.entry(&key).map(|x| x.state),
+                        Some(JournalState::Resolved(r)) if !r.is_data_bearing()
+                    );
+                    if non_data
+                        && matches!(
+                            exact_marker(successor, &key, e.generation)
+                                .await
+                                .map_err(|err| {
+                                    JournalError::Successor(format!(
+                                        "marker read failed while starting the journal: {err:?}"
+                                    ))
+                                })?,
+                            Some(MigrationMarker::InProgress { saw_data: true })
+                        )
+                    {
+                        reopened |= journal.mark_import_started(&key, e.generation);
+                    }
+                }
                 // Lineage entries the stored journal has never seen (the lineage
                 // grew) are read off their markers, as a fresh journal's are, and
                 // the loaded journal is merged in (so a store whose re-read misses
@@ -2084,7 +2136,11 @@ where
                     .copied()
                     .collect();
                 if unseen.is_empty() {
-                    return Ok(Started::Existing(journal));
+                    return Ok(if reopened {
+                        Started::New(journal)
+                    } else {
+                        Started::Existing(journal)
+                    });
                 }
                 let mut seeded = fresh_journal(successor, &unseen, policy).await?;
                 seeded.merge_stored(&journal, Some(binding));
@@ -2134,35 +2190,41 @@ where
             }
             // A completion an earlier (plain) walk sealed, resolved as the walk
             // would resolve its `AlreadyMigrated`, so nothing treats it as owed.
-            Ok(Some(MigrationMarker::Done { had_data })) => {
-                if !had_data {
-                    journal.record(
-                        &key,
-                        e.generation,
-                        RunOutcome::Resolved(JournalResolution::NoData),
-                    );
-                } else if seal_is_bridged(successor, &key, e.generation, policy).await {
-                    // A legacy seal can hide this generation's own in-progress
-                    // marker: an import that started (under Union, say) is still a
-                    // possible partial copy.
-                    if matches!(
-                        exact_marker(successor, &key, e.generation).await,
-                        Ok(Some(MigrationMarker::InProgress { saw_data: true }))
-                    ) {
-                        journal.mark_import_started(&key, e.generation);
-                    } else {
-                        journal.record(
-                            &key,
-                            e.generation,
-                            RunOutcome::Resolved(JournalResolution::SupersededByAuthoritative),
-                        );
-                    }
+            Ok(Some(MigrationMarker::Done { had_data: false })) => journal.record(
+                &key,
+                e.generation,
+                RunOutcome::Resolved(JournalResolution::NoData),
+            ),
+            Ok(Some(MigrationMarker::Done { had_data: true })) => {
+                // Under a snapshot policy the seal may hold only through a legacy
+                // marker for a NEWER generation (superseded, not imported), and that
+                // seal can hide this generation's own in-progress import. One exact
+                // read decides; it fails closed like the read above.
+                let exact = if policy.legacy_bridge() == LegacyBridge::AtOrAboveGeneration {
+                    exact_marker(successor, &key, e.generation)
+                        .await
+                        .map_err(|err| {
+                            JournalError::Successor(format!(
+                                "marker read failed while starting the journal: {err:?}"
+                            ))
+                        })?
                 } else {
-                    journal.record(
+                    Some(MigrationMarker::Done { had_data: true })
+                };
+                match exact {
+                    Some(MigrationMarker::Done { had_data: true }) => journal.record(
                         &key,
                         e.generation,
                         RunOutcome::Resolved(JournalResolution::Imported),
-                    );
+                    ),
+                    Some(MigrationMarker::InProgress { saw_data: true }) => {
+                        journal.mark_import_started(&key, e.generation);
+                    }
+                    _ => journal.record(
+                        &key,
+                        e.generation,
+                        RunOutcome::Resolved(JournalResolution::SupersededByAuthoritative),
+                    ),
                 }
             }
             Ok(_) => {}
@@ -10901,7 +10963,7 @@ mod tests {
 
     /// A read error on the second (exact) marker query counts as bridged.
     #[test]
-    fn r7_a_failed_exact_read_journals_the_reopenable_side() {
+    fn r7_a_failed_exact_read_while_starting_the_journal_fails_closed() {
         struct FailExact {
             store: MemStore,
         }
@@ -10944,11 +11006,10 @@ mod tests {
             store: MemStore::default(),
         };
         w.store.set_secret(&done_marker(5), b"1");
-        block_on(begin_migration_journal(&mut w, &lineage, &newest())).expect("begin");
-        assert_eq!(
-            state_of(&w.store, &g3),
-            JournalState::Resolved(JournalResolution::SupersededByAuthoritative)
-        );
+        // Starting the journal cannot tell a superseded generation from a hidden
+        // import in progress without that read: it fails closed, storing nothing.
+        assert!(block_on(begin_migration_journal(&mut w, &lineage, &newest())).is_err());
+        assert!(w.store.get_secret(MIGRATION_JOURNAL_KEY).is_none());
     }
 
     /// A plain walk pays no extra marker read for the bridge check.

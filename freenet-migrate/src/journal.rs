@@ -1047,6 +1047,11 @@ pub enum JournalError {
     /// The stored journal was written by a build with a different journal encoding
     /// version. This build never overwrites it.
     ForeignVersion(u64),
+    /// [`crate::note_app_import_started`] was asked to flag a predecessor that the
+    /// app's snapshot policy supersedes (a newer generation's data is the
+    /// authoritative snapshot), or that is not in the journal's lineage. Do not
+    /// import from it: a flag there could never resolve.
+    NotImportable(String),
 }
 
 impl std::error::Error for JournalError {}
@@ -1059,6 +1064,7 @@ impl core::fmt::Display for JournalError {
                 f,
                 "stored journal has encoding version {v}; this build does not overwrite it"
             ),
+            JournalError::NotImportable(why) => write!(f, "not importable: {why}"),
         }
     }
 }
