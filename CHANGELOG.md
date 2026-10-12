@@ -150,7 +150,8 @@ of 4 rooms on every later load. Four review rounds of in-session fixes
   shadow its values under a never-clobber writer (#42). A count the journal
   kept is itself evidence that the predecessor holds data, so a rejection a
   higher revision reopened is not believed empty even if its in-progress marker
-  was lost (#48). And a predecessor that
+  was lost; under a snapshot policy it also stops the walk there, so an older
+  generation it superseded is not imported over it (#48). And a predecessor that
   really does export fewer than it once did (an old tab's deletes, a build whose
   `fetch_secrets` lists less) stays pending for good (#39).
 * `note_app_import_started(successor, lineage, predecessor, policy, items)` raises the

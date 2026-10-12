@@ -65,7 +65,7 @@
 //! |---|---|
 //! | `Imported`, or `AlreadyMigrated` with a data-bearing marker | [`JournalResolution::Imported`] |
 //! | `AlreadyMigrated` only through a legacy marker for a NEWER generation (snapshot policies) | [`JournalResolution::SupersededByAuthoritative`] — or an import [`Started`](ImportFlag::Started) if this generation's own marker says one is under way |
-//! | `NoData` (it answered "nothing"), or `AlreadyMigrated` with an empty marker | [`JournalResolution::NoData`] — but an empty marker contradicted by a started import is not believed: the predecessor is asked again |
+//! | `NoData` (it answered "nothing"), or `AlreadyMigrated` with an empty marker | [`JournalResolution::NoData`] — but an empty marker contradicted by a started import, or by a count the journal kept, is not believed: the predecessor is asked again |
 //! | `Incomplete` whose only blemish is permanently rejected items | [`JournalResolution::ImportedWithRejections`], stamped with the writer's [`import_revision`](JournaledSuccessorIo::import_revision) |
 //! | `Superseded` behind a resolved, data-bearing newer predecessor, under a `NewestSnapshotWins` policy | [`JournalResolution::SupersededByAuthoritative`] |
 //! | `Unresponsive` — silence, a timeout, a transport fault, **a definitive "not installed"**, or an empty export from a predecessor an earlier attempt saw data in | stays pending; `attempts + 1` |
@@ -83,9 +83,10 @@
 //!   so an app can decide, as its own policy, to probe less often
 //!   ([`JournalStatus::pending_all_absent`]). The crate itself never gives up.
 //! * **"Nothing" after "something" is not believed.** Once an import from a
-//!   predecessor has [`Started`](ImportFlag::Started), a later answer that it
-//!   holds nothing leaves it pending rather than resolving it: a frozen
-//!   predecessor does not lose data, so the empty answer is the fault.
+//!   predecessor has [`Started`](ImportFlag::Started), or the journal kept a
+//!   count of the items an import from it saw, a later answer that it holds
+//!   nothing (or fewer items) leaves it pending rather than resolving it: a
+//!   frozen predecessor does not lose data, so the short answer is the fault.
 //! * **A permanent rejection resolves, and can be reopened.** A retry would be
 //!   refused identically, so leaving it pending would re-run the whole
 //!   migration on every load forever. The resolution is stamped with the
