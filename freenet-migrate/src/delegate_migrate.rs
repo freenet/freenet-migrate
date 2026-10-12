@@ -11449,6 +11449,10 @@ mod tests {
         ))
         .expect("begin");
         assert!(status.interrupted_import(), "{status:?}");
+        assert!(
+            stored_status(&store, &lineage).interrupted_import(),
+            "the reopened entry is stored, not only reported"
+        );
         let mut io = MockIo::default().executable_with(&k, &[(b"room:a", b"A"), (b"room:b", b"B")]);
         assert!(complete(&journaled(&mut store, &mut io, &lineage, union())));
         assert_eq!(store.get_secret(b"room:b").as_deref(), Some(&b"B"[..]));
