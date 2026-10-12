@@ -10686,7 +10686,11 @@ mod tests {
         assert!(matches!(
             run.report.predecessors[0],
             PredecessorMigration::Imported {
-                tally: ImportTally { written: 1, .. },
+                tally: ImportTally {
+                    written: 1,
+                    skipped: 0,
+                    ..
+                },
                 ..
             }
         ));
