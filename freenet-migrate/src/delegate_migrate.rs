@@ -1722,8 +1722,16 @@ where
     W::Error: core::fmt::Debug,
 {
     let binding = JournalBinding::new(policy, successor.import_revision());
-    let mut journal = match start_journal(successor, predecessors, policy, &binding).await? {
-        Started::Existing(journal) => return Ok(journal.status(predecessors, &binding)),
+    let (started, unverified) = start_journal(successor, predecessors, policy, &binding).await?;
+    let mut journal = match started {
+        Started::Existing(journal) => {
+            return Ok(status_with_unverified(
+                &journal,
+                &unverified,
+                predecessors,
+                &binding,
+            ))
+        }
         Started::New(journal) => journal,
     };
     store_merged(
@@ -1733,7 +1741,31 @@ where
         Some((predecessors, policy)),
     )
     .await?;
-    Ok(journal.status(predecessors, &binding))
+    Ok(status_with_unverified(
+        &journal,
+        &unverified,
+        predecessors,
+        &binding,
+    ))
+}
+
+/// The status to report: `journal`'s, with each predecessor whose marker could
+/// not be read this load counted as an import under way. Never stored: the read
+/// is retried on a later load, and a recovered read decides it.
+fn status_with_unverified(
+    journal: &MigrationJournal,
+    unverified: &[(DelegateKey, u32)],
+    predecessors: &[DelegateLineageEntry],
+    binding: &JournalBinding,
+) -> JournalStatus {
+    if unverified.is_empty() {
+        return journal.status(predecessors, binding);
+    }
+    let mut view = journal.clone();
+    for (key, generation) in unverified {
+        view.mark_import_started(key, *generation);
+    }
+    view.status(predecessors, binding)
 }
 
 /// Durably flag `predecessor` as having an import
@@ -1957,10 +1989,14 @@ where
     let binding = JournalBinding::new(&policy, successor.import_revision());
 
     // 1. Load or start, failing closed.
-    let mut journal = match start_journal(successor, predecessors, &policy, &binding).await {
-        Err(e) => return refused(e.to_string()),
-        Ok(Started::Existing(journal)) => journal,
-        Ok(Started::New(mut journal)) => {
+    let (started, mut unverified) =
+        match start_journal(successor, predecessors, &policy, &binding).await {
+            Err(e) => return refused(e.to_string()),
+            Ok(started) => started,
+        };
+    let mut journal = match started {
+        Started::Existing(journal) => journal,
+        Started::New(mut journal) => {
             if let Err(e) = store_merged(
                 successor,
                 &mut journal,
@@ -1999,14 +2035,44 @@ where
         )
         .await;
 
-    // 4. Resolve, and store with read-merge-write.
-    for (row, run_outcome) in outcome.report.predecessors.iter().zip(resolve_outcomes(
-        &outcome,
-        &policy,
-        binding.import_revision,
-    )) {
-        journal.record(row.key(), row.generation(), run_outcome);
+    // 4. Resolve.
+    let outcomes = resolve_outcomes(&outcome, &policy, binding.import_revision);
+    for (row, run_outcome) in outcome.report.predecessors.iter().zip(&outcomes) {
+        journal.record(row.key(), row.generation(), *run_outcome);
     }
+
+    // 5. What this run never reached (behind a halt, or a successor fault) it
+    // could not check against the markers. A pending predecessor behind a halt
+    // whose marker records an import under way lost its journal flag to another
+    // session's store: restore it. A marker the start could not read, on a
+    // predecessor the walk did not reach either, stays unverified.
+    let mut reached = Vec::new();
+    for (row, run_outcome) in outcome.report.predecessors.iter().zip(&outcomes) {
+        if *run_outcome != RunOutcome::Unexamined {
+            reached.push(row.key().clone());
+            continue;
+        }
+        let unflagged = matches!(
+            journal.entry(row.key()).map(|e| e.state),
+            Some(JournalState::Pending {
+                import: crate::journal::ImportFlag::None,
+                ..
+            })
+        );
+        if !unflagged || !matches!(row, PredecessorMigration::Superseded { .. }) {
+            continue;
+        }
+        match exact_marker(successor, row.key(), row.generation()).await {
+            Ok(Some(MigrationMarker::InProgress { saw_data: true })) => {
+                journal.mark_import_started(row.key(), row.generation());
+            }
+            Ok(_) => {}
+            Err(_) => unverified.push((row.key().clone(), row.generation())),
+        }
+    }
+    unverified.retain(|(key, _)| !reached.contains(key));
+
+    // 6. Store with read-merge-write.
     let status = match store_merged(
         successor,
         &mut journal,
@@ -2015,7 +2081,12 @@ where
     )
     .await
     {
-        Ok(()) => Some(journal.status(predecessors, &binding)),
+        Ok(()) => Some(status_with_unverified(
+            &journal,
+            &unverified,
+            predecessors,
+            &binding,
+        )),
         Err(e) => {
             if journal_error.is_none() {
                 journal_error = Some(e.to_string());
@@ -2079,13 +2150,15 @@ enum Started {
 }
 
 /// Load the stored journal, or build the one to start with, for `begin` and the
-/// journaled walk alike. Never stores anything.
+/// journaled walk alike. Never stores anything. Also returns the predecessors
+/// whose markers could not be read to check a stored resolution: the caller
+/// reports each as an import under way for this load, without storing that.
 async fn start_journal<W>(
     successor: &mut W,
     predecessors: &[DelegateLineageEntry],
     policy: &SecretSelectionPolicy,
     binding: &JournalBinding,
-) -> Result<Started, JournalError>
+) -> Result<(Started, Vec<(DelegateKey, u32)>), JournalError>
 where
     W: JournaledSuccessorIo,
     W::Error: core::fmt::Debug,
@@ -2100,27 +2173,27 @@ where
                 // A resolution saying the predecessor's data is NOT in the
                 // successor, contradicted by its marker (an import started since,
                 // whose journal flag another session's store overwrote): reopen it.
-                // Only such entries are read, once each.
+                // Only such entries are read, one marker each per call. A read
+                // that fails refuses nothing (one stuck marker must not stop every
+                // other predecessor migrating); the entry is left as stored and
+                // reported unverified.
                 let mut reopened = false;
+                let mut unverified = Vec::new();
                 for e in predecessors {
                     let key = DelegateKey::new(e.delegate_key, CodeHash::new(e.code_hash));
                     let non_data = matches!(
                         journal.entry(&key).map(|x| x.state),
                         Some(JournalState::Resolved(r)) if !r.is_data_bearing()
                     );
-                    if non_data
-                        && matches!(
-                            exact_marker(successor, &key, e.generation)
-                                .await
-                                .map_err(|err| {
-                                    JournalError::Successor(format!(
-                                        "marker read failed while starting the journal: {err:?}"
-                                    ))
-                                })?,
-                            Some(MigrationMarker::InProgress { saw_data: true })
-                        )
-                    {
-                        reopened |= journal.mark_import_started(&key, e.generation);
+                    if !non_data {
+                        continue;
+                    }
+                    match exact_marker(successor, &key, e.generation).await {
+                        Ok(Some(MigrationMarker::InProgress { saw_data: true })) => {
+                            reopened |= journal.mark_import_started(&key, e.generation);
+                        }
+                        Ok(_) => {}
+                        Err(_) => unverified.push((key, e.generation)),
                     }
                 }
                 // Lineage entries the stored journal has never seen (the lineage
@@ -2140,23 +2213,28 @@ where
                     .copied()
                     .collect();
                 if unseen.is_empty() {
-                    return Ok(if reopened {
-                        Started::New(journal)
-                    } else {
-                        Started::Existing(journal)
-                    });
+                    return Ok((
+                        if reopened {
+                            Started::New(journal)
+                        } else {
+                            Started::Existing(journal)
+                        },
+                        unverified,
+                    ));
                 }
                 let mut seeded = fresh_journal(successor, &unseen, policy).await?;
                 seeded.merge_stored(&journal, Some(binding));
-                Ok(Started::New(seeded))
+                Ok((Started::New(seeded), unverified))
             }
             Err(JournalDecodeError::UnknownVersion(v)) => Err(JournalError::ForeignVersion(v)),
-            Err(JournalDecodeError::Corrupt(_)) => Ok(Started::New(
-                fresh_journal(successor, predecessors, policy).await?,
+            Err(JournalDecodeError::Corrupt(_)) => Ok((
+                Started::New(fresh_journal(successor, predecessors, policy).await?),
+                Vec::new(),
             )),
         },
-        None => Ok(Started::New(
-            fresh_journal(successor, predecessors, policy).await?,
+        None => Ok((
+            Started::New(fresh_journal(successor, predecessors, policy).await?),
+            Vec::new(),
         )),
     }
 }
@@ -11345,8 +11423,11 @@ mod tests {
                 Ok(())
             }
         }
-        let (g3, g5) = (entry(3, 3), entry(5, 5));
-        let lineage = [g3, g5];
+        let g3 = entry(3, 3);
+        // Only g3 is in the lineage, so its exact read is the first; a second
+        // one (the fail-open shape round 8 removed) would be the one that fails.
+        // The legacy seal below is generation 5's.
+        let lineage = [g3];
         let mut w = FailSecondExact {
             store: MemStore::default(),
             exact_reads: 0,
@@ -11355,7 +11436,7 @@ mod tests {
         w.store
             .set_secret(&pred_wip_marker(&key_of(&g3)), PRED_DONE_MARKER_VALUE_DATA);
         let r = block_on(begin_migration_journal(&mut w, &lineage, &newest()));
-        let flagged = matches!(r.as_ref().map(|s| s.interrupted_import()), Ok(true)) || r.is_err();
+        let flagged = matches!(r.as_ref().map(|s| s.interrupted_import()), Ok(true));
         assert!(
             flagged,
             "a possible partial copy was silently unflagged: {r:?}"
@@ -11535,15 +11616,34 @@ mod tests {
             }
             assert!(complete(&journaled(&mut store, &mut io, &lineage, union())));
             let stale = store.get_secret(MIGRATION_JOURNAL_KEY).unwrap();
-            r9_flag(&mut store, &key_of(&lineage[flagged]), lineage[flagged].generation, union());
+            r9_flag(
+                &mut store,
+                &key_of(&lineage[flagged]),
+                lineage[flagged].generation,
+                union(),
+            );
             store.set_secret(MIGRATION_JOURNAL_KEY, &stale);
             assert!(stored_status(&store, &lineage).is_complete());
-            let status = block_on(begin_migration_journal(&mut store_io(&mut store), &lineage, &union())).expect("begin");
+            let status = block_on(begin_migration_journal(
+                &mut store_io(&mut store),
+                &lineage,
+                &union(),
+            ))
+            .expect("begin");
             assert!(status.interrupted_import(), "flagged {flagged}: {status:?}");
             for (i, e) in lineage.iter().enumerate() {
                 let st = state_of(&store, e);
                 if i == flagged {
-                    assert!(matches!(st, JournalState::Pending { import: ImportFlag::Started, .. }), "{i} {st:?}");
+                    assert!(
+                        matches!(
+                            st,
+                            JournalState::Pending {
+                                import: ImportFlag::Started,
+                                ..
+                            }
+                        ),
+                        "{i} {st:?}"
+                    );
                 } else {
                     assert_eq!(st, JournalState::Resolved(JournalResolution::NoData), "{i}");
                 }
@@ -11565,25 +11665,158 @@ mod tests {
         r9_flag(&mut store, &key_of(&lineage[0]), 1, union());
         r9_flag(&mut store, &key_of(&lineage[2]), 3, union());
         store.set_secret(MIGRATION_JOURNAL_KEY, &stale);
-        block_on(begin_migration_journal(&mut store_io(&mut store), &lineage, &union())).expect("begin");
+        block_on(begin_migration_journal(
+            &mut store_io(&mut store),
+            &lineage,
+            &union(),
+        ))
+        .expect("begin");
         for i in [0usize, 2] {
-            assert!(matches!(state_of(&store, &lineage[i]), JournalState::Pending { import: ImportFlag::Started, .. }), "{i}");
+            assert!(
+                matches!(
+                    state_of(&store, &lineage[i]),
+                    JournalState::Pending {
+                        import: ImportFlag::Started,
+                        ..
+                    }
+                ),
+                "{i}"
+            );
         }
-        assert_eq!(state_of(&store, &lineage[1]), JournalState::Resolved(JournalResolution::NoData));
+        assert_eq!(
+            state_of(&store, &lineage[1]),
+            JournalState::Resolved(JournalResolution::NoData)
+        );
     }
 
-    /// A marker fault while reopening against an EXISTING journal fails closed.
+    /// A marker fault while checking a stored no-data resolution refuses nothing:
+    /// the newer predecessor that now holds data still migrates, the faulted entry
+    /// reads as an import under way for that load (never stored), and a recovered
+    /// read decides it.
     #[test]
-    fn r9_p2_a_marker_fault_in_the_reopen_loop_refuses() {
+    fn r9_p2_a_stuck_marker_on_a_resolved_empty_predecessor_blocks_nothing() {
+        let (g1, g2) = (entry(1, 1), entry(2, 2));
+        let lineage = [g1, g2];
+        let (k1, k2) = (key_of(&g1), key_of(&g2));
+        let mut w = InspectingWriter::new(&lineage);
+        let mut io = MockIo::default()
+            .executable_with(&k1, &[])
+            .not_installed(&k2);
+        let _ = w.run(&mut io, union());
+        assert_eq!(
+            state_of(&w.store, &g1),
+            JournalState::Resolved(JournalResolution::NoData)
+        );
+        // g2 is installed now, holding the user's data; g1's marker read fails.
+        w.fail_marker_read.insert(k1.bytes().to_vec());
+        let mut io = MockIo::default()
+            .executable_with(&k1, &[])
+            .executable_with(&k2, &[(b"room:a", b"A")]);
+        let begun = block_on(begin_migration_journal(&mut w, &lineage, &union())).expect("begin");
+        assert!(begun.interrupted_import(), "{begun:?}");
+        let run = w.run(&mut io, union());
+        assert!(!refused(&run), "{run:?}");
+        assert_eq!(w.store.get_secret(b"room:a").as_deref(), Some(&b"A"[..]));
+        let status = run.status.expect("stored");
+        assert!(status.interrupted_import(), "{status:?}");
+        assert_eq!(
+            state_of(&w.store, &g1),
+            JournalState::Resolved(JournalResolution::NoData),
+            "an unread marker is never stored as a started import"
+        );
+        // The read recovers: nothing contradicts the resolution.
+        w.fail_marker_read.clear();
+        let begun = block_on(begin_migration_journal(&mut w, &lineage, &union())).expect("begin");
+        assert!(begun.is_complete(), "{begun:?}");
+    }
+
+    /// The same under the walk alone, with nothing else pending: the run's status
+    /// is not `Complete` while a resolution it could not check stands.
+    #[test]
+    fn a_stuck_marker_keeps_the_walks_status_from_reading_complete() {
         let lineage = [entry(1, 1)];
         let k = key_of(&lineage[0]);
         let mut w = InspectingWriter::new(&lineage);
         let mut io = MockIo::default().executable_with(&k, &[]);
         assert!(complete(&w.run(&mut io, union())));
         w.fail_marker_read.insert(k.bytes().to_vec());
-        assert!(block_on(begin_migration_journal(&mut w, &lineage, &union())).is_err());
         let run = w.run(&mut io, union());
-        assert!(refused(&run), "{run:?}");
+        assert!(!refused(&run), "{run:?}");
+        let status = run.status.expect("stored");
+        assert!(
+            !status.is_complete() && status.interrupted_import(),
+            "{status:?}"
+        );
+    }
+
+    /// An app flag lost to a stale store on a predecessor still PENDING (not
+    /// resolved), behind a newer generation the snapshot walk halts at: the walk
+    /// never reaches it, so it reads the predecessor's marker after the halt and
+    /// restores the flag.
+    #[test]
+    fn a_lost_flag_on_a_pending_predecessor_behind_a_halt_is_restored_by_the_walk() {
+        let (g2, g3) = (entry(2, 2), entry(3, 3));
+        let lineage = [g2, g3];
+        let k2 = key_of(&g2);
+        let mut store = MemStore::default();
+        block_on(begin_migration_journal(
+            &mut store_io(&mut store),
+            &lineage,
+            &newest(),
+        ))
+        .expect("begin");
+        let stale = store.get_secret(MIGRATION_JOURNAL_KEY).unwrap();
+        r9_flag(&mut store, &k2, 2, newest());
+        store.set_secret(b"g2:a", b"A");
+        store.set_secret(MIGRATION_JOURNAL_KEY, &stale);
+        assert!(matches!(
+            state_of(&store, &g2),
+            JournalState::Pending {
+                import: ImportFlag::None,
+                ..
+            }
+        ));
+        let mut io = MockIo::default()
+            .executable_with(&k2, &[(b"g2:a", b"A"), (b"g2:b", b"B")])
+            .not_installed(&key_of(&g3));
+        let run = journaled(&mut store, &mut io, &lineage, newest());
+        let status = run.status.expect("stored");
+        assert!(status.interrupted_import(), "{status:?}");
+        assert!(
+            matches!(
+                state_of(&store, &g2),
+                JournalState::Pending {
+                    import: ImportFlag::Started,
+                    ..
+                }
+            ),
+            "restored durably"
+        );
+        assert!(!store.has_secret(b"g2:b"), "halted: not imported yet");
+    }
+
+    /// Behind a halt, a pending predecessor whose marker cannot be read reads as
+    /// an import under way for that load.
+    #[test]
+    fn a_pending_predecessor_behind_a_halt_with_an_unreadable_marker_is_unverified() {
+        let (g2, g3) = (entry(2, 2), entry(3, 3));
+        let lineage = [g2, g3];
+        let k2 = key_of(&g2);
+        let mut w = InspectingWriter::new(&lineage);
+        block_on(begin_migration_journal(&mut w, &lineage, &newest())).expect("begin");
+        w.fail_marker_read.insert(k2.bytes().to_vec());
+        let mut io = MockIo::default()
+            .executable_with(&k2, &[(b"g2:a", b"A")])
+            .not_installed(&key_of(&g3));
+        let status = w.run(&mut io, newest()).status.expect("stored");
+        assert!(status.interrupted_import(), "{status:?}");
+        assert!(matches!(
+            state_of(&w.store, &g2),
+            JournalState::Pending {
+                import: ImportFlag::None,
+                ..
+            }
+        ));
     }
 
     /// An EMPTY in-progress marker beside a NoData resolution is not a started import.
@@ -11596,7 +11829,12 @@ mod tests {
         assert!(complete(&journaled(&mut store, &mut io, &lineage, union())));
         store.data.remove(&pred_done_marker(&k));
         store.set_secret(&pred_wip_marker(&k), PRED_DONE_MARKER_VALUE_EMPTY);
-        let status = block_on(begin_migration_journal(&mut store_io(&mut store), &lineage, &union())).expect("begin");
+        let status = block_on(begin_migration_journal(
+            &mut store_io(&mut store),
+            &lineage,
+            &union(),
+        ))
+        .expect("begin");
         assert!(status.is_complete(), "{status:?}");
     }
 
@@ -11610,12 +11848,31 @@ mod tests {
             let mut io = MockIo::default()
                 .executable_with(&key_of(&g2), &[(b"room:n", b"N")])
                 .executable_with(&key_of(&g1), &[(b"room:o", b"O")]);
-            assert!(complete(&journaled(&mut store, &mut io, &lineage, newest())));
-            assert_eq!(state_of(&store, &g1), JournalState::Resolved(JournalResolution::SupersededByAuthoritative));
+            assert!(complete(&journaled(
+                &mut store,
+                &mut io,
+                &lineage,
+                newest()
+            )));
+            assert_eq!(
+                state_of(&store, &g1),
+                JournalState::Resolved(JournalResolution::SupersededByAuthoritative)
+            );
             store.set_secret(&pred_wip_marker(&key_of(&g1)), PRED_DONE_MARKER_VALUE_DATA);
-            let st = block_on(begin_migration_journal(&mut store_io(&mut store), &lineage, &begin_policy())).expect("begin");
+            let st = block_on(begin_migration_journal(
+                &mut store_io(&mut store),
+                &lineage,
+                &begin_policy(),
+            ))
+            .expect("begin");
             assert!(st.interrupted_import(), "{st:?}");
-            assert!(matches!(state_of(&store, &g1), JournalState::Pending { import: ImportFlag::Started, .. }));
+            assert!(matches!(
+                state_of(&store, &g1),
+                JournalState::Pending {
+                    import: ImportFlag::Started,
+                    ..
+                }
+            ));
         }
     }
 
@@ -11630,26 +11887,66 @@ mod tests {
         let mut io = MockIo::default()
             .executable_with(&key_of(&g2), &[(b"room:n", b"N")])
             .executable_with(&key_of(&g1), &[(b"room:o", b"O")]);
-        assert!(journaled(&mut store, &mut io, &lineage, newest()).status.is_some());
-        block_on(note_app_import_started(&mut store_io(&mut store), &key_of(&g2), 2, &newest()))
-            .expect("a completed own-generation import under a snapshot policy is a no-op, not a refusal");
+        assert!(journaled(&mut store, &mut io, &lineage, newest())
+            .status
+            .is_some());
+        block_on(note_app_import_started(
+            &mut store_io(&mut store),
+            &key_of(&g2),
+            2,
+            &newest(),
+        ))
+        .expect(
+            "a completed own-generation import under a snapshot policy is a no-op, not a refusal",
+        );
         // (b) a newer NoData resolution does not supersede an older generation
         let mut store = MemStore::default();
-        block_on(begin_migration_journal(&mut store_io(&mut store), &lineage, &newest())).unwrap();
+        block_on(begin_migration_journal(
+            &mut store_io(&mut store),
+            &lineage,
+            &newest(),
+        ))
+        .unwrap();
         let mut j = stored_journal(&store);
-        j.record(&key_of(&g2), 2, RunOutcome::Resolved(JournalResolution::NoData));
+        j.record(
+            &key_of(&g2),
+            2,
+            RunOutcome::Resolved(JournalResolution::NoData),
+        );
         put_journal(&mut store, &j);
-        block_on(note_app_import_started(&mut store_io(&mut store), &key_of(&g1), 1, &newest()))
-            .expect("a newer EMPTY generation does not supersede");
+        block_on(note_app_import_started(
+            &mut store_io(&mut store),
+            &key_of(&g1),
+            1,
+            &newest(),
+        ))
+        .expect("a newer EMPTY generation does not supersede");
         assert!(stored_status(&store, &lineage).interrupted_import());
         // (c) a newer rejection-resolved generation holds data and does supersede
         let mut store = MemStore::default();
-        block_on(begin_migration_journal(&mut store_io(&mut store), &lineage, &newest())).unwrap();
+        block_on(begin_migration_journal(
+            &mut store_io(&mut store),
+            &lineage,
+            &newest(),
+        ))
+        .unwrap();
         let mut j = stored_journal(&store);
-        j.record(&key_of(&g2), 2, RunOutcome::Resolved(JournalResolution::ImportedWithRejections { rejected: 1, revision: 0 }));
+        j.record(
+            &key_of(&g2),
+            2,
+            RunOutcome::Resolved(JournalResolution::ImportedWithRejections {
+                rejected: 1,
+                revision: 0,
+            }),
+        );
         put_journal(&mut store, &j);
         assert!(matches!(
-            block_on(note_app_import_started(&mut store_io(&mut store), &key_of(&g1), 1, &newest())),
+            block_on(note_app_import_started(
+                &mut store_io(&mut store),
+                &key_of(&g1),
+                1,
+                &newest()
+            )),
             Err(JournalError::NotImportable(_))
         ));
     }
@@ -11661,13 +11958,22 @@ mod tests {
         let k3 = key_of(&g3);
         let mut store = MemStore::default();
         store.set_secret(&done_marker(5), b"1");
-        block_on(begin_migration_journal(&mut store_io(&mut store), &[g3], &newest())).expect("begin");
+        block_on(begin_migration_journal(
+            &mut store_io(&mut store),
+            &[g3],
+            &newest(),
+        ))
+        .expect("begin");
         assert!(matches!(
-            block_on(note_app_import_started(&mut store_io(&mut store), &k3, 3, &newest())),
+            block_on(note_app_import_started(
+                &mut store_io(&mut store),
+                &k3,
+                3,
+                &newest()
+            )),
             Err(JournalError::NotImportable(_))
         ));
     }
-
 
     /// Fixed r8 fixture: only g3 in the lineage, so the one exact read the
     /// rebuild may do for it is the first, and a SECOND (fail-open) read would be the one
@@ -11680,16 +11986,25 @@ mod tests {
         }
         impl SuccessorSecretsIo for FailSecondExact {
             type Error = SecretStoreWriteFailed;
-            async fn migration_marker(&mut self, q: &MarkerQuery<'_>) -> Result<Option<MigrationMarker>, Self::Error> {
+            async fn migration_marker(
+                &mut self,
+                q: &MarkerQuery<'_>,
+            ) -> Result<Option<MigrationMarker>, Self::Error> {
                 if q.legacy_bridge == LegacyBridge::ExactGenerationOnly {
                     self.exact_reads += 1;
                     if self.exact_reads >= 2 {
-                        return Err(SecretStoreWriteFailed { key: b"exact".to_vec() });
+                        return Err(SecretStoreWriteFailed {
+                            key: b"exact".to_vec(),
+                        });
                     }
                 }
                 store_io(&mut self.store).migration_marker(q).await
             }
-            async fn record_marker(&mut self, p: &DelegateKey, m: MigrationMarker) -> Result<(), Self::Error> {
+            async fn record_marker(
+                &mut self,
+                p: &DelegateKey,
+                m: MigrationMarker,
+            ) -> Result<(), Self::Error> {
                 store_io(&mut self.store).record_marker(p, m).await
             }
             async fn write_secret(&mut self, i: &RecoveredSecret<'_>) -> ItemWrite<Self::Error> {
@@ -11706,14 +12021,20 @@ mod tests {
             }
         }
         let g3 = entry(3, 3);
-        let mut w = FailSecondExact { store: MemStore::default(), exact_reads: 0 };
+        let mut w = FailSecondExact {
+            store: MemStore::default(),
+            exact_reads: 0,
+        };
         w.store.set_secret(&done_marker(5), b"1");
-        w.store.set_secret(&pred_wip_marker(&key_of(&g3)), PRED_DONE_MARKER_VALUE_DATA);
+        w.store
+            .set_secret(&pred_wip_marker(&key_of(&g3)), PRED_DONE_MARKER_VALUE_DATA);
         let r = block_on(begin_migration_journal(&mut w, &[g3], &newest()));
         eprintln!("P8 {:?}", r.as_ref().map(|s| s.interrupted_import()));
-        assert!(matches!(r.as_ref().map(|s| s.interrupted_import()), Ok(true)), "{r:?}");
+        assert!(
+            matches!(r.as_ref().map(|s| s.interrupted_import()), Ok(true)),
+            "{r:?}"
+        );
     }
-
 
     /// Lineage grew AND an old entry is contradicted: both land in the stored journal.
     #[test]
@@ -11728,10 +12049,24 @@ mod tests {
         // g2 has an in-progress data marker (an old plain walk's)
         store.set_secret(&pred_wip_marker(&key_of(&g2)), PRED_DONE_MARKER_VALUE_DATA);
         let lineage = [g1, g2];
-        let st = block_on(begin_migration_journal(&mut store_io(&mut store), &lineage, &union())).expect("begin");
+        let st = block_on(begin_migration_journal(
+            &mut store_io(&mut store),
+            &lineage,
+            &union(),
+        ))
+        .expect("begin");
         assert!(st.interrupted_import());
         for g in [&g1, &g2] {
-            assert!(matches!(state_of(&store, g), JournalState::Pending { import: ImportFlag::Started, .. }), "{g:?}");
+            assert!(
+                matches!(
+                    state_of(&store, g),
+                    JournalState::Pending {
+                        import: ImportFlag::Started,
+                        ..
+                    }
+                ),
+                "{g:?}"
+            );
         }
     }
 
@@ -11750,7 +12085,10 @@ mod tests {
         store.set_secret(MIGRATION_JOURNAL_KEY, &stale);
         // the predecessor answers empty again (a #5857 read fault)
         let run = journaled(&mut store, &mut io, &lineage, union());
-        assert!(!complete(&run), "sealed Complete over a partial copy: {run:?}");
+        assert!(
+            !complete(&run),
+            "sealed Complete over a partial copy: {run:?}"
+        );
         assert!(interrupted(&run));
         assert!(stored_status(&store, &lineage).interrupted_import());
         // and when it answers properly, it completes
@@ -11759,7 +12097,6 @@ mod tests {
         assert_eq!(store.get_secret(b"room:b").as_deref(), Some(&b"B"[..]));
     }
 
-
     /// The reopen loop reads the predecessor's OWN marker, as the rebuild does:
     /// a legacy seal for a newer generation must not hide its in-progress import.
     #[test]
@@ -11767,10 +12104,23 @@ mod tests {
         let g3 = entry(3, 3);
         let mut store = MemStore::default();
         store.set_secret(&done_marker(5), b"1");
-        block_on(begin_migration_journal(&mut store_io(&mut store), &[g3], &newest())).expect("begin");
-        assert_eq!(state_of(&store, &g3), JournalState::Resolved(JournalResolution::SupersededByAuthoritative));
+        block_on(begin_migration_journal(
+            &mut store_io(&mut store),
+            &[g3],
+            &newest(),
+        ))
+        .expect("begin");
+        assert_eq!(
+            state_of(&store, &g3),
+            JournalState::Resolved(JournalResolution::SupersededByAuthoritative)
+        );
         store.set_secret(&pred_wip_marker(&key_of(&g3)), PRED_DONE_MARKER_VALUE_DATA);
-        let st = block_on(begin_migration_journal(&mut store_io(&mut store), &[g3], &newest())).expect("begin");
+        let st = block_on(begin_migration_journal(
+            &mut store_io(&mut store),
+            &[g3],
+            &newest(),
+        ))
+        .expect("begin");
         assert!(st.interrupted_import(), "{st:?}");
     }
 
@@ -11787,9 +12137,12 @@ mod tests {
         assert!(complete(&w.run(&mut io, union())));
         let before = w.status_at_marker_reads.len();
         block_on(begin_migration_journal(&mut w, &lineage, &union())).expect("begin");
-        assert_eq!(w.status_at_marker_reads.len() - before, 1, "one NoData entry, one read");
+        assert_eq!(
+            w.status_at_marker_reads.len() - before,
+            1,
+            "one NoData entry, one read"
+        );
     }
-
 
     #[test]
     fn r9_p13_a_grown_lineage_reads_only_the_unseen_entries() {
@@ -11802,7 +12155,6 @@ mod tests {
         assert_eq!(w.status_at_marker_reads.len() - before, 1);
     }
 
-
     /// Adapter whose EXACT marker reads can be switched to fail after the journal is started.
     struct ExactFault {
         store: MemStore,
@@ -11812,16 +12164,25 @@ mod tests {
     }
     impl SuccessorSecretsIo for ExactFault {
         type Error = SecretStoreWriteFailed;
-        async fn migration_marker(&mut self, q: &MarkerQuery<'_>) -> Result<Option<MigrationMarker>, Self::Error> {
+        async fn migration_marker(
+            &mut self,
+            q: &MarkerQuery<'_>,
+        ) -> Result<Option<MigrationMarker>, Self::Error> {
             if self.fail_exact && q.legacy_bridge == LegacyBridge::ExactGenerationOnly {
                 if self.skip_exact == 0 {
-                    return Err(SecretStoreWriteFailed { key: b"exact".to_vec() });
+                    return Err(SecretStoreWriteFailed {
+                        key: b"exact".to_vec(),
+                    });
                 }
                 self.skip_exact -= 1;
             }
             store_io(&mut self.store).migration_marker(q).await
         }
-        async fn record_marker(&mut self, p: &DelegateKey, m: MigrationMarker) -> Result<(), Self::Error> {
+        async fn record_marker(
+            &mut self,
+            p: &DelegateKey,
+            m: MigrationMarker,
+        ) -> Result<(), Self::Error> {
             store_io(&mut self.store).record_marker(p, m).await
         }
         async fn write_secret(&mut self, i: &RecoveredSecret<'_>) -> ItemWrite<Self::Error> {
@@ -11843,27 +12204,44 @@ mod tests {
     #[test]
     fn r9_p14_walk_a_failed_exact_read_does_not_journal_a_bridged_seal_as_imported() {
         let g3 = entry(3, 3);
-        let mut w = ExactFault { store: MemStore::default(), fail_exact: false, skip_exact: 1 };
+        let mut w = ExactFault {
+            store: MemStore::default(),
+            fail_exact: false,
+            skip_exact: 1,
+        };
         w.store.set_secret(&done_marker(5), b"1");
         block_on(begin_migration_journal(&mut w, &[g3], &newest())).expect("begin");
         w.fail_exact = true;
         let mut io = MockIo::default().executable_with(&key_of(&g3), &[(b"room:o", b"O")]);
-        let run = block_on(migrate_delegate_secrets_journaled(&mut w, &mut io, &[g3], ack(), newest()));
-        assert_eq!(state_of(&w.store, &g3), JournalState::Resolved(JournalResolution::SupersededByAuthoritative), "{run:?}");
+        let run = block_on(migrate_delegate_secrets_journaled(
+            &mut w,
+            &mut io,
+            &[g3],
+            ack(),
+            newest(),
+        ));
+        assert_eq!(
+            state_of(&w.store, &g3),
+            JournalState::Resolved(JournalResolution::SupersededByAuthoritative),
+            "{run:?}"
+        );
     }
 
     /// ... and in note_app_import_started.
     #[test]
     fn r9_p15_note_app_a_failed_exact_read_is_a_refusal() {
         let g3 = entry(3, 3);
-        let mut w = ExactFault { store: MemStore::default(), fail_exact: false, skip_exact: 0 };
+        let mut w = ExactFault {
+            store: MemStore::default(),
+            fail_exact: false,
+            skip_exact: 0,
+        };
         w.store.set_secret(&done_marker(5), b"1");
         block_on(begin_migration_journal(&mut w, &[g3], &newest())).expect("begin");
         w.fail_exact = true;
         let r = block_on(note_app_import_started(&mut w, &key_of(&g3), 3, &newest()));
         assert!(r.is_err(), "{r:?}");
     }
-
 
     #[test]
     fn r9_p16_a_resolved_entry_survives_a_later_silence() {
@@ -11876,7 +12254,10 @@ mod tests {
         let mut silent = MockIo::default().dead(&k);
         let run = journaled(&mut store, &mut silent, &lineage, union());
         assert!(complete(&run), "{run:?}");
-        assert_eq!(state_of(&store, &lineage[0]), JournalState::Resolved(JournalResolution::NoData));
+        assert_eq!(
+            state_of(&store, &lineage[0]),
+            JournalState::Resolved(JournalResolution::NoData)
+        );
     }
 
     #[test]
@@ -11890,5 +12271,4 @@ mod tests {
         let st = stored_status(&store, &lineage);
         assert_eq!(st.rejected_items(), 0);
     }
-
 }
