@@ -137,9 +137,19 @@ of 4 rooms on every later load. Four review rounds of in-session fixes
   (`PredecessorMigration::exported_fewer_after_data()`), exactly as an empty
   one after data is, and never resolves the predecessor: a frozen predecessor
   does not lose items, so the short answer is the fault (a secret or an index
-  the node failed to read). This closes the interrupted-import-then-read-fault
-  case (river#760, then freenet-core#5857). A first attempt that is already
-  short is still believed: that stays the app's `fetch_secrets` to make loud.
+  the node failed to read). Keys are counted once each; the count survives an
+  import with rejections and the higher revision that reopens it; and a retry
+  re-reads the stored count before its first item, so another session's larger
+  count holds it. This closes the interrupted-import-then-read-fault case
+  (river#760, then freenet-core#5857) when the walk started the import, or the
+  app passed a count with its flag. Still believed: a first attempt that is
+  already short (the app's `fetch_secrets` to make loud); an app-started import
+  flagged with no count; and any retry after the journal was lost or corrupt,
+  or after a stale store dropped the count (the markers do not carry it). Under
+  Union a refused newest generation does not stop older ones, which can then
+  shadow its values under a never-clobber writer (#42). And a predecessor that
+  really does export fewer than it once did (an old tab's deletes, a build whose
+  `fetch_secrets` lists less) stays pending for good (#39).
 * `note_app_import_started(successor, lineage, predecessor, policy, items)` raises the
   same flag for an app that writes migrated data outside the walk (River's
   hand-rolled sweep), once it holds data read from the predecessor and before

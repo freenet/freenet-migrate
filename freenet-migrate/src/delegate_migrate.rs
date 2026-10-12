@@ -1809,10 +1809,12 @@ fn status_with_unverified(
 /// unit**: the number of pairs the app's
 /// [`PredecessorSecretsIo::fetch_secrets`] returns for it, not counting reserved
 /// keys ([`crate::is_reserved_key`]). The journal keeps the largest count it is
-/// given, and a later walk export with fewer items is not believed (#44). Pass
-/// `None` if the app cannot count in that unit: a count in another unit (rooms
-/// where the export holds keys, say) that is larger than the walk's export
-/// keeps the predecessor pending for good.
+/// given, and a later walk export with fewer items is not believed (#44). A
+/// lower bound is safe (count only what you read for certain); a count larger
+/// than the walk's export, in another unit (rooms where the export holds keys,
+/// say) or counting an overridden journal key, keeps the predecessor pending
+/// for good. Pass `None` if the app cannot count in that unit; its interrupted
+/// import is then not protected against a short retry.
 ///
 /// Records it twice: in the journal, and as the predecessor's in-progress
 /// migration marker (`InProgress { saw_data: true }`), exactly as the walk does

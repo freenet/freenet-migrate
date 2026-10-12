@@ -160,7 +160,9 @@
 //!   be an `Err` from the app's [`crate::PredecessorSecretsIo::fetch_secrets`].
 //!   A retry after an interrupted import is held to the count the interrupted
 //!   attempt saw (an export with fewer items is not believed, #44), but a first
-//!   attempt that is already short is believed. An app that enumerates through an index the predecessor itself
+//!   attempt that is already short is believed, and so is a retry after the
+//!   journal was lost, corrupt or overwritten by a stale store: the count lives
+//!   only in the journal, and a rebuild from the markers starts it again at 0. An app that enumerates through an index the predecessor itself
 //!   reads (and freenet/freenet-core#5857 can make that read come back empty)
 //!   must not let an unreadable index become a short list. For a predecessor
 //!   already deployed, an index read that failed may look exactly like an
