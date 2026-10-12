@@ -1784,8 +1784,7 @@ fn status_with_unverified(
 /// the policy supersedes (an older one behind the newest that holds data): it
 /// can then never resolve, and [`JournalStatus::interrupted_import`] stays true.
 /// Once per predecessor per session is enough; each call costs two journal loads,
-/// a journal store, two marker reads (three behind a legacy seal) and a marker
-/// write.
+/// a journal store, two marker reads and a marker write.
 ///
 /// Records it twice: in the journal, and as the predecessor's in-progress
 /// migration marker (`InProgress { saw_data: true }`), exactly as the walk does
@@ -1971,10 +1970,13 @@ pub struct JournaledMigrationReport {
 ///    as an import started; if that store fails, the walk stops before writing
 ///    anything of it.
 /// 4. After the walk each predecessor's outcome resolves its entry or counts an
-///    unresolved attempt (table in the [`crate::journal`] module docs). A pending
-///    predecessor the walk stopped short of (behind a halt) is checked against
-///    its marker, so a flag another session's stale store overwrote is
-///    restored. The journal is stored with read-merge-write.
+///    unresolved attempt (table in the [`crate::journal`] module docs). Every
+///    predecessor whose marker neither the walk nor the start read (behind a
+///    halt, a failed read, a legacy-bridged seal, a supersession) is then
+///    checked against its own marker, so a flag another session's stale store
+///    overwrote is restored, and one that cannot be read counts as an import
+///    under way in the returned status. The journal is stored with
+///    read-merge-write.
 ///
 /// The app calls [`begin_migration_journal`] on every load, and this while the
 /// status is incomplete. That is safe to repeat:
@@ -6796,7 +6798,7 @@ mod tests {
 
     // -- begin, and the durable-before-the-first-write property -----------------
 
-    /// The journal must be durable, with every predecessor pending, BEFORE the
+    /// The journal must be durable (read off the markers) BEFORE the
     /// app's first migration write — that is the whole point of `begin`.
     #[test]
     fn begin_stores_every_predecessor_pending_before_anything_is_written() {
@@ -7776,7 +7778,7 @@ mod tests {
 
     // -- the stored form -------------------------------------------------------------
 
-    /// The load-time read is conservative.
+    /// The pure read of stored bytes is conservative.
     #[test]
     fn journal_status_reads_the_stored_bytes_conservatively() {
         let (a, b) = (entry(1, 1), entry(2, 2));

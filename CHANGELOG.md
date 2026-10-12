@@ -135,14 +135,18 @@ of 4 rooms on every later load. Four review rounds of in-session fixes
   data outside the walk (River's hand-rolled sweep), once it holds data read
   from the predecessor and before it writes or merges it. It refuses
   (`JournalError::NotImportable`) a predecessor outside the lineage, or one a
-  snapshot policy supersedes, where a flag could never resolve.
+  snapshot policy supersedes (a newer generation's data, or an import from a
+  newer generation under way), or a `generation` that is not the predecessor's,
+  where a flag could never resolve. `begin` takes the lineage's generations for
+  entries it already has, so a renumbered lineage does not trip it.
 * Inside the no-compare-and-swap window between two sessions' stores, a stale
   session can overwrite an app's flag, and the stored journal can then say no
   import is under way over the app's partial copy (even `Complete`, if the
   predecessor had been resolved as holding nothing). The predecessor's marker
   still records the import: `begin_migration_journal` reopens such a resolution,
-  and the walk restores the flag on a pending entry, including one behind a halt
-  it stops at. Call `begin` on every load, and decide from the status the last
+  and the walk restores the flag on any predecessor it reaches, and after it on
+  any whose marker neither it nor the start read (behind a halt, a failed read,
+  a legacy seal, a supersession). Call `begin` on every load, and decide from the status the last
   call returned, never from a raw `journal_status` read.
 * `begin` costs one marker read per predecessor resolved as holding nothing, per
   call. A marker it cannot read there refuses nothing: the predecessor reads as

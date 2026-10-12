@@ -737,15 +737,17 @@ before it became one (see the CHANGELOG).
 
 Compose "the successor may not be everything the user had" from: a walk in
 flight, a status not read yet, `begin_migration_journal` erring, a walk whose
-`status` is `None`, or `interrupted_import()` on the status the last call
-returned.
+`status` is `None`, `interrupted_import()` on the status the last call
+returned, or `rejected_items() > 0` (items the successor's import path refused,
+missing until a fix raises `import_revision`).
 
 Per load, `begin` reads the journal and one marker per predecessor resolved as
 holding nothing; it stores only when it reopens or adds an entry. A marker it
 cannot read there refuses nothing: that predecessor reads as an import under way
 for the load, and the read is retried on the next. (Starting a journal, or adding
 a lineage entry, still refuses until that predecessor's marker reads; and the
-walk halts at a pending predecessor whose marker it cannot read.) The walk then
+walk halts at a predecessor not resolved with its data whose marker it cannot
+read.) The walk then
 costs what the section below says.
 
 What resolves a predecessor is a table in the `journal` module docs. The short
@@ -758,7 +760,8 @@ So `Complete` needs every predecessor in the lineage to answer, and one this nod
 never had keeps the journal `Incomplete` indefinitely: the walk keeps asking it on
 every run. Implement `PredecessorSecretsIo::probe_verdict` if your transport can
 tell a definitive "not installed" from silence. That makes each such probe
-immediate, though every walk still reads each predecessor's marker and stores
+immediate, though every walk still reads the marker of each predecessor not
+already resolved with its data, and stores
 the journal; only running the walk less often (a cadence) makes a lineage of
 absent generations cheap. It also lets `JournalStatus::pending_all_absent(n)` tell you that every
 remaining predecessor has answered "not installed" `n` times in a row, if you
@@ -788,9 +791,9 @@ between two sessions' journal stores, a stale session can also overwrite an
 app's flag: the stored journal can then say no import is under way over a
 partial copy, and if the predecessor had been resolved as holding nothing, it
 can even read `Complete`. Its marker still records the import. The next `begin`
-reopens such a resolution, and the walk restores the flag on a pending entry
-(one it reaches, or one behind a halt it stops at), so the status those calls
-return reports it.
+reopens such a resolution, and the walk restores the flag on any predecessor it
+reaches and, after it, on any whose marker neither it nor the start read, so
+the status those calls return reports it.
 
 ### Known limitations
 

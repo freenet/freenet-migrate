@@ -118,8 +118,9 @@
 //! import flag, and the stored journal can then read `Complete` over a partial
 //! copy. The predecessor's marker still records the import:
 //! [`crate::begin_migration_journal`] reopens such a resolution, and the walk
-//! restores a pending entry's flag (one it reaches, or one behind a halt it
-//! stops at). So decide from the status those calls return, not from a raw
+//! restores a flag on any predecessor it reaches, and after it on any whose
+//! marker neither it nor the start read (behind a halt, a failed read, a legacy
+//! seal, a supersession). So decide from the status those calls return, not from a raw
 //! [`journal_status`] read. Every store a walk relies on **fails closed**:
 //! if the journal cannot be read or established, or the import flag cannot be
 //! stored before a predecessor's first item, that predecessor is not imported
@@ -994,6 +995,11 @@ impl JournalStatus {
     /// `NewestSnapshotWins` an absent newest predecessor halts the walk, the older
     /// ones are never examined, and this stays `false`; each such walk then costs
     /// one probe.
+    ///
+    /// On a load that skips the walk, the status left is `begin`'s, and `begin`
+    /// reads no pending predecessor's marker: a flag lost in the no-compare-and-
+    /// swap window on such a predecessor (one that went absent mid-import) is not
+    /// seen until the walk next runs.
     pub fn pending_all_absent(&self, min_streak: u32) -> bool {
         match self {
             JournalStatus::Incomplete { pending, .. } => pending
