@@ -10599,4 +10599,96 @@ mod tests {
             "sealed over a partial copy"
         );
     }
+
+    /// The walk (not only a fresh journal) tells a legacy at-or-above seal from an
+    /// import, and a bridged row still supersedes what is older behind it.
+    #[test]
+    fn the_walk_journals_a_legacy_bridged_seal_as_superseded() {
+        let (g2, g3) = (entry(2, 2), entry(3, 3));
+        let lineage = [g2, g3];
+        let mut store = MemStore::default();
+        // A journal already exists (begun before the legacy marker was visible).
+        put_journal(&mut store, &MigrationJournal::new_pending(&lineage));
+        store.set_secret(&done_marker(5), b"1");
+        let mut io = MockIo::default()
+            .executable_with(&key_of(&g3), &[(b"room:3", b"3")])
+            .executable_with(&key_of(&g2), &[(b"room:2", b"2")]);
+        let run = journaled(&mut store, &mut io, &lineage, newest());
+        assert_eq!(
+            state_of(&store, &g3),
+            JournalState::Resolved(JournalResolution::SupersededByAuthoritative)
+        );
+        assert_eq!(
+            state_of(&store, &g2),
+            JournalState::Resolved(JournalResolution::SupersededByAuthoritative)
+        );
+        assert!(complete(&run), "{:?}", run.status);
+        // Under Union both reopen and are imported.
+        let run = journaled(&mut store, &mut io, &lineage, union());
+        assert!(complete(&run), "{:?}", run.status);
+        assert!(store.has_secret(b"room:3") && store.has_secret(b"room:2"));
+    }
+
+    /// A writer that stores its journal under its own key, reported from
+    /// `journal_key()`: the journaled walk withholds that key too.
+    #[test]
+    fn an_overridden_journal_key_is_withheld() {
+        struct OwnKey {
+            store: MemStore,
+        }
+        impl SuccessorSecretsIo for OwnKey {
+            type Error = SecretStoreWriteFailed;
+            async fn migration_marker(
+                &mut self,
+                query: &MarkerQuery<'_>,
+            ) -> Result<Option<MigrationMarker>, Self::Error> {
+                store_io(&mut self.store).migration_marker(query).await
+            }
+            async fn record_marker(
+                &mut self,
+                p: &DelegateKey,
+                m: MigrationMarker,
+            ) -> Result<(), Self::Error> {
+                store_io(&mut self.store).record_marker(p, m).await
+            }
+            async fn write_secret(&mut self, item: &RecoveredSecret<'_>) -> ItemWrite<Self::Error> {
+                store_io(&mut self.store).write_secret(item).await
+            }
+        }
+        impl JournaledSuccessorIo for OwnKey {
+            async fn load_journal(&mut self) -> Result<Option<Vec<u8>>, Self::Error> {
+                Ok(self.store.get_secret(b"app/journal"))
+            }
+            async fn store_journal(&mut self, j: &[u8]) -> Result<(), Self::Error> {
+                self.store.set_secret(b"app/journal", j);
+                Ok(())
+            }
+            fn journal_key(&self) -> &[u8] {
+                b"app/journal"
+            }
+        }
+        let lineage = [entry(1, 1)];
+        let k = key_of(&lineage[0]);
+        let mut w = OwnKey {
+            store: MemStore::default(),
+        };
+        let mut io = MockIo::default()
+            .executable_with(&k, &[(b"app/journal", b"forged"), (b"room:a", b"A")]);
+        let run = block_on(migrate_delegate_secrets_journaled(
+            &mut w,
+            &mut io,
+            &lineage,
+            ack(),
+            union(),
+        ));
+        assert!(complete(&run), "{:?}", run.status);
+        assert!(MigrationJournal::decode(&w.store.get_secret(b"app/journal").unwrap()).is_ok());
+        assert!(matches!(
+            run.report.predecessors[0],
+            PredecessorMigration::Imported {
+                tally: ImportTally { written: 1, .. },
+                ..
+            }
+        ));
+    }
 }
