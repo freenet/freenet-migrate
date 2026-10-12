@@ -11795,6 +11795,24 @@ mod tests {
         assert!(!store.has_secret(b"g2:b"), "halted: not imported yet");
     }
 
+    /// Behind a halt, an EMPTY in-progress marker (an attempt that saw nothing)
+    /// is not a started import: flagging it would wedge the entry.
+    #[test]
+    fn an_empty_in_progress_marker_behind_a_halt_flags_nothing() {
+        let (g2, g3) = (entry(2, 2), entry(3, 3));
+        let lineage = [g2, g3];
+        let k2 = key_of(&g2);
+        let mut store = MemStore::default();
+        store.set_secret(&pred_wip_marker(&k2), PRED_DONE_MARKER_VALUE_EMPTY);
+        let mut io = MockIo::default()
+            .executable_with(&k2, &[(b"g2:a", b"A")])
+            .not_installed(&key_of(&g3));
+        let status = journaled(&mut store, &mut io, &lineage, newest())
+            .status
+            .expect("stored");
+        assert!(!status.interrupted_import(), "{status:?}");
+    }
+
     /// Behind a halt, a pending predecessor whose marker cannot be read reads as
     /// an import under way for that load.
     #[test]
