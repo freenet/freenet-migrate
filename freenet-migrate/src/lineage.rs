@@ -58,7 +58,11 @@ impl ContractLineageEntry {
 /// One predecessor generation of a *delegate*.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DelegateLineageEntry {
-    /// Monotonic generation number (older = smaller).
+    /// Monotonic generation number (older = smaller). Never change it for an
+    /// existing predecessor once a successor may hold legacy generation-keyed
+    /// markers (pre-0.5 `import_secrets_once`): those are keyed by this number,
+    /// so a renumber points them at a different predecessor, which can then read
+    /// as migrated without ever being imported.
     pub generation: u32,
     /// The 32-byte code hash `blake3(wasm)`, decoded at build time.
     pub code_hash: [u8; 32],

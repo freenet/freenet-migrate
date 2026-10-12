@@ -141,10 +141,11 @@ of 4 rooms on every later load. Four review rounds of in-session fixes
   the lineage, or one a snapshot policy supersedes: a newer generation holds
   data by the journal (resolved with it, an import under way, or a rejection a
   higher revision reopened) or by its own marker, or only a legacy seal for a
-  newer generation covers it. A marker read that fails there is a plain
-  `Successor` error, never a verdict. Under a snapshot policy, an app's sweep
-  should also stop where the walk would (at a newer generation it cannot read):
-  the guard refuses only what it knows holds data.
+  newer generation covers it. Under plain `NewestSnapshotWins` it also refuses,
+  until it has, one behind a newer generation that has not answered that it
+  holds nothing (the walk halts there too). So an app's sweep is held to what
+  the walk would import. A marker read that fails there is a plain `Successor`
+  error, never a verdict.
 * Inside the no-compare-and-swap window between two sessions' stores, a stale
   session can overwrite an app's flag, and the stored journal can then say no
   import is under way over the app's partial copy (even `Complete`, if the
@@ -152,8 +153,8 @@ of 4 rooms on every later load. Four review rounds of in-session fixes
   still records the import: `begin_migration_journal` reopens such a resolution,
   and the walk restores the flag on any predecessor it reaches, and after it on
   any whose marker neither it nor the start read (behind a halt, a failed read,
-  a legacy seal, a supersession). Call `begin` on every load, and decide from the status the last
-  call returned, never from a raw `journal_status` read.
+  a legacy seal, a supersession). Call `begin` on every load, and decide from
+  the status the last call returned, never from a raw `journal_status` read.
 * `begin` costs one marker read per predecessor resolved as holding nothing, per
   call. A marker it cannot read there refuses nothing: the predecessor reads as
   an import under way for that load, nothing is stored, and the read is retried
@@ -325,11 +326,14 @@ is not there (freenet/freenet-core#5857).
   partial copy cannot be told apart from a complete one. Ship the journal with
   a delegate re-key, or accept that window knowingly.
 * **Do not renumber a lineage over a successor holding legacy generation-keyed
-  markers.** Those markers (pre-0.5 `import_secrets_once`, and the at-or-above
-  bridge) are keyed by generation number, so a renumber points them at a
-  different predecessor: one can then read as migrated without ever being
-  imported, and the journal certifies it. A successor that only ever saw the
-  per-predecessor markers is unaffected.
+  markers.** Those markers (pre-0.5 `import_secrets_once`) are keyed by
+  generation number, under every policy's bridge, so a renumber points them at
+  a different predecessor: one can then read as migrated without ever being
+  imported, or hide an import under way, and the journal certifies it. A
+  successor that only ever saw the per-predecessor markers does not have this
+  problem. Under a snapshot policy, inserting a forgotten data-bearing
+  generation between two already resolved is a different hazard: the older one
+  was imported as the authoritative snapshot, and the walk does not revisit it.
 * **A legacy generation-keyed import (`import_secrets_once`) interrupted part-way
   is invisible to the journal,** which reads only the per-predecessor markers.
   Do not mix the two APIs on one successor. A legacy at-or-above seal (a

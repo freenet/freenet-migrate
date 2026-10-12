@@ -1783,7 +1783,9 @@ fn status_with_unverified(
 /// "nothing" is not believed. `predecessors` is the lineage the app passes to
 /// [`begin_migration_journal`] and the walk: it decides the predecessor's
 /// generation and which generations are newer, never the stored journal (which
-/// a tab running another build may have numbered differently). Once per
+/// a tab running another build may have numbered differently). Under a snapshot
+/// policy the app is held to what the walk would import (see Errors), so sweep
+/// newest first and stop where this refuses. Once per
 /// predecessor per session is enough; each call costs two journal loads, a
 /// journal store, two marker reads and a marker write, plus under a snapshot
 /// policy one marker read per newer generation the journal does not already
@@ -1811,12 +1813,14 @@ fn status_with_unverified(
 /// flag or the marker could not be stored. Do not write: a kill mid-write would
 /// leave a partial copy nothing records.
 ///
-/// [`JournalError::NotImportable`]: the predecessor is not in `predecessors`, or
-/// a snapshot policy supersedes it. A newer generation holds the authoritative
-/// snapshot when the journal shows it holding data (resolved with it, an import
-/// from it under way, or a rejection a higher revision reopened), when its own
-/// marker records data, or when only a legacy seal for a newer generation covers
-/// this one. The walk would not import it either. Do not import from it.
+/// [`JournalError::NotImportable`]: the walk would not import the predecessor
+/// now, so do not write from it on this call. It is not in `predecessors`; or a
+/// snapshot policy supersedes it, because a newer generation holds data (the
+/// journal shows it resolved with data, an import from it under way, or a
+/// rejection a higher revision reopened; or its own marker records data) or only
+/// a legacy seal for a newer generation covers this one; or, under plain
+/// `NewestSnapshotWins`, a newer generation has not yet answered that it holds
+/// nothing (the walk halts there too; this one can change on a later load).
 pub async fn note_app_import_started<W>(
     successor: &mut W,
     predecessors: &[DelegateLineageEntry],

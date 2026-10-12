@@ -298,7 +298,9 @@ impl JournalState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct JournalEntry {
-    /// The predecessor's lineage generation.
+    /// The predecessor's generation as the last build to write the entry
+    /// numbered it. Informational: every decision takes the generation from the
+    /// lineage the caller passes.
     pub generation: u32,
     /// Its state.
     pub state: JournalState,
@@ -1092,11 +1094,12 @@ pub enum JournalError {
     /// The stored journal was written by a build with a different journal encoding
     /// version. This build never overwrites it.
     ForeignVersion(u64),
-    /// [`crate::note_app_import_started`] was asked to flag a predecessor that the
-    /// app's snapshot policy supersedes (a newer generation holds the
-    /// authoritative snapshot), or that is not in the lineage the app passed. Do
-    /// not import from it: the walk would not either, and a flag there could
-    /// never resolve.
+    /// [`crate::note_app_import_started`] was asked to flag a predecessor the walk
+    /// would not import now: one not in the lineage the app passed, one a newer
+    /// generation's data supersedes under a snapshot policy, or, under plain
+    /// `NewestSnapshotWins`, one behind a newer generation that has not yet
+    /// answered that it holds nothing (that one can change on a later load). Do
+    /// not write from it on this call.
     NotImportable(String),
 }
 
