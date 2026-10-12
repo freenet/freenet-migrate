@@ -6177,7 +6177,8 @@ mod tests {
         };
         // What each policy owes the successor: Union every generation, a snapshot
         // policy only the newest data-bearing one.
-        let cases: [(fn() -> SecretSelectionPolicy, &[&[u8]]); 2] = [
+        type Case = (fn() -> SecretSelectionPolicy, &'static [&'static [u8]]);
+        let cases: [Case; 2] = [
             (union, &[b"room:a", b"room:b", b"room:c", b"room:d"]),
             (newest, &[b"room:c", b"room:d"]),
         ];
@@ -6241,14 +6242,6 @@ mod tests {
     struct KillableStore {
         inner: MemStore,
         budget: usize,
-    }
-    impl KillableStore {
-        fn new(budget: usize) -> Self {
-            Self {
-                inner: MemStore::default(),
-                budget,
-            }
-        }
     }
     impl SecretStore for KillableStore {
         fn list_secrets(&self, prefix: &[u8]) -> Vec<Vec<u8>> {
