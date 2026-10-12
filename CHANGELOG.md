@@ -97,34 +97,51 @@ of 4 rooms on every later load. Four review rounds of in-session fixes
 `Resolved`:
 
 * `begin_migration_journal` stores it, every predecessor pending, before the app's
-  first migration write.
+  first migration write. It never resets a readable journal.
 * `migrate_delegate_secrets_journaled` runs the ordinary walk, durably flags a
-  data-bearing predecessor before its first item, and records what each
-  predecessor resolved to.
+  data-bearing predecessor as *import in progress* before its first item, and
+  records what each predecessor resolved to.
+* `note_app_import_started` raises the same flag for an app that writes migrated
+  data outside the walk (River's hand-rolled sweep).
 * `journal_status` is the app's pure load-time read: `NotStarted`, `Unreadable`,
-  `Incomplete { pending }` (re-run the walk) or `Complete` (nothing left to probe,
-  durably — which also stops an empty account re-probing every generation on
-  every load).
+  `Incomplete { pending }` (re-run the walk) or `Complete { rejected_items }`
+  (nothing left to probe, durably, which also stops an empty account re-probing
+  every generation on every load). `interrupted_import()` says the successor may
+  hold a partial copy right now.
 
 Completeness is arithmetic over durable state; there is no timing anywhere in it.
-Silence and timeouts never resolve (attempts are counted, nothing is given up on);
-an item permanently rejected resolves with a count instead of re-running the
-migration forever; an older generation superseded behind a halt stays pending, and
-under `UnionAllGenerations` never resolves as superseded at all. Resolution is
-sticky, so `Complete` is a seal.
+The rules the data-loss argument rests on:
+
+* **Absence never resolves.** Silence, a timeout, and a definitive "not
+  installed" all stay pending: freenet-core unregisters a delegate without
+  deleting its secrets, so "not installed" is not proof of "holds nothing". A
+  "not installed" answer is counted (`absent_streak`) so an app can choose to stop
+  re-probing (`JournalStatus::pending_all_absent`); the crate never gives up.
+* **A permanent rejection resolves with a count, and reopens** when the writer's
+  `JournaledSuccessorIo::import_revision` rises, so a fixed import path retries
+  instead of the predecessor being sealed away.
+* **`SupersededByAuthoritative` is bound to the policy family** it was resolved
+  under; switching to `UnionAllGenerations` reopens it. Under Union a generation
+  is never resolved as superseded.
+* **Every store is read-merge-write and fails closed.** A second session's import
+  flag survives our store. If the journal cannot be read, started, or (before a
+  predecessor's first item) flagged, nothing of that predecessor is written. A
+  journal from a different encoding version is never overwritten; a corrupt one
+  is replaced by a pessimistic one (every predecessor pending and flagged).
+
+The new `WriterStage::JournalFlag` names a failed import-flag store.
 
 **`ProbeVerdict` and `PredecessorSecretsIo::probe_verdict`.** A new default trait
 method with a third answer, `NotInstalled`, for an adapter whose transport can tell
 "this node has no such delegate" from silence (a typed node error, never a
 timeout). The default forwards to `probe_executable` and never answers
-`NotInstalled`, so existing adapters are unaffected. An adapter that opts in gets
-`NoData` for that predecessor (no completion marker, no termination under any
-policy) and a resolved journal entry. A `NotInstalled` answer contradicting an
-earlier attempt that saw data is not believed.
+`NotInstalled`, so existing adapters are unaffected. The walk treats
+`NotInstalled` exactly like silence (`Unresponsive`, same termination rule under
+every policy); the only difference is the journal's absent streak.
 
 **`SecretStoreIo`** implements `JournaledSuccessorIo`, storing the journal under
 `MIGRATION_JOURNAL_KEY`, inside the crate's reserved namespace (filtered from
-every export).
+every export). Its `import_revision` is 0.
 
 ## freenet-migrate 0.6.0
 

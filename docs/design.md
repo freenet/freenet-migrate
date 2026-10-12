@@ -202,6 +202,16 @@ evolution could carry generations/policy). The earlier "`NodeCopyForward: impl
 SecretTransport` drop-in routed inside migrate" framing was non-viable (the io
 reaches predecessors, not the node) and is retired.
 
+**Completeness across predecessors (0.7.0, #37).** The two-phase marker makes
+one predecessor's import durable. Whether *every* predecessor has been dealt with
+is a separate durable record, the `MigrationJournal`, stored in the successor
+through `JournaledSuccessorIo` and read on every load (see the `journal` module
+docs for the resolution table). It composes with the hand-off above: a node-side
+copy-forward that writes `predecessor_done_marker`s makes the journaled walk see
+`AlreadyMigrated`, which resolves from the marker's `had_data`, so the journal
+completes with no app change. Absence (silence or "not installed") never
+resolves a journal entry, for the same reason it never seals a marker.
+
 Hosted per-user secrets stay un-migratable at rest even under a node-mediated
 copy (their DEK keying material is the user's secret, deliberately not the node
 KEK), so the crate returns `MigrateError::UserScopeNotAtRest` and documents the
@@ -243,7 +253,8 @@ predecessor rule is manual-only today — a real hardening). Its "cover every
 
 ## Status
 
-Published: `freenet-migrate` **0.5.0** and `freenet-migrate-build` **0.2.0**.
+Published: `freenet-migrate` **0.6.0** and `freenet-migrate-build` **0.2.0**;
+0.7.0 (unreleased) adds the completeness journal.
 The two halves version independently. The reusable core machinery + tests,
 **field-validated by River's 0.6 → 0.8 re-key** (above).
 

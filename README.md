@@ -689,30 +689,38 @@ state (freenet/river#760). Store a `MigrationJournal` in the successor instead:
 
 ```rust,ignore
 // Load path. One read of the stored journal decides whether the walk runs.
-match journal_status(stored_journal_bytes.as_deref(), DELEGATE_LINEAGE) {
-    JournalStatus::Complete => { /* migrated: never probe the predecessors again */ }
-    status => {
+let binding = JournalBinding::new(&policy, successor.import_revision());
+match journal_status(stored_journal_bytes.as_deref(), DELEGATE_LINEAGE, &binding) {
+    JournalStatus::Complete { .. } => { /* migrated: never probe the predecessors again */ }
+    _ => {
         // Durable intent BEFORE the first migration write (yours or the walk's).
-        begin_migration_journal(&mut successor, DELEGATE_LINEAGE).await?;
+        // An Err means: do not write anything migrated this load.
+        begin_migration_journal(&mut successor, DELEGATE_LINEAGE, &policy).await?;
+        // Writing migrated data yourself, outside the walk? Flag it first:
+        // note_app_import_started(&mut successor, &predecessor, generation).await?;
         let run = migrate_delegate_secrets_journaled(
             &mut successor, &mut io, DELEGATE_LINEAGE, authz, policy,
         ).await;
-        // `run.status` is what was stored. While it is incomplete, re-run on the
-        // next load; `status.interrupted_import()` says the successor may hold a
-        // PARTIAL copy right now, so do not treat it as authoritative yet.
+        // While `run.status` is incomplete, re-run on the next load.
+        // `interrupted_import()` says the successor may hold a PARTIAL copy right
+        // now, so do not treat it as authoritative yet.
     }
 }
 ```
 
-`successor` implements `JournaledSuccessorIo` (two methods: load and store the
-journal bytes under one key the predecessor adapter never offers for import;
-`SecretStoreIo` does this for you). Implement
-`PredecessorSecretsIo::probe_verdict` if your transport can tell a definitive
-"not installed" from silence; without it an absent predecessor stays pending.
+`successor` implements `JournaledSuccessorIo`: load and store the journal bytes
+under one key the predecessor adapter never offers for import (`SecretStoreIo`
+does this for you), and optionally an `import_revision` to bump when a fix to
+your import path should retry items it previously rejected.
 
-What resolves a predecessor is a table in the `journal` module docs; the short
-version is that silence never does, a permanent rejection does (with a count),
-and a generation skipped behind a halt does not.
+What resolves a predecessor is a table in the `journal` module docs. The short
+version: silence and "not installed" never do; a permanent rejection does, with a
+count, until `import_revision` rises; a generation skipped behind a halt does not.
+Implement `PredecessorSecretsIo::probe_verdict` if your transport can tell a
+definitive "not installed" from silence. It does not resolve anything, but it
+lets `JournalStatus::pending_all_absent` tell you when every remaining
+predecessor has repeatedly answered "not installed", if you choose to stop
+re-probing then.
 
 ### Known limitations
 
@@ -776,22 +784,24 @@ leaving the contract-side surface untouched. 0.7.0 adds
 `SecretSelectionPolicy::NewestSnapshotWinsContinuePastUnresponsive`, an opt-in
 fix for `NewestSnapshotWins` halting on the *first* silent predecessor — the
 common case, not the rare one — which disabled migration in practice for any
-lineage longer than one generation ([#14]).
+lineage longer than one generation ([#14]), and a durable completeness
+journal so an app knows when every predecessor has been dealt with ([#37]).
 
-**Published:** `freenet-migrate` **0.5.0**, `freenet-migrate-build` **0.2.0**.
+**Published:** `freenet-migrate` **0.6.0**, `freenet-migrate-build` **0.2.0**.
 The two halves version independently, so an app can take one without the other.
 Targets current stdlib **0.8.x**.
 
-**Unreleased: 0.6.0**, breaking on the **contract** half — silence is no longer
-absence ([#19]). Four of the five adopters below need a code change, three of
-them to compile at all. See [Upgrading to 0.6.0](#upgrading-to-060) and the
+**0.6.0** (published 2026-08-13) is breaking on the **contract** half — silence
+is no longer absence ([#19]). See [Upgrading to 0.6.0](#upgrading-to-060) and the
 CHANGELOG.
 
 **Unreleased: 0.7.0**, additive on the **delegate** half — the new
-`NewestSnapshotWinsContinuePastUnresponsive` policy variant ([#14]). No
-adopter below needs a code change: every known adopter constructs
-`SecretSelectionPolicy` rather than exhaustively matching it, so a new variant
-does not break compilation. Adopting it is optional per app.
+`NewestSnapshotWinsContinuePastUnresponsive` policy variant ([#14]) and the
+opt-in completeness journal ([#37]). No adopter below needs a code change:
+every known adopter constructs `SecretSelectionPolicy` rather than exhaustively
+matching it, the new `WriterStage::JournalFlag` variant joins a
+`#[non_exhaustive]` enum, and the journal and `probe_verdict` are new API with
+defaults. Adopting either is optional per app.
 
 ### Adopters
 
@@ -903,3 +913,4 @@ LGPL-3.0-only. See [LICENSE](./LICENSE).
 [#19]: https://github.com/freenet/freenet-migrate/issues/19
 [#8]: https://github.com/freenet/freenet-migrate/issues/8
 [#14]: https://github.com/freenet/freenet-migrate/issues/14
+[#37]: https://github.com/freenet/freenet-migrate/issues/37
