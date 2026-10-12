@@ -1035,6 +1035,8 @@ pub enum JournalError {
     ForeignVersion(u64),
 }
 
+impl std::error::Error for JournalError {}
+
 impl core::fmt::Display for JournalError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
