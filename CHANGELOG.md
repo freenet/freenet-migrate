@@ -109,18 +109,25 @@ of 4 rooms on every later load. Four review rounds of in-session fixes
 
 * `begin_migration_journal` stores it, every predecessor pending, before the app's
   first migration write. It never resets a readable journal, and a fresh one
-  flags any predecessor an earlier plain walk left mid-import
-  (`InProgress { saw_data: true }`).
+  flags an import `Started` for any predecessor an earlier plain walk left
+  mid-import (`InProgress { saw_data: true }`).
 * `migrate_delegate_secrets_journaled` runs the ordinary walk, durably flags a
-  data-bearing predecessor as *import in progress* before its first item, and
+  data-bearing predecessor's import as started before its first item, and
   records what each predecessor resolved to.
 * `note_app_import_started` raises the same flag for an app that writes migrated
   data outside the walk (River's hand-rolled sweep).
 * `journal_status` is the app's pure load-time read: `NotStarted`, `Unreadable`,
-  `Incomplete { pending }` (re-run the walk) or `Complete { rejected_items }`
-  (nothing left to probe, durably, which also stops an empty account re-probing
-  every generation on every load). `interrupted_import()` says the successor may
-  hold a partial copy right now.
+  `Incomplete { pending, rejected_items }` (re-run the walk) or
+  `Complete { rejected_items }` (nothing left to probe, durably).
+  `interrupted_import()` says the successor may hold a partial copy right now;
+  gate "is the successor everything the user had?" on that, not on
+  `!is_complete()`.
+
+`Complete` needs every predecessor resolved, and a predecessor that is not
+installed on the node never resolves. An account whose lineage includes
+generations this node never had therefore stays `Incomplete`, and the walk keeps
+probing them; with a typed "not installed" answer each probe is cheap.
+`pending_all_absent(n)` lets an app probe less often, as its own policy.
 
 Completeness is arithmetic over durable state; there is no timing anywhere in it.
 The rules the data-loss argument rests on:
@@ -128,27 +135,41 @@ The rules the data-loss argument rests on:
 * **Absence never resolves.** Silence, a timeout, and a definitive "not
   installed" all stay pending: freenet-core unregisters a delegate without
   deleting its secrets, so "not installed" is not proof of "holds nothing". A
-  "not installed" answer is counted (`absent_streak`) so an app can choose to stop
-  re-probing (`JournalStatus::pending_all_absent`); the crate never gives up.
-* **A permanent rejection resolves with a count, and reopens** when the writer's
-  `JournaledSuccessorIo::import_revision` rises, so a fixed import path retries
-  instead of the predecessor being sealed away.
-* **`SupersededByAuthoritative` is bound to the policy family** it was resolved
-  under; switching to `UnionAllGenerations` reopens it. Under Union a generation
-  is never resolved as superseded.
+  "not installed" answer is counted (`absent_streak`); the crate never gives up.
+* **"Nothing" after "something" is not believed.** A predecessor whose import
+  `Started` and which then answers that it holds nothing stays pending. (The
+  walk itself now does the same; see below.)
+* **A permanent rejection resolves with a count, and can be reopened** when the
+  writer's `JournaledSuccessorIo::import_revision` rises, so an app that finds
+  and fixes a wrong rejection retries it. An older build of the app never
+  downgrades the revision.
+* **`SupersededByAuthoritative` holds only under a snapshot policy.** Under
+  `UnionAllGenerations` it reads as pending. Both this and the revision are
+  evaluated against the app's `JournalBinding` on every read and every merge,
+  so a stale stored copy cannot bring a reopened resolution back.
 * **Every store is read-merge-write and fails closed.** A second session's import
-  flag survives our store. If the journal cannot be read, started, or (before a
-  predecessor's first item) flagged, nothing of that predecessor is written. A
-  journal from a different encoding version is never overwritten; a corrupt one
-  is replaced by a pessimistic one (every predecessor pending and flagged).
+  flag survives our store, including the very first store. If the journal, or a
+  predecessor's marker while starting one, cannot be read, or the journal cannot
+  be started or (before a predecessor's first item) flagged, nothing of that
+  predecessor is written. A journal from a different encoding version is never
+  overwritten; a corrupt one is replaced by a pessimistic one (every predecessor
+  pending, an import `Suspected` until it resolves).
 
 The new `WriterStage::JournalFlag` names a failed import-flag store.
+
+**Behaviour change in the plain walk: an empty export after data was seen is a
+silence.** A predecessor an earlier attempt saw data in (its `InProgress`
+marker says so) that now exports nothing is reported `Unresponsive` and keeps
+its in-progress marker, instead of being sealed `Done { had_data: true }` with
+the interrupted attempt's missing items never asked for again. A frozen
+predecessor does not lose data, so the empty answer is the fault: freenet-core
+reports a secret it failed to read the same way as one that is not there.
 
 **`ProbeVerdict` and `PredecessorSecretsIo::probe_verdict`.** A new default trait
 method with a third answer, `NotInstalled`, for an adapter whose transport can tell
 "this node has no such delegate" from silence (a typed node error, never a
-timeout). The default forwards to `probe_executable` and never answers
-`NotInstalled`, so existing adapters are unaffected. The walk treats
+timeout or an empty reply). The default forwards to `probe_executable` and never
+answers `NotInstalled`, so existing adapters are unaffected. The walk treats
 `NotInstalled` exactly like silence (`Unresponsive`, same termination rule under
 every policy); the only difference is the journal's absent streak.
 

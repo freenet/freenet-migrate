@@ -741,6 +741,10 @@ pub enum RetryAdvice {
     /// If the refusal might not be stable, either keep the item `Retryable` or make
     /// the writer generation-aware via [`RecoveredSecret::generation`] so it can
     /// prefer the newer generation's value when it later becomes acceptable.
+    ///
+    /// A journaled migration resolves a predecessor whose only blemish is
+    /// permanent rejections, so it is not retried. If a `Permanent` verdict turns
+    /// out to have been wrong, see [`crate::JournaledSuccessorIo::import_revision`].
     Permanent,
 }
 

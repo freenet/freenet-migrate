@@ -689,38 +689,47 @@ state (freenet/river#760). Store a `MigrationJournal` in the successor instead:
 
 ```rust,ignore
 // Load path. One read of the stored journal decides whether the walk runs.
+// `load_journal` must answer Err (not None) for a read that timed out.
 let binding = JournalBinding::new(&policy, successor.import_revision());
-match journal_status(stored_journal_bytes.as_deref(), DELEGATE_LINEAGE, &binding) {
-    JournalStatus::Complete { .. } => { /* migrated: never probe the predecessors again */ }
-    _ => {
-        // Durable intent BEFORE the first migration write (yours or the walk's).
-        // An Err means: do not write anything migrated this load.
-        begin_migration_journal(&mut successor, DELEGATE_LINEAGE, &policy).await?;
-        // Writing migrated data yourself, outside the walk? Flag it first:
-        // note_app_import_started(&mut successor, &predecessor, generation).await?;
-        let run = migrate_delegate_secrets_journaled(
-            &mut successor, &mut io, DELEGATE_LINEAGE, authz, policy,
-        ).await;
-        // While `run.status` is incomplete, re-run on the next load.
-        // `interrupted_import()` says the successor may hold a PARTIAL copy right
-        // now, so do not treat it as authoritative yet.
-    }
+let stored = successor.load_journal().await?;
+let status = journal_status(stored.as_deref(), DELEGATE_LINEAGE, &binding);
+if !status.is_complete() {
+    // Durable intent BEFORE the first migration write (yours or the walk's).
+    // An Err means: do not write anything migrated this load.
+    begin_migration_journal(&mut successor, DELEGATE_LINEAGE, &policy).await?;
+    // Writing migrated data yourself, outside the walk? Flag it first, and
+    // skip the write if this errs:
+    // note_app_import_started(&mut successor, &predecessor, generation).await?;
+    let run = migrate_delegate_secrets_journaled(
+        &mut successor, &mut io, DELEGATE_LINEAGE, authz, policy,
+    ).await;
+    // `run.status` is what was stored (None if it could not be). While it is
+    // incomplete, run again on a later load.
 }
+// Gate "is the successor everything the user had?" on
+// `status.interrupted_import()`, not on `!is_complete()`.
 ```
 
 `successor` implements `JournaledSuccessorIo`: load and store the journal bytes
 under one key the predecessor adapter never offers for import (`SecretStoreIo`
-does this for you), and optionally an `import_revision` to bump when a fix to
-your import path should retry items it previously rejected.
+does this for you), and optionally an `import_revision` to bump when you find and
+fix a wrong permanent rejection. Drive the journal calls one at a time within a
+session.
 
 What resolves a predecessor is a table in the `journal` module docs. The short
 version: silence and "not installed" never do; a permanent rejection does, with a
-count, until `import_revision` rises; a generation skipped behind a halt does not.
-Implement `PredecessorSecretsIo::probe_verdict` if your transport can tell a
-definitive "not installed" from silence. It does not resolve anything, but it
-lets `JournalStatus::pending_all_absent` tell you when every remaining
-predecessor has repeatedly answered "not installed", if you choose to stop
-re-probing then.
+count, until `import_revision` rises; a generation skipped behind a halt does not;
+and once an import from a predecessor has started, an answer that it holds
+nothing is not believed.
+
+So `Complete` needs every predecessor in the lineage to answer, and one this node
+never had keeps the journal `Incomplete` indefinitely: the walk keeps asking it on
+every run. Implement `PredecessorSecretsIo::probe_verdict` if your transport can
+tell a definitive "not installed" from silence. That makes each such probe
+immediate, and lets `JournalStatus::pending_all_absent(n)` tell you that every
+remaining predecessor has answered "not installed" `n` times in a row, if you
+want to run the walk less often. Treat that as a rate limit, never a seal:
+"not installed" can also mean the node failed to read the delegate.
 
 ### Known limitations
 

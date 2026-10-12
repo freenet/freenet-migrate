@@ -35,6 +35,11 @@
 //!   / [`import_secrets_once`] primitives over the [`SecretStore`] trait. The
 //!   transport the entry points drive is an internal, redesigned sans-IO seam
 //!   ([`delegate_migrate`]) a future node copy-forward swaps under.
+//! * **Delegate migration completeness** — [`journal`]: a durable
+//!   [`MigrationJournal`] in the successor records which predecessors are dealt
+//!   with, so an app knows on every load whether the walk must run again
+//!   ([`begin_migration_journal`], [`note_app_import_started`],
+//!   [`migrate_delegate_secrets_journaled`], [`journal_status`]).
 //!
 //! ## Preconditions made first-class (design §3)
 //!
@@ -105,7 +110,7 @@ pub use driver::{
 };
 pub use error::MigrateError;
 pub use journal::{
-    journal_status, JournalBinding, JournalDecodeError, JournalEntry, JournalError,
+    journal_status, ImportFlag, JournalBinding, JournalDecodeError, JournalEntry, JournalError,
     JournalResolution, JournalState, JournalStatus, JournaledSuccessorIo, MigrationJournal,
     PendingPredecessor, PolicyFamily, MIGRATION_JOURNAL_KEY, MIGRATION_JOURNAL_VERSION,
 };

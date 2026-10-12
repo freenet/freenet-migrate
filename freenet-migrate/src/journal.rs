@@ -99,8 +99,8 @@
 //! # Concurrency and failure
 //!
 //! The journal is one stored value. Every store is a **read-merge-write**: the
-//! stored journal is re-read and merged (see the merge rules on
-//! [`MigrationJournal`]) before writing, so a second tab or session cannot erase
+//! stored journal is re-read and merged (the rules are on [`MigrationJournal`])
+//! before writing, so a second tab or session cannot erase
 //! a flag or a resolution the first one recorded — except inside the window
 //! between one session's re-read and its write, which a successor without
 //! compare-and-swap cannot close. Every store a walk relies on **fails closed**:
@@ -309,6 +309,19 @@ impl JournalBinding {
 }
 
 /// The durable completeness record for one successor. See the module docs.
+///
+/// Every store merges the stored copy in first, each entry evaluated under the
+/// app's [`JournalBinding`]:
+///
+/// * Between two resolutions, the one recording more of the data in the
+///   successor wins (`Imported` over `ImportedWithRejections` over `NoData` and
+///   `SupersededByAuthoritative`); between two rejection resolutions, the higher
+///   import revision.
+/// * A resolution putting the data in the successor beats a pending entry. One
+///   that does not beats a pending entry unless an import from it
+///   [`Started`](ImportFlag::Started).
+/// * Between two pending entries, the stronger import flag and the larger
+///   attempt count win; the absent streak is the newer observation's.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct MigrationJournal {
     entries: BTreeMap<[u8; 32], JournalEntry>,
