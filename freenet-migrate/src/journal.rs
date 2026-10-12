@@ -777,15 +777,10 @@ impl MigrationJournal {
                 state: JournalState::fresh(),
             });
         let ours = match (entry.state, outcome) {
-            // An import with rejections keeps the count its import saw, and
-            // the count an earlier resolution of it (another session's,
-            // brought in by a re-read) carries.
+            // An import with rejections keeps the count its import saw (a
+            // resolution already stored keeps its own through the merge).
             (
-                JournalState::Pending { items_seen, .. }
-                | JournalState::Resolved(JournalResolution::ImportedWithRejections {
-                    items_seen,
-                    ..
-                }),
+                JournalState::Pending { items_seen, .. },
                 RunOutcome::Resolved(JournalResolution::ImportedWithRejections {
                     rejected,
                     revision,
