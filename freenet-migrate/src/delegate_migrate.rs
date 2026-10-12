@@ -12825,4 +12825,26 @@ mod tests {
         let status = run.status.expect("stored");
         assert!(status.is_complete(), "{status:?}");
     }
+
+    /// Marker reads per run under a snapshot policy: the start's checks are not
+    /// repeated after the walk, and a journal-resolved import's marker is not read.
+    #[test]
+    fn a_snapshot_walk_reads_each_marker_at_most_once() {
+        let lineage = [entry(1, 1), entry(2, 2), entry(3, 3)];
+        let mut w = InspectingWriter::new(&lineage);
+        let mut io = MockIo::default();
+        for e in &lineage {
+            io = io.executable_with(&key_of(e), &[(b"k", b"v")]);
+        }
+        // No journal yet: the start reads all three (one each), the walk reads g3's
+        // (it imports) and stops; g2 and g1 are superseded, already read.
+        assert!(complete(&w.run(&mut io, newest())));
+        let first = w.status_at_marker_reads.len();
+        // A stored journal: the start reads g2 and g1 (resolved as superseded); g3
+        // is resolved imported, so neither it nor the post-walk check reads again.
+        w.status_at_marker_reads.clear();
+        assert!(complete(&w.run(&mut io, newest())));
+        assert_eq!(first, 4, "first run");
+        assert_eq!(w.status_at_marker_reads.len(), 2, "second run");
+    }
 }
