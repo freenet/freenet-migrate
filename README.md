@@ -709,27 +709,34 @@ if !journal_status(stored.as_deref(), DELEGATE_LINEAGE, &binding).is_complete() 
     // later load.
 }
 // `interrupted_import()` of the status as STORED NOW (`run.status`, or, when that
-// is None or the walk did not run, a fresh `journal_status` read after `begin`)
+// is None or the walk did not run, a fresh `journal_status` read after the last
+// journal call)
 // true means: do NOT treat the successor as everything the user had. False does
 // not mean it is: check `rejected_items()` and the report's unresponsive rows
 // too. Never gate on `!is_complete()`, and never on a status read before `begin`.
 ```
 
 `successor` implements `JournaledSuccessorIo`: load and store the journal bytes
-under one key **in your app's own namespace** (a node refuses non-marker keys in
-the crate's reserved one, so the crate ships no delegate-side journal store),
-reports that key from `journal_key()` so the walk never imports a predecessor's
-journal over yours, and optionally an `import_revision` to bump when you find and
-fix a wrong permanent rejection. Its marker store must follow the three-rule
+under `MIGRATION_JOURNAL_KEY` in the successor's secrets (the crate withholds that
+key from every walk and export; a node accepts it, though it refuses non-marker
+keys in the crate's marker namespace, so there is no delegate-side store), and an
+`import_revision` you bump with every change to how your import path decodes
+items. Its marker store must follow the three-rule
 marker contract on `SuccessorSecretsIo::migration_marker` / `record_marker` (see
 the CHANGELOG): break it and a lost journal certifies `Complete` over a partial
 copy. The crate refuses, rather than trusts, a store that visibly breaks it.
 Drive the journal calls one at a time within a session.
 
-**Do not adopt the journal unless your `fetch_secrets` fails loudly** (a
+**Do not adopt the journal unless** your `fetch_secrets` fails loudly (a
 resolution is as permanent as a `Done` marker, so an export that can come back
-partial without an `Err` gets a partial import certified complete), **your
-successor store is durable**, and **your marker store follows the contract**.
+partial without an `Err` gets a partial import certified complete), your
+successor store is durable, your marker store follows the contract, your
+predecessors are frozen, and no older build of your app walks the same
+successor (see the CHANGELOG).
+
+Compose "the successor may not be everything the user had" from: a walk in
+flight, a status not read yet, `begin_migration_journal` erring, or
+`interrupted_import()` on the status as stored now.
 
 What resolves a predecessor is a table in the `journal` module docs. The short
 version: silence and "not installed" never do; a permanent rejection does, with a
@@ -741,7 +748,8 @@ So `Complete` needs every predecessor in the lineage to answer, and one this nod
 never had keeps the journal `Incomplete` indefinitely: the walk keeps asking it on
 every run. Implement `PredecessorSecretsIo::probe_verdict` if your transport can
 tell a definitive "not installed" from silence. That makes each such probe
-immediate, and lets `JournalStatus::pending_all_absent(n)` tell you that every
+immediate (this, not skipping the walk, is what keeps a lineage of absent
+generations cheap), and lets `JournalStatus::pending_all_absent(n)` tell you that every
 remaining predecessor has answered "not installed" `n` times in a row, if you
 want to run the walk less often. Treat that as a rate limit, never a seal:
 "not installed" can also mean the node failed to read the delegate. The crate
@@ -751,7 +759,8 @@ successor state).
 `interrupted_import()` can stay true indefinitely: a predecessor an import
 started from that never answers with data again (it was unregistered, it really
 did become empty, or a snapshot policy later superseded it; a rejection reopened
-by a higher `import_revision` counts too) is never resolved, and the crate has no call to abandon
+by a higher `import_revision` counts too, once a walk has re-asked it) is never
+resolved, and the crate has no call to abandon
 it yet ([#39](https://github.com/freenet/freenet-migrate/issues/39)). An app that
 gates something on `interrupted_import()` must be able to live with that.
 
@@ -779,9 +788,9 @@ gates something on `interrupted_import()` must be able to live with that.
   only an explicit `UnregisterDelegate` removes it — so this is not time-decay;
   it is per-node registration/availability.) A predecessor the reached node never
   registered is indistinguishable from a broken one — both surface as
-  `Unresponsive`, which the app must show rather than silently fresh-installing —
-  unless the adapter implements `probe_verdict` over a node that answers "not
-  installed" definitively (0.7.0).
+  `Unresponsive`, which the app must show rather than silently fresh-installing.
+  A `probe_verdict` answering "not installed" (0.7.0) is reported the same way;
+  it only feeds the journal's absent streak.
   The node-side copy-forward removes the dependency by reading storage directly.
 
 ## Building & testing
@@ -836,8 +845,9 @@ nothing although an earlier attempt saw data is now reported `Unresponsive`
 instead of being sealed as done (see the CHANGELOG before upgrading). Nothing
 needs a code change to compile: every known adopter constructs
 `SecretSelectionPolicy` rather than exhaustively matching it, the new
-`WriterStage::JournalFlag` variant joins a `#[non_exhaustive]` enum, and the
-journal and `probe_verdict` are new API with defaults.
+`WriterStage::JournalFlag` and `JournalUnavailable` variants join a
+`#[non_exhaustive]` enum, and the journal and `probe_verdict` are new API with
+defaults.
 
 ### Adopters
 

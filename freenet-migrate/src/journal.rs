@@ -95,9 +95,11 @@
 //!   revision are evaluated against the app's [`JournalBinding`] on every read
 //!   and every merge, never stored as journal-wide state a stale copy could
 //!   carry back.
-//! * **Resolution is otherwise sticky.** Once resolved, an entry only ever
-//!   changes towards more of its data in the successor (`NoData` to
-//!   `Imported`, say), never back to pending.
+//! * **Resolution is otherwise sticky.** Once resolved, an entry only changes
+//!   towards more of its data in the successor (`NoData` to `Imported`, say),
+//!   with one exception: an import STARTING from a predecessor resolved as not
+//!   in the successor (`NoData`, `SupersededByAuthoritative`) reopens it as an
+//!   import in progress.
 //!
 //! # Concurrency and failure
 //!
@@ -1025,7 +1027,8 @@ pub trait JournaledSuccessorIo: SuccessorSecretsIo {
     /// handle it" (see its docs): under a never-clobber writer, an older
     /// generation's copy of a rejected key may already have landed and will
     /// decline the newer value when it is retried. Only rejection resolutions
-    /// reopen; `Imported` and `NoData` are final.
+    /// reopen on a revision bump (a `NoData` entry reopens only when an import
+    /// from it starts; `Imported` is final).
     fn import_revision(&self) -> u32 {
         0
     }

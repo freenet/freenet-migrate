@@ -632,6 +632,12 @@ pub enum PredecessorImportOutcome {
 /// * `UnionAllGenerations` imports the late-added older predecessor (never-clobber,
 ///   so only keys the successor lacks), which is exactly the ack'd
 ///   delete-by-absence resurrection that policy opts into.
+///
+/// **Data then empty.** A retry that exports nothing although an earlier attempt
+/// saw data returns `Incomplete` with every count zero and seals nothing: the
+/// empty answer is taken for a fault. A caller retrying on `Incomplete` retries
+/// such a predecessor until it answers with data again, for ever if it really
+/// did lose it.
 pub fn import_predecessor_secrets_once<S: SecretStore + ?Sized>(
     store: &mut S,
     predecessor: &DelegateKey,
@@ -708,8 +714,8 @@ pub(crate) fn predecessor_already_migrated<S: SecretStore + ?Sized>(
 }
 
 /// Whether `predecessor` carries an EMPTY completion marker AND an in-progress
-/// marker that saw data. A walk never writes that pair (its data flag is sticky),
-/// so it means an import was started after the empty seal — by the app
+/// marker that saw data. A walk never writes that pair on its own account (its
+/// data flag is sticky), so it means an import was started after the empty seal — by the app
 /// ([`crate::note_app_import_started`]) or by a walk re-asking a predecessor a
 /// journal knows holds data. The empty seal is then wrong, and the predecessor
 /// reads as in progress, never as done.

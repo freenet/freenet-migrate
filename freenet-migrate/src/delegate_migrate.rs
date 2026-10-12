@@ -885,8 +885,9 @@ pub trait SuccessorSecretsIo {
     /// When both a `Done` and an `InProgress` marker are stored, `Done` wins —
     /// with one exception every implementation must honour: an
     /// `InProgress { saw_data: true }` beside a `Done { had_data: false }` reads
-    /// as `InProgress { saw_data: true }`. The walk never writes that pair (its
-    /// data flag is sticky); it means an import started after the empty seal
+    /// as `InProgress { saw_data: true }`. A walk never writes that pair on its
+    /// own account (its data flag is sticky); it means an import started after
+    /// the empty seal
     /// ([`crate::note_app_import_started`], or a walk re-asking a predecessor a
     /// journal knows holds data), so the empty seal is wrong. Reading it as done
     /// would let a lost journal seal that import's missing items away.
@@ -1686,7 +1687,9 @@ where
 /// * A corrupt journal stored: rebuilds it the same way from the markers, which
 ///   record every import that started (the app's too, see
 ///   [`note_app_import_started`]).
-/// * A readable journal stored: writes nothing. It is never reset, so resolutions
+/// * A readable journal stored: writes nothing (unless the lineage has entries it
+///   has never seen, which are read off their markers and added). It is never
+///   reset, so resolutions
 ///   and import flags survive.
 ///
 /// Returns the journal's status under `policy` and the successor's
@@ -1727,7 +1730,9 @@ where
 /// from it **outside** the walk (River's hand-rolled sweep), or merges it into
 /// state a later save would persist. Call it only once the app holds data read
 /// from the predecessor: a predecessor flagged this way that then answers
-/// "nothing" is not believed. Once per predecessor per session is enough; each
+/// "nothing" is not believed. Under a snapshot policy, do not flag a generation
+/// the policy supersedes (an older one behind the newest that holds data): it
+/// can then never resolve, and [`JournalStatus::interrupted_import`] stays true. Once per predecessor per session is enough; each
 /// call costs a journal load, a marker read and a marker write.
 ///
 /// Records it twice: in the journal, and as the predecessor's in-progress

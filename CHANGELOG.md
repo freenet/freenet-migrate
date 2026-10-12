@@ -20,7 +20,8 @@ The minor version bump (not a patch) is the conventional pre-1.0 signal for new
 public enum variants. `SecretSelectionPolicy` was not `#[non_exhaustive]` before
 this release (it is now), so an external exhaustive `match` over it, though none
 is known to exist, would need a new arm; that is technically breaking.
-`WriterStage::JournalFlag` joins an enum that was already `#[non_exhaustive]`.
+`WriterStage::JournalFlag` and `WriterStage::JournalUnavailable` join an enum that
+was already `#[non_exhaustive]`.
 No known adopter's code needs to change to compile: every one constructs the
 policy rather than matching it exhaustively, and the journal is new API. The
 behaviour change above is the one thing to audit.
@@ -138,12 +139,13 @@ of 4 rooms on every later load. Four review rounds of in-session fixes
   says otherwise). Never gate on `!is_complete()`, which absent generations keep
   true for ever.
 
-**Store it in the successor, under a key in your app's own namespace.** The
-crate ships no delegate-side journal store: a node refuses any key in the
-reserved `\0freenet-migrate/` namespace that is not a migration marker. Report
-the key from `JournaledSuccessorIo::journal_key` so the journaled walk never
-imports a predecessor's journal over yours, and keep it out of anything else
-that copies predecessor data (a hand-rolled sweep).
+**Store it in the successor's secrets under `MIGRATION_JOURNAL_KEY`**
+(`\0freenet-migrate-journal/v1`). That namespace is the crate's but not the
+node's (a node refuses any key in the marker namespace `\0freenet-migrate/` that
+is not a marker, which is why there is no delegate-side store, #40). Every walk,
+the plain one included, and `handle_export_request` withhold it, so a
+predecessor's journal is never imported nor counted as its data. Keep it out of
+any copying your app does itself (a hand-rolled sweep).
 
 **Do not adopt the journal unless:**
 
@@ -153,7 +155,17 @@ that copies predecessor data (a hand-rolled sweep).
   "nothing", as in freenet/delta#100) gets a partial import certified complete;
 * **your successor store is durable** (a page-memory marker store cannot hold a
   journal); and
-* **your marker store follows the new contract** below.
+* **your marker store follows the new contract** below;
+* **your predecessors are frozen**: nothing writes to an old generation once its
+  successor is in use, or `Imported` and `NoData` seal over data written later;
+  and
+* **no older build of your app walks the same successor** while the journaled
+  one is in use (old tabs during a UI-only rollout): it still seals over partial
+  copies the journal then believes. Ship the journal with a delegate re-key.
+
+**`import_revision` is part of adopting, not optional.** Any change to how the
+import path decodes items (River's byte-string change, say) must bump it, or
+predecessors it rejected before stay resolved and their items stay missing.
 
 `Complete` needs every predecessor resolved, and a predecessor that is not
 installed on the node never resolves. An account whose lineage includes
@@ -201,7 +213,7 @@ own stores do not follow it today:
    `InProgress { saw_data: true }`.
 
 Break rule 1 and a lost or corrupt journal certifies `Complete` over a partial
-copy. The crate checks it where it matters: `note_app_import_started` and a walk
+copy. A conformance check adopters can run is tracked in #41. The crate checks it where it matters: `note_app_import_started` and a walk
 re-asking an empty seal read the marker back after recording it, and refuse
 (nothing written) if it does not read as recorded.
 
@@ -247,7 +259,7 @@ is not there (freenet/freenet-core#5857).
   * `NewestSnapshotWins` and `...ContinuePastUnresponsive` stop there.
   * `UnionAllGenerations` goes on to older generations, as for any unresponsive
     predecessor, and a never-clobber writer may then keep an older generation's
-    value for a key the newer one also holds.
+    value for a key the newer one also holds (an opt-in halt is tracked in #42).
 * **If your app relies on the walk halting there under Union**, it has to do it
   in its adapter: once a predecessor exports nothing while the successor's
   marker for it says `InProgress { saw_data: true }`, return `Err` from
@@ -266,7 +278,12 @@ is not there (freenet/freenet-core#5857).
   a delegate re-key, or accept that window knowingly.
 * **A legacy generation-keyed import (`import_secrets_once`) interrupted part-way
   is invisible to the journal,** which reads only the per-predecessor markers.
-  Do not mix the two APIs on one successor.
+  Do not mix the two APIs on one successor. A legacy at-or-above seal (a
+  generation-keyed marker for a NEWER generation) is journalled as superseded,
+  never as imported, so it reopens under Union.
+* **A lost journal re-walks a predecessor resolved with rejections.** It has no
+  `Done` marker, so its rebuilt entry is an import in progress and its items are
+  offered again, which can bring back keys deleted since.
 * **A re-asked predecessor cannot undo what ran in the meantime.** Under a
   snapshot policy, a predecessor first answering empty lets the same run import
   an older generation; when the newer one is later re-asked (it held data after
