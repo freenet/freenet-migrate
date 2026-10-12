@@ -871,8 +871,7 @@ Targets current stdlib **0.8.x**.
 is no longer absence ([#19]). See [Upgrading to 0.6.0](#upgrading-to-060) and the
 CHANGELOG.
 
-**Unreleased: 0.7.0** (publish gated on
-[#43](https://github.com/freenet/freenet-migrate/issues/43)), on the **delegate** half: the new
+**0.7.0** (published 2026-10-12), on the **delegate** half: the new
 `NewestSnapshotWinsContinuePastUnresponsive` policy variant ([#14]) and the
 opt-in completeness journal ([#37]), both optional per app, plus one behaviour
 change every adopter of the delegate walk gets. A predecessor that exports
@@ -899,6 +898,9 @@ Six apps now use the crate, and both halves have adopters. Pins as of
 | [Atlas](https://github.com/freenet/atlas) | 0.6 | 0.2.0 | contract |
 | [Harvest](https://github.com/freenet/harvest) | 0.6 | 0.2 | delegate + contract |
 | [freenet-git](https://github.com/freenet/freenet-git) | none | 0.2.0 | contract (registry codegen) |
+
+[freenet/river#768](https://github.com/freenet/river/pull/768) (open) moves River's UI to 0.7 and
+adopts the completeness journal; the River row above is its pin until that merges.
 
 River and Delta each run the crate alongside the hand-rolled sweep they
 already had, a deliberate dual-running period that ends when the walk is

@@ -1,9 +1,6 @@
 # Changelog
 
-## freenet-migrate 0.7.0
-
-**Unreleased; publish gated on #43** (this release's #44 change, then River's
-real-node rehearsal against main, with real WASM).
+## freenet-migrate 0.7.0 (2026-10-12)
 
 **Delegate half only.** Two features and one behaviour change:
 

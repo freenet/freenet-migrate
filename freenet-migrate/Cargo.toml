@@ -1,6 +1,5 @@
 [package]
 name = "freenet-migrate"
-# Unpublished: do not publish until freenet/freenet-migrate#43 is closed.
 version = "0.7.0"
 edition = "2021"
 # u64::is_multiple_of (and CI clippy expects it) — needs 1.87+.
