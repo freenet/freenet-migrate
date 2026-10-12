@@ -13233,4 +13233,30 @@ mod tests {
         ))
         .expect("the lineage's generation is accepted");
     }
+
+    /// A renumber with no new entry (the same keys, numbered differently: a
+    /// registry moving to explicit `V<n>` versions) is stored too.
+    #[test]
+    fn begin_stores_a_pure_renumber() {
+        let (a0, b1) = (entry(0, 10), entry(1, 11));
+        let mut store = MemStore::default();
+        block_on(begin_migration_journal(
+            &mut store_io(&mut store),
+            &[a0, b1],
+            &union(),
+        ))
+        .expect("begin");
+        let (mut a5, mut b6) = (a0, b1);
+        a5.generation = 5;
+        b6.generation = 6;
+        block_on(begin_migration_journal(
+            &mut store_io(&mut store),
+            &[a5, b6],
+            &union(),
+        ))
+        .expect("begin");
+        let stored = stored_journal(&store);
+        assert_eq!(stored.entry(&key_of(&a5)).map(|e| e.generation), Some(5));
+        assert_eq!(stored.entry(&key_of(&b6)).map(|e| e.generation), Some(6));
+    }
 }
