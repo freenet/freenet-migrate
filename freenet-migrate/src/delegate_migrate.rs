@@ -13848,4 +13848,184 @@ mod tests {
         ))
         .expect("reopened by the higher revision");
     }
+
+    // ---- round-14 probes --------------------------------------------------------
+
+    /// Plain NewestSnapshotWins refuses an older flag behind ANY newer generation
+    /// that has not answered, so a bare `NotImportable` from it proves nothing about
+    /// the data checks. These probes therefore make every other newer generation
+    /// known-empty and assert the refusal REASON is the data, under both snapshot
+    /// policies, for every way the guard can learn a newer generation holds data.
+    fn r14_reason(r: Result<(), JournalError>, ctx: &str) {
+        match r {
+            Err(JournalError::NotImportable(m)) => assert!(
+                m.contains("authoritative snapshot"),
+                "{ctx}: refused for the wrong reason: {m}"
+            ),
+            other => panic!("{ctx}: expected a data refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn r14_p1_every_way_a_newer_generation_holds_data_refuses_under_both_policies() {
+        for make in [newest as fn() -> SecretSelectionPolicy, r10_cpu] {
+            for three in [false, true] {
+                for holder_is_top in [true, false] {
+                    if !three && !holder_is_top {
+                        continue;
+                    }
+                    for source in 0..9u8 {
+                        let (g1, g2, g3) = (entry(1, 1), entry(2, 2), entry(3, 3));
+                        let lineage: Vec<_> = if three {
+                            vec![g1, g2, g3]
+                        } else {
+                            vec![g1, g2]
+                        };
+                        let holder = if !three || !holder_is_top { g2 } else { g3 };
+                        let other: Option<DelegateLineageEntry> = if three {
+                            Some(if holder_is_top { g2 } else { g3 })
+                        } else {
+                            None
+                        };
+                        let ctx = format!(
+                            "policy_nsw={} three={three} top={holder_is_top} source={source}",
+                            make().unresponsive_terminates(false)
+                        );
+                        let mut store = MemStore::default();
+                        block_on(begin_migration_journal(
+                            &mut store_io(&mut store),
+                            &lineage,
+                            &make(),
+                        ))
+                        .expect("begin");
+                        let hk = key_of(&holder);
+                        let mut j = MigrationJournal::new_pending(&lineage);
+                        if let Some(o) = other {
+                            j.record(
+                                &key_of(&o),
+                                1,
+                                RunOutcome::Resolved(JournalResolution::NoData),
+                            );
+                            store.set_secret(
+                                &pred_done_marker(&key_of(&o)),
+                                PRED_DONE_MARKER_VALUE_EMPTY,
+                            );
+                        }
+                        match source {
+                            0 => {
+                                j.record(&hk, 1, RunOutcome::Resolved(JournalResolution::Imported))
+                            }
+                            1 => j.record(
+                                &hk,
+                                1,
+                                RunOutcome::Resolved(JournalResolution::ImportedWithRejections {
+                                    rejected: 1,
+                                    revision: 0,
+                                }),
+                            ),
+                            _ => {}
+                        }
+                        put_journal(&mut store, &j);
+                        match source {
+                            2 => {
+                                // a journal flag with no marker behind it
+                                r12_flag(&mut store, &lineage, &hk, &r10_cpu()).expect("holder");
+                                store.data.remove(&pred_wip_marker(&hk));
+                            }
+                            3 => {
+                                store
+                                    .set_secret(&pred_wip_marker(&hk), PRED_DONE_MARKER_VALUE_DATA);
+                            }
+                            4 => {
+                                store.set_secret(
+                                    &pred_done_marker(&hk),
+                                    PRED_DONE_MARKER_VALUE_DATA,
+                                );
+                            }
+                            5 => {
+                                store.set_secret(&done_marker(holder.generation), b"1");
+                            }
+                            6 => {
+                                // resolved empty, contradicted by an in-progress data marker
+                                let mut j2 = stored_journal(&store);
+                                j2.record(&hk, 1, RunOutcome::Resolved(JournalResolution::NoData));
+                                put_journal(&mut store, &j2);
+                                store
+                                    .set_secret(&pred_wip_marker(&hk), PRED_DONE_MARKER_VALUE_DATA);
+                            }
+                            7 => {
+                                // resolved empty, contradicted by a data seal
+                                let mut j2 = stored_journal(&store);
+                                j2.record(&hk, 1, RunOutcome::Resolved(JournalResolution::NoData));
+                                put_journal(&mut store, &j2);
+                                store.set_secret(
+                                    &pred_done_marker(&hk),
+                                    PRED_DONE_MARKER_VALUE_DATA,
+                                );
+                            }
+                            8 => {
+                                // a legacy seal AND the flagged generation's own data seal
+                                store.set_secret(&done_marker(holder.generation), b"1");
+                                store.set_secret(
+                                    &pred_done_marker(&key_of(&g1)),
+                                    PRED_DONE_MARKER_VALUE_DATA,
+                                );
+                            }
+                            _ => {}
+                        }
+                        let before = store.get_secret(MIGRATION_JOURNAL_KEY);
+                        let r = r12_flag(&mut store, &lineage, &key_of(&g1), &make());
+                        r14_reason(r, &ctx);
+                        assert_eq!(
+                            store.get_secret(MIGRATION_JOURNAL_KEY),
+                            before,
+                            "{ctx}: wrote"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// A newer rejection a higher import revision reopened still holds the rest of
+    /// its data. The guard's JOURNAL pass must say so by itself: the marker pass is
+    /// a second line of defence, so the markers are removed here. Both policies,
+    /// and the reason must be the data (plain NewestSnapshotWins would otherwise
+    /// refuse the unanswered entry for a different reason and hide a broken arm).
+    #[test]
+    fn r14_p2_a_reopened_rejection_refuses_on_the_journal_alone() {
+        for make in [newest as fn() -> SecretSelectionPolicy, r10_cpu] {
+            let (g1, g2) = (entry(1, 1), entry(2, 2));
+            let lineage = [g1, g2];
+            let mut w = InspectingWriter::new(&lineage);
+            w.permanent_fail.insert(b"room:x".to_vec());
+            let mut io = MockIo::default()
+                .executable_with(&key_of(&g2), &[(b"room:x", b"NEWX"), (b"room:y", b"Y")])
+                .executable_with(&key_of(&g1), &[(b"room:x", b"OLDX")]);
+            let _ = w.run(&mut io, make());
+            w.permanent_fail.clear();
+            w.revision = 1;
+            // What a walk at the higher revision stores: the resolution reopened.
+            let mut reopened = stored_journal(&w.store);
+            reopened.rebind(&JournalBinding::new(&make(), 1));
+            put_journal(&mut w.store, &reopened);
+            assert!(
+                matches!(
+                    state_of(&w.store, &g2),
+                    JournalState::Pending { rejected, .. } if rejected > 0
+                ),
+                "{:?}",
+                state_of(&w.store, &g2)
+            );
+            w.store.data.remove(&pred_done_marker(&key_of(&g2)));
+            w.store.data.remove(&pred_wip_marker(&key_of(&g2)));
+            let r = block_on(note_app_import_started(
+                &mut w,
+                &lineage,
+                &key_of(&g1),
+                &make(),
+            ));
+            r14_reason(r, "reopened rejection, no markers");
+        }
+    }
 }
