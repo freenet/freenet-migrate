@@ -140,12 +140,17 @@ of 4 rooms on every later load. Four review rounds of in-session fixes
   true for ever.
 
 **Store it in the successor's secrets under `MIGRATION_JOURNAL_KEY`**
-(`\0freenet-migrate-journal/v1`). That namespace is the crate's but not the
-node's (a node refuses any key in the marker namespace `\0freenet-migrate/` that
-is not a marker, which is why there is no delegate-side store, #40). Every walk,
-the plain one included, and `handle_export_request` withhold it, so a
-predecessor's journal is never imported nor counted as its data. Keep it out of
-any copying your app does itself (a hand-rolled sweep).
+(`\0freenet-migrate-journal/v1`). That namespace is the crate's, not the
+node's: a node refuses any key in the marker namespace `\0freenet-migrate/` that
+is not a marker, but accepts this one. Every walk, the plain one included, and
+`handle_export_request` withhold it, so a predecessor's journal is never
+imported nor counted as its data; `is_reserved_key` tells an app's own code the
+same. Keep it out of any copying your app does itself (a hand-rolled sweep).
+The crate does not ship a delegate-side store (`SecretStoreIo` does not
+implement `JournaledSuccessorIo`; #40).
+
+This reserves a second namespace for every adopter, not only journal users: a
+key beginning with `\0freenet-migrate-journal/` is never exported or imported.
 
 **Do not adopt the journal unless:**
 
@@ -162,6 +167,14 @@ any copying your app does itself (a hand-rolled sweep).
 * **no older build of your app walks the same successor** while the journaled
   one is in use (old tabs during a UI-only rollout): it still seals over partial
   copies the journal then believes. Ship the journal with a delegate re-key.
+  (Even then, an old tab keeps writing to what is now a predecessor until it is
+  closed, so "frozen" holds only after the rollout; data written there in the
+  window is the app's to reconcile.)
+* **under a snapshot policy, every predecessor finished its own migration**
+  before it became one. A newer predecessor that was itself interrupted
+  mid-migration is still taken as the authoritative snapshot, and what it never
+  received from older generations is not asked for. Union does not have this
+  limit.
 
 **`import_revision` is part of adopting, not optional.** Any change to how the
 import path decodes items (River's byte-string change, say) must bump it, or
@@ -213,7 +226,8 @@ own stores do not follow it today:
    `InProgress { saw_data: true }`.
 
 Break rule 1 and a lost or corrupt journal certifies `Complete` over a partial
-copy. A conformance check adopters can run is tracked in #41. The crate checks it where it matters: `note_app_import_started` and a walk
+copy. The crate checks rule 1 by reading the marker back where it matters; it
+checks rule 3 nowhere. A conformance check adopters can run is tracked in #41. The crate checks it where it matters: `note_app_import_started` and a walk
 re-asking an empty seal read the marker back after recording it, and refuse
 (nothing written) if it does not read as recorded.
 

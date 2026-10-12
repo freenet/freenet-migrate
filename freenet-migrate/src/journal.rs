@@ -99,7 +99,8 @@
 //!   towards more of its data in the successor (`NoData` to `Imported`, say),
 //!   with one exception: an import STARTING from a predecessor resolved as not
 //!   in the successor (`NoData`, `SupersededByAuthoritative`) reopens it as an
-//!   import in progress.
+//!   import in progress. (A rejection a higher revision reopened is pending, not
+//!   resolved, so a concurrent stale session's `NoData` can still replace it.)
 //!
 //! # Concurrency and failure
 //!
@@ -131,8 +132,10 @@
 //!   reports a failed secret read as "not found" (freenet/freenet-core#5857), so
 //!   the export is empty and the predecessor resolves `NoData`. Only once an
 //!   attempt has seen data is a later "nothing" refused.
-//! * It does not bind a journal to the successor it is stored in. Store it under
-//!   a key the predecessor adapter never offers for import.
+//! * It does not bind a journal to the successor it is stored in. The crate
+//!   withholds [`MIGRATION_JOURNAL_KEY`] (its whole namespace) from every walk
+//!   and export; an app copying predecessor data itself must skip it too
+//!   ([`crate::is_reserved_key`]).
 
 use std::collections::BTreeMap;
 use std::future::Future;

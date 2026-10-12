@@ -847,6 +847,14 @@ pub(crate) fn is_marker(key: &[u8]) -> bool {
     key.starts_with(MARKER_NS) || key.starts_with(JOURNAL_NS)
 }
 
+/// Whether `key` is reserved by the crate (a migration marker, or the
+/// migration journal): never an app's data, never exported, never imported. An
+/// app that copies predecessor data itself (a hand-rolled sweep, an adapter
+/// listing a predecessor's keys) should skip these too.
+pub fn is_reserved_key(key: &[u8]) -> bool {
+    is_marker(key)
+}
+
 /// The in-progress marker key for a source generation.
 fn wip_marker(generation: u32) -> Vec<u8> {
     let mut k = WIP_PREFIX.to_vec();

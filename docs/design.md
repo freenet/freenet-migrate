@@ -211,8 +211,14 @@ copy-forward that writes `predecessor_done_marker`s makes the journaled walk see
 `AlreadyMigrated`, which resolves from the marker's `had_data`, so every
 predecessor the copy reached resolves with no app change. (One the node never had
 stays pending, as always.) Absence (silence or "not installed") never
-resolves a journal entry, for the same reason it never seals a marker. A node copy-forward that copied raw secrets would also copy a predecessor's
-`MIGRATION_JOURNAL_KEY`; the walk withholds it, a raw copy would not (see #40).
+resolves a journal entry, for the same reason it never seals a marker.
+
+A node copy-forward that copied a predecessor's raw secrets would carry its
+`MIGRATION_JOURNAL_KEY` too (only the crate filters that namespace, not the
+node), installing the predecessor's journal as the successor's when the
+successor has none. That is mostly benign (the journal's data travels with it,
+and the predecessor's own entry is absent, so it reads pending), but the copy
+should exclude the namespace (#40).
 
 Hosted per-user secrets stay un-migratable at rest even under a node-mediated
 copy (their DEK keying material is the user's secret, deliberately not the node

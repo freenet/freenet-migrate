@@ -717,9 +717,9 @@ if !journal_status(stored.as_deref(), DELEGATE_LINEAGE, &binding).is_complete() 
 ```
 
 `successor` implements `JournaledSuccessorIo`: load and store the journal bytes
-under `MIGRATION_JOURNAL_KEY` in the successor's secrets (the crate withholds that
-key from every walk and export; a node accepts it, though it refuses non-marker
-keys in the crate's marker namespace, so there is no delegate-side store), and an
+under `MIGRATION_JOURNAL_KEY` in the successor's secrets (a node accepts the key;
+the crate withholds it from every walk and export, and `is_reserved_key` tells
+your own code the same; the crate ships no delegate-side store), and an
 `import_revision` you bump with every change to how your import path decodes
 items. Its marker store must follow the three-rule
 marker contract on `SuccessorSecretsIo::migration_marker` / `record_marker` (see
@@ -748,8 +748,9 @@ So `Complete` needs every predecessor in the lineage to answer, and one this nod
 never had keeps the journal `Incomplete` indefinitely: the walk keeps asking it on
 every run. Implement `PredecessorSecretsIo::probe_verdict` if your transport can
 tell a definitive "not installed" from silence. That makes each such probe
-immediate (this, not skipping the walk, is what keeps a lineage of absent
-generations cheap), and lets `JournalStatus::pending_all_absent(n)` tell you that every
+immediate, though every walk still reads each predecessor's marker and stores
+the journal; only running the walk less often (a cadence) makes a lineage of
+absent generations cheap. It also lets `JournalStatus::pending_all_absent(n)` tell you that every
 remaining predecessor has answered "not installed" `n` times in a row, if you
 want to run the walk less often. Treat that as a rate limit, never a seal:
 "not installed" can also mean the node failed to read the delegate. The crate
@@ -758,11 +759,21 @@ successor state).
 
 `interrupted_import()` can stay true indefinitely: a predecessor an import
 started from that never answers with data again (it was unregistered, it really
-did become empty, or a snapshot policy later superseded it; a rejection reopened
-by a higher `import_revision` counts too, once a walk has re-asked it) is never
-resolved, and the crate has no call to abandon
+did become empty, or a snapshot policy later superseded it, which under
+`NewestSnapshotWinsContinuePastUnresponsive` follows from an ordinary transient
+silence of the newest generation while an older one was being imported; a
+rejection reopened by a higher `import_revision` counts too, once a walk has
+re-asked it) is never resolved, and the crate has no call to abandon
 it yet ([#39](https://github.com/freenet/freenet-migrate/issues/39)). An app that
 gates something on `interrupted_import()` must be able to live with that.
+
+Nor does `interrupted_import()` cover a predecessor that has never answered: it
+may hold everything the user had, with nothing partially written. It shows as a
+pending entry with no import flag (`absent_streak` 0 if it was silent rather
+than "not installed"). Whether that blocks anything (a fresh install, say) is the
+app's rule to state, from the pending list. Inside the no-compare-and-swap window
+between two sessions' journal stores, `interrupted_import()` can also be briefly
+false over a partial copy; `Complete` is still never claimed then.
 
 ### Known limitations
 

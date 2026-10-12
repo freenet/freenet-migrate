@@ -331,6 +331,13 @@ pub enum SecretSelectionPolicy {
     /// Construct the ack only if this risk is acceptable for this app, or if
     /// silence has already been established as the ordinary case (an
     /// unregistered legacy delegate) rather than a transient fault.
+    ///
+    /// With a migration journal: a transient silence of the newest generation
+    /// lets an older one start importing; if that import is interrupted and the
+    /// newest then answers, the older one is superseded with its import
+    /// [`Started`](crate::ImportFlag::Started), and
+    /// [`JournalStatus::interrupted_import`] stays true (no call abandons it yet,
+    /// freenet/freenet-migrate#39).
     NewestSnapshotWinsContinuePastUnresponsive(RollbackRiskAck),
     /// **Opt-in recovery.** Import *every* predecessor newest-first, with the
     /// newest generation's value winning any key conflict **only because the app's
@@ -11068,5 +11075,17 @@ mod tests {
         );
         writer.run(&mut io, union());
         assert_eq!(writer.offered, vec![b"room:a".to_vec()]);
+    }
+
+    /// `is_reserved_key` answers for both reserved namespaces, and for nothing
+    /// else.
+    #[test]
+    fn is_reserved_key_covers_markers_and_the_journal() {
+        assert!(crate::is_reserved_key(MIGRATION_JOURNAL_KEY));
+        assert!(crate::is_reserved_key(&pred_wip_marker(&key_of(&entry(
+            1, 1
+        )))));
+        assert!(!crate::is_reserved_key(b"room:a"));
+        assert!(!crate::is_reserved_key(b"\0freenet-migrat"));
     }
 }

@@ -87,7 +87,7 @@ pub use contract::{
     resolve_predecessors, CarryForward, PermissiveValidatorAck, Resolution,
 };
 pub use delegate::{
-    handle_export_request, import_predecessor_secrets_once, import_secrets_once,
+    handle_export_request, import_predecessor_secrets_once, import_secrets_once, is_reserved_key,
     predecessor_delegate_keys, predecessor_delegate_keys_checked, predecessor_done_marker,
     predecessor_migration_had_data, ExportRequest, ExportScope, ExportedSecrets, ImportOutcome,
     OriginPolicy, PredecessorImportOutcome, SecretPair, SecretStore, SingleAppDelegateAck,
