@@ -196,6 +196,7 @@ pub enum JournalResolution {
     /// permanently refuses. Surface the count. Reopens when the writer's
     /// [`import_revision`](JournaledSuccessorIo::import_revision) rises above
     /// `revision`.
+    #[non_exhaustive]
     ImportedWithRejections {
         /// How many items were permanently rejected on the resolving run.
         rejected: u32,
@@ -258,6 +259,7 @@ impl ImportFlag {
 #[non_exhaustive]
 pub enum JournalState {
     /// Not yet resolved. The walk must run again.
+    #[non_exhaustive]
     Pending {
         /// How many journaled walks examined it and left it unresolved.
         attempts: u32,
@@ -293,6 +295,7 @@ impl JournalState {
 
 /// One journal entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct JournalEntry {
     /// The predecessor's lineage generation.
     pub generation: u32,
@@ -735,6 +738,18 @@ impl MigrationJournal {
     /// With a `binding`, both sides are first evaluated under it, so a resolution
     /// that no longer holds cannot win the merge. Without one (a caller that does
     /// not know the policy), states merge as stored.
+    /// Set `predecessor`'s generation to the lineage's, where it differs (a
+    /// lineage renumbered since the entry was written). Whether it changed.
+    pub(crate) fn sync_generation(&mut self, predecessor: &DelegateKey, generation: u32) -> bool {
+        match self.entries.get_mut(&key_bytes(predecessor)) {
+            Some(e) if e.generation != generation => {
+                e.generation = generation;
+                true
+            }
+            _ => false,
+        }
+    }
+
     pub(crate) fn merge_stored(
         &mut self,
         stored: &MigrationJournal,
@@ -881,6 +896,7 @@ fn lineage_key(e: &DelegateLineageEntry) -> DelegateKey {
 
 /// A predecessor the journal does not yet consider resolved.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PendingPredecessor {
     /// The predecessor delegate key.
     pub key: DelegateKey,

@@ -1814,8 +1814,9 @@ fn status_with_unverified(
 ///
 /// [`JournalError::NotImportable`]: the predecessor is not in the lineage (or
 /// `generation` is not its generation there), or the snapshot policy supersedes
-/// it (a newer generation's data, or a legacy seal for
-/// one, is the authoritative snapshot). Do not import from it.
+/// it (a newer generation's data, an import from a newer generation under way,
+/// or a legacy seal for a newer one, is the authoritative snapshot). Do not
+/// import from it.
 pub async fn note_app_import_started<W>(
     successor: &mut W,
     predecessor: &DelegateKey,
@@ -1864,13 +1865,19 @@ where
     }
     let binding = JournalBinding::new(policy, successor.import_revision());
     journal.rebind(&binding);
-    // Under a snapshot policy a newer generation resolved with its data in the
-    // successor is the authoritative snapshot: this one is superseded, and a flag
-    // on it could never resolve.
+    // Under a snapshot policy a newer generation that holds data is the
+    // authoritative snapshot: resolved with its data in the successor, or with an
+    // import from it under way (which the walk finishes before it looks at older
+    // ones). This one is superseded, and a flag on it could never resolve.
     if binding.policy == crate::journal::PolicyFamily::NewestSnapshot
         && journal.entries().any(|(_, e)| {
             e.generation > generation
-                && matches!(e.state, JournalState::Resolved(r) if r.is_data_bearing())
+                && match e.state {
+                    JournalState::Resolved(r) => r.is_data_bearing(),
+                    JournalState::Pending { import, .. } => {
+                        import == crate::journal::ImportFlag::Started
+                    }
+                }
         })
     {
         return Err(JournalError::NotImportable(
@@ -2237,10 +2244,14 @@ where
                 // predecessor must not stop the newer ones migrating; the walk
                 // itself still halts at a pending one it cannot read); the entry is
                 // left as stored and reported unverified.
-                let mut reopened = false;
+                let mut changed = false;
                 let mut checks = MarkerChecks::default();
                 for e in predecessors {
                     let key = DelegateKey::new(e.delegate_key, CodeHash::new(e.code_hash));
+                    // A lineage renumbered since (a forgotten generation inserted):
+                    // the entry takes the lineage's generation, which is what the
+                    // app passes to `note_app_import_started`.
+                    changed |= journal.sync_generation(&key, e.generation);
                     let non_data = matches!(
                         journal.entry(&key).map(|x| x.state),
                         Some(JournalState::Resolved(r)) if !r.is_data_bearing()
@@ -2254,7 +2265,7 @@ where
                                 marker,
                                 Some(MigrationMarker::InProgress { saw_data: true })
                             ) {
-                                reopened |= journal.mark_import_started(&key, e.generation);
+                                changed |= journal.mark_import_started(&key, e.generation);
                             }
                             checks.read.push(key);
                         }
@@ -2279,7 +2290,7 @@ where
                     .collect();
                 if unseen.is_empty() {
                     return Ok((
-                        if reopened {
+                        if changed {
                             Started::New(journal)
                         } else {
                             Started::Existing(journal)
