@@ -13437,4 +13437,26 @@ mod tests {
             Err(JournalError::Successor(_))
         ));
     }
+
+    /// A predecessor in the caller's lineage that the journal has no entry for
+    /// (the lineage grew and `begin` has not run with it): "begin first", a plain
+    /// failure, and nothing is recorded.
+    #[test]
+    fn an_app_flag_before_begin_saw_the_grown_lineage_is_a_plain_failure() {
+        let (g1, g2) = (entry(1, 1), entry(2, 2));
+        let mut store = MemStore::default();
+        block_on(begin_migration_journal(
+            &mut store_io(&mut store),
+            &[g1],
+            &union(),
+        ))
+        .expect("begin");
+        let before = store.get_secret(MIGRATION_JOURNAL_KEY);
+        assert!(matches!(
+            r12_flag(&mut store, &[g1, g2], &key_of(&g2), &union()),
+            Err(JournalError::Successor(_))
+        ));
+        assert_eq!(store.get_secret(MIGRATION_JOURNAL_KEY), before);
+        assert!(store.get_secret(&pred_wip_marker(&key_of(&g2))).is_none());
+    }
 }
