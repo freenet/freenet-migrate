@@ -212,6 +212,10 @@ pub enum JournalResolution {
         rejected: u32,
         /// The writer's import revision on that run.
         revision: u32,
+        /// The most items an attempt that started this import saw the
+        /// predecessor export, carried into the pending entry a higher revision
+        /// reopens it as (#44).
+        items_seen: u32,
     },
     /// It was not imported because a newer predecessor, itself resolved and
     /// data-bearing (or a legacy generation-keyed seal for one), supplied the
@@ -423,7 +427,8 @@ struct WireEntry {
     absent_streak: u32,
     rejected: u32,
     revision: u32,
-    /// Pending entries only; absent (0) in a journal written before #44.
+    /// Pending and imported-with-rejections entries only; absent (0) in a journal
+    /// written before #44.
     #[serde(default)]
     items_seen: u32,
 }
@@ -601,10 +606,12 @@ impl MigrationJournal {
                         JournalState::Resolved(JournalResolution::ImportedWithRejections {
                             rejected,
                             revision,
+                            items_seen,
                         }) => {
                             w.state = 4;
                             w.rejected = rejected;
                             w.revision = revision;
+                            w.items_seen = items_seen;
                         }
                         JournalState::Resolved(JournalResolution::SupersededByAuthoritative) => {
                             w.state = 5
@@ -661,6 +668,7 @@ impl MigrationJournal {
                 4 => JournalState::Resolved(JournalResolution::ImportedWithRejections {
                     rejected: w.rejected,
                     revision: w.revision,
+                    items_seen: w.items_seen,
                 }),
                 5 => JournalState::Resolved(JournalResolution::SupersededByAuthoritative),
                 other => {
@@ -767,6 +775,19 @@ impl MigrationJournal {
                 state: JournalState::fresh(),
             });
         let ours = match (entry.state, outcome) {
+            // An import with rejections keeps the count its import saw.
+            (
+                JournalState::Pending { items_seen, .. },
+                RunOutcome::Resolved(JournalResolution::ImportedWithRejections {
+                    rejected,
+                    revision,
+                    items_seen: resolved_seen,
+                }),
+            ) => JournalState::Resolved(JournalResolution::ImportedWithRejections {
+                rejected,
+                revision,
+                items_seen: items_seen.max(resolved_seen),
+            }),
             (_, RunOutcome::Resolved(r)) => JournalState::Resolved(r),
             (
                 JournalState::Pending {
@@ -841,12 +862,13 @@ fn effective(state: JournalState, binding: &JournalBinding) -> JournalState {
         JournalState::Resolved(JournalResolution::ImportedWithRejections {
             revision,
             rejected,
+            items_seen,
         }) if revision < binding.import_revision => JournalState::Pending {
             attempts: 0,
             import: ImportFlag::None,
             absent_streak: 0,
             rejected,
-            items_seen: 0,
+            items_seen,
         },
         other => other,
     }

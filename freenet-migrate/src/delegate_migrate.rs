@@ -2610,9 +2610,20 @@ where
         generation: u32,
         items: Option<u32>,
     ) -> Result<(), String> {
+        // A retry (an import already under way) re-reads the stored journal before
+        // its first item even when nothing here changes, so a larger count
+        // another session stored since this run loaded the journal holds it.
+        let retry = items.is_some()
+            && matches!(
+                self.journal.entry(predecessor).map(|e| e.state),
+                Some(JournalState::Pending {
+                    import: crate::journal::ImportFlag::Started,
+                    ..
+                })
+            );
         let flagged = self.journal.mark_import_started(predecessor, generation);
         let counted = items.is_some_and(|n| self.journal.note_items_seen(predecessor, n));
-        if !flagged && !counted {
+        if !flagged && !counted && !retry {
             return Ok(());
         }
         match store_merged(
@@ -2691,6 +2702,7 @@ fn resolve_outcomes(
                 Some(JournalResolution::ImportedWithRejections {
                     rejected: u32::try_from(tally.rejected).unwrap_or(u32::MAX),
                     revision: import_revision,
+                    items_seen: 0,
                 })
             }
             // Superseded only resolves when THIS run proves why: under a snapshot
@@ -3154,8 +3166,17 @@ where
             // rest would never be asked for again. Treat it as a silence: no
             // marker change, so the in-progress marker survives and a later run
             // asks again.
+            // Distinct keys: a key listed twice in one export must not raise the
+            // count every later export is held to.
             let items_seen = observer.items_seen(&key);
-            let exported = u32::try_from(items.len()).unwrap_or(u32::MAX);
+            let exported = u32::try_from(
+                items
+                    .iter()
+                    .map(|(k, _)| k.as_slice())
+                    .collect::<BTreeSet<_>>()
+                    .len(),
+            )
+            .unwrap_or(u32::MAX);
             if prior_saw_data && (items.is_empty() || exported < items_seen) {
                 results.push(PredecessorMigration::Unresponsive {
                     key,
@@ -3192,6 +3213,20 @@ where
                         },
                     });
                     terminated = true;
+                    continue;
+                }
+                // That store re-read the journal: another session may have seen
+                // more since this run loaded it.
+                let items_seen = observer.items_seen(&key);
+                if exported < items_seen {
+                    results.push(PredecessorMigration::Unresponsive {
+                        key,
+                        generation,
+                        error: Some(format!(
+                            "{EXPORTED_FEWER_AFTER_DATA}: {exported} of {items_seen}"
+                        )),
+                    });
+                    terminated = policy.unresponsive_terminates(true);
                     continue;
                 }
             }
@@ -7407,13 +7442,14 @@ mod tests {
             run.status,
             Some(JournalStatus::Complete { rejected_items: 1 })
         );
-        assert_eq!(
+        assert!(matches!(
             state_of(&writer.store, &lineage[0]),
             JournalState::Resolved(JournalResolution::ImportedWithRejections {
                 rejected: 1,
-                revision: 0
+                revision: 0,
+                ..
             })
-        );
+        ));
     }
 
     /// The writer's import revision rising reopens a predecessor resolved with
@@ -7959,6 +7995,7 @@ mod tests {
             resolved(JournalResolution::ImportedWithRejections {
                 rejected: 7,
                 revision: 3,
+                items_seen: 0,
             }),
             resolved(JournalResolution::SupersededByAuthoritative),
             RunOutcome::Unresolved { absent: true },
@@ -8132,13 +8169,14 @@ mod tests {
             run.status,
             Some(JournalStatus::Complete { rejected_items: 1 })
         );
-        assert_eq!(
+        assert!(matches!(
             state_of(&writer.store, &lineage[0]),
             JournalState::Resolved(JournalResolution::ImportedWithRejections {
                 rejected: 1,
-                revision: 1
+                revision: 1,
+                ..
             })
-        );
+        ));
     }
 
     /// After a revision bump, a silent predecessor keeps the reopened rejection
@@ -8179,13 +8217,14 @@ mod tests {
             run.status,
             Some(JournalStatus::Complete { rejected_items: 2 })
         );
-        assert_eq!(
+        assert!(matches!(
             state_of(&writer.store, &lineage[0]),
             JournalState::Resolved(JournalResolution::ImportedWithRejections {
                 rejected: 2,
-                revision: 2
+                revision: 2,
+                ..
             })
-        );
+        ));
         assert_eq!(
             journal_status(
                 writer.store.get_secret(MIGRATION_JOURNAL_KEY).as_deref(),
@@ -8719,13 +8758,14 @@ mod tests {
         // (the predecessor has no done marker, so it is retried) and rejects again.
         writer.revision = 0;
         writer.run(&mut io, union());
-        assert_eq!(
+        assert!(matches!(
             state_of(&writer.store, &lineage[0]),
             JournalState::Resolved(JournalResolution::ImportedWithRejections {
                 rejected: 1,
-                revision: 1
+                revision: 1,
+                ..
             })
-        );
+        ));
     }
 
     // -- round 3 of the #38 review --------------------------------------------------
@@ -9015,6 +9055,7 @@ mod tests {
             resolved(JournalResolution::ImportedWithRejections {
                 rejected: 2,
                 revision: 0,
+                items_seen: 0,
             }),
         );
         journal.record(
@@ -9023,6 +9064,7 @@ mod tests {
             resolved(JournalResolution::ImportedWithRejections {
                 rejected: 1,
                 revision: 0,
+                items_seen: 0,
             }),
         );
         assert_eq!(
@@ -9262,6 +9304,7 @@ mod tests {
             resolved(JournalResolution::ImportedWithRejections {
                 rejected: 3,
                 revision: 0,
+                items_seen: 0,
             }),
         );
         let mut ours = MigrationJournal::new_pending(&lineage);
@@ -9677,6 +9720,7 @@ mod tests {
             resolved(JournalResolution::ImportedWithRejections {
                 rejected: 4,
                 revision: 0,
+                items_seen: 0,
             }),
         );
         let rev1 = JournalBinding::new(&union(), 1);
@@ -9717,6 +9761,7 @@ mod tests {
             resolved(JournalResolution::ImportedWithRejections {
                 rejected: 1,
                 revision: 0,
+                items_seen: 0,
             }),
         );
         j.record(&k, 1, resolved(JournalResolution::NoData));
@@ -11576,6 +11621,7 @@ mod tests {
         let iwr = ImportedWithRejections {
             rejected: 1,
             revision: 1,
+            items_seen: 0,
         };
         for non_data in [NoData, SupersededByAuthoritative] {
             for data in [iwr, Imported] {
@@ -11601,10 +11647,12 @@ mod tests {
         let lo = ImportedWithRejections {
             rejected: 5,
             revision: 2,
+            items_seen: 0,
         };
         let hi = ImportedWithRejections {
             rejected: 2,
             revision: 3,
+            items_seen: 0,
         };
         assert_eq!(r8_merge(lo, hi), JournalState::Resolved(hi));
         assert_eq!(r8_merge(hi, lo), JournalState::Resolved(hi));
@@ -11622,6 +11670,7 @@ mod tests {
             resolved(ImportedWithRejections {
                 rejected: 5,
                 revision: 1,
+                items_seen: 0,
             }),
         );
         j.record(
@@ -11630,6 +11679,7 @@ mod tests {
             resolved(ImportedWithRejections {
                 rejected: 3,
                 revision: 0,
+                items_seen: 0,
             }),
         );
         // e3 stays pending with no rejections (a silent predecessor).
@@ -11769,7 +11819,9 @@ mod tests {
         );
     }
 
-    /// A flag that is already durable costs no further journal store.
+    /// A flag that is already durable costs no further flag store; a retried
+    /// import re-reads the journal once before its first item (#44: another
+    /// session's larger count holds it), and stores the final resolution.
     #[test]
     fn r8_an_already_durable_flag_costs_no_further_journal_store() {
         let lineage = [entry(1, 1)];
@@ -11785,8 +11837,8 @@ mod tests {
         assert!(complete(&run), "{:?}", run.status);
         assert_eq!(
             w.journal_stores - before,
-            1,
-            "only the final resolution is stored"
+            2,
+            "the retry's re-read before its first item, and the final resolution"
         );
     }
 
@@ -12322,6 +12374,7 @@ mod tests {
             RunOutcome::Resolved(JournalResolution::ImportedWithRejections {
                 rejected: 1,
                 revision: 0,
+                items_seen: 0,
             }),
         );
         put_journal(&mut store, &j);
@@ -14134,6 +14187,7 @@ mod tests {
                                 RunOutcome::Resolved(JournalResolution::ImportedWithRejections {
                                     rejected: 1,
                                     revision: 0,
+                                    items_seen: 0,
                                 }),
                             ),
                             _ => {}
@@ -14617,6 +14671,7 @@ mod tests {
             RunOutcome::Resolved(JournalResolution::ImportedWithRejections {
                 rejected: 1,
                 revision: 0,
+                items_seen: 0,
             }),
         );
         w.inject_at_first_marker_read = Some(theirs.encode());
@@ -14669,6 +14724,7 @@ mod tests {
                     _ => JournalResolution::ImportedWithRejections {
                         rejected: 1,
                         revision: 0,
+                        items_seen: 0,
                     },
                 };
                 let mut theirs = MigrationJournal::new_pending(&lineage);
