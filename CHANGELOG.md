@@ -2,15 +2,26 @@
 
 ## freenet-migrate 0.7.0
 
-**Additive, delegate half only.** New
-`SecretSelectionPolicy::NewestSnapshotWinsContinuePastUnresponsive`
-([#14](https://github.com/freenet/freenet-migrate/issues/14)). The minor version
-bump (not a patch) is the conventional pre-1.0 signal for a new public enum
-variant — `SecretSelectionPolicy` is not `#[non_exhaustive]` before this
-release (it is now), so an external exhaustive `match` over it, though none is
-known to exist, would need a new arm. This is a version-number convention, not
-a behavior change: no known adopter's code needs to change, since every one of
-them constructs the policy rather than matching it exhaustively.
+**Additive, delegate half only.** Two features:
+
+* `SecretSelectionPolicy::NewestSnapshotWinsContinuePastUnresponsive`
+  ([#14](https://github.com/freenet/freenet-migrate/issues/14)), below.
+* A durable, opt-in **completeness journal**
+  ([#37](https://github.com/freenet/freenet-migrate/issues/37)), so an app knows
+  on every load whether every predecessor has been dealt with. See "Durable,
+  verifiable migration completeness" below.
+
+The minor version bump (not a patch) is the conventional pre-1.0 signal for new
+public enum variants. `SecretSelectionPolicy` was not `#[non_exhaustive]` before
+this release (it is now), so an external exhaustive `match` over it, though none
+is known to exist, would need a new arm; that is technically breaking.
+`WriterStage::JournalFlag` joins an enum that was already `#[non_exhaustive]`.
+No known adopter's code needs to change: every one constructs the policy rather
+than matching it exhaustively, and the journal is new API.
+
+**Upgrading from 0.5.** 0.6.0 (the contract half: silence is no longer absence)
+sits between, and is breaking on the contract half. Read "Upgrading to 0.6.0" in
+the README first.
 
 ### The problem
 
@@ -97,7 +108,9 @@ of 4 rooms on every later load. Four review rounds of in-session fixes
 `Resolved`:
 
 * `begin_migration_journal` stores it, every predecessor pending, before the app's
-  first migration write. It never resets a readable journal.
+  first migration write. It never resets a readable journal, and a fresh one
+  flags any predecessor an earlier plain walk left mid-import
+  (`InProgress { saw_data: true }`).
 * `migrate_delegate_secrets_journaled` runs the ordinary walk, durably flags a
   data-bearing predecessor as *import in progress* before its first item, and
   records what each predecessor resolved to.
