@@ -7700,4 +7700,63 @@ mod tests {
             Err(JournalDecodeError::Corrupt(_))
         ));
     }
+
+    /// A generation reopened by a policy switch is counted like any pending one:
+    /// its "not installed" answers build an absent streak, rather than being lost
+    /// to the stale resolution it was reopened from.
+    #[test]
+    fn a_reopened_superseded_generation_counts_its_absent_streak() {
+        let (old, new) = (entry(1, 1), entry(2, 2));
+        let lineage = [old, new];
+        let mut store = MemStore::default();
+        let mut io = MockIo::default()
+            .executable_with(&key_of(&new), &[(b"room:n", b"N")])
+            .executable_with(&key_of(&old), &[(b"room:o", b"O")]);
+        assert!(complete(&journaled(
+            &mut store,
+            &mut io,
+            &lineage,
+            newest()
+        )));
+        for _ in 0..2 {
+            let mut io = MockIo::default()
+                .executable_with(&key_of(&new), &[(b"room:n", b"N")])
+                .not_installed(&key_of(&old));
+            journaled(&mut store, &mut io, &lineage, union());
+        }
+        assert!(matches!(
+            state_of(&store, &old),
+            JournalState::Pending {
+                attempts: 2,
+                absent_streak: 2,
+                ..
+            }
+        ));
+        assert!(stored_status(&store, &lineage).pending_all_absent(2));
+    }
+
+    /// An older build of the app (a lower import revision) running after a newer
+    /// one must not downgrade a rejection's revision, or the newer build would
+    /// reopen it on every load.
+    #[test]
+    fn an_older_build_does_not_downgrade_a_rejection_revision() {
+        let lineage = [entry(1, 1)];
+        let k = key_of(&lineage[0]);
+        let mut writer = InspectingWriter::new(&lineage);
+        writer.permanent_fail.insert(b"room:x".to_vec());
+        writer.revision = 1;
+        let mut io = MockIo::default().executable_with(&k, &[(b"room:a", b"A"), (b"room:x", b"?")]);
+        assert!(complete(&writer.run(&mut io, union())));
+        // An older tab, at revision 0, still running. Its walk re-imports nothing new
+        // (the predecessor has no done marker, so it is retried) and rejects again.
+        writer.revision = 0;
+        writer.run(&mut io, union());
+        assert_eq!(
+            state_of(&writer.store, &lineage[0]),
+            JournalState::Resolved(JournalResolution::ImportedWithRejections {
+                rejected: 1,
+                revision: 1
+            })
+        );
+    }
 }
