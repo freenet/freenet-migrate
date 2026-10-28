@@ -671,7 +671,9 @@ match import_secrets_once(&mut ctx, &exported, successor_generation)? {
 > **The transport is an internal, redesigned seam, not part of the app-facing
 > API.** Apps call `migrate_delegate_secrets`; today it drives the interim
 > app-side `DelegateRequest::ApplicationMessages` round-trips (as River/Delta do).
-> When the node-side copy-forward lands (freenet-core#2776), it slots under the
+> No node-side copy-forward exists today (the one wire for it was disabled in
+> freenet-core#5199 and removed in stdlib 0.9.0); the seam is kept so that, if
+> one is added (freenet-core#2776), it slots under the
 > *unchanged* entry point — it copies secrets between namespaces internally
 > without executing old code, killing the `ReRunOldWasm` / #204 landmine, and
 > needs no app re-adoption. This is the plan-v2 correction over v1's
@@ -825,7 +827,9 @@ the status those calls return reports it.
   `Unresponsive`, which the app must show rather than silently fresh-installing.
   A `probe_verdict` answering "not installed" (0.7.0) is reported the same way;
   it only feeds the journal's absent streak.
-  The node-side copy-forward removes the dependency by reading storage directly.
+  A node-side copy-forward would remove the dependency by reading storage
+  directly; none exists today (see "The transport is an internal, redesigned
+  seam" below).
 
 ## Building & testing
 
@@ -947,12 +951,14 @@ for the stdlib and freenet-migrate together:
    or move them out of the workspace pinned to their old stdlib (which also
    keeps their build reproducible).
 3. Move `freenet-stdlib` to 0.12 and `freenet-migrate` to 0.8 together, then
-   check that nothing that ships holds two stdlibs. This must print exactly
-   one version:
+   check that every non-dev crate under this lockfile is on one stdlib. This
+   must print exactly one line (two lines at one version means two sources,
+   e.g. crates.io and a path copy, which conflict just the same):
 
    ```sh
    cargo tree --workspace --all-features -e normal,build --target all \
-       --prefix none --format '{p}' | awk '$1=="freenet-stdlib"{print $2}' | sort -u
+       --prefix none --format '{p}' \
+       | awk '$1=="freenet-stdlib"{sub(/ \(\*\)$/,""); print}' | sort -u
    ```
 
    `-e normal,build` leaves out dev-dependencies, which may legitimately pin an

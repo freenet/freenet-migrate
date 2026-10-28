@@ -185,8 +185,9 @@ breaks — River V4–V6 / #204). The crate does not eliminate that fragility; i
 - the two-phase, delegate-key-keyed anti-resurrection marker bounds the damage of
   a stray re-import, and
 - the **seam is the app-facing entry points plus a public, versioned marker
-  contract**, NOT a swappable transport trait. When the platform primitive (the
-  node-mediated secret copy-forward, freenet-core#2776) lands, it copies each
+  contract**, NOT a swappable transport trait. No such platform primitive exists
+  today (see below); if one (the node-mediated secret copy-forward,
+  freenet-core#2776) is added, it copies each
   predecessor's secrets **at registration time** (the `register_successor` path
   carries the predecessor list newest-first) and seals each fully-copied
   predecessor by writing the exact `predecessor_done_marker(key, had_data)` secret.

@@ -137,8 +137,10 @@ pointer belonging to the same author.
 **On freenet-stdlib 0.12, do not depend on this crate:** it pins
 `freenet-stdlib = "=0.8.5"` (frozen with its bytes), so the app would hold two
 stdlibs. Use the `freenet-migrate` resolver in the box above instead (same wire
-format, pinned by its parity test); the steps below are for apps still on
-stdlib 0.8. The `pointer-record` publisher binary is unaffected.
+format, pinned by its parity test: `pointer_params`, `pointer_contract_id`,
+`PointerRecord`, `resolve_app_pointer`). The Rust code below is for apps still
+on stdlib 0.8; the steps themselves still describe the protocol for any
+implementer. The `pointer-record` publisher binary is unaffected.
 
 ```toml
 [dependencies]

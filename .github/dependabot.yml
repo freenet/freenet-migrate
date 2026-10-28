@@ -72,7 +72,9 @@ updates:
     # deliberately (see CHANGELOG 0.8.0; #36 was the bump that showed why).
     # Cargo semver makes 0.12 -> 0.13 a major bump (header above), but some of
     # our repos' Dependabot PRs have labelled 0.x line bumps `semver-minor`, so
-    # both are listed. 0.12.x patches are `semver-patch` and are not ignored.
+    # both are listed. 0.12.x patches are `semver-patch` and are not ignored
+    # (with no committed lockfile here they resolve on their own rather than
+    # arrive as PRs).
     # The cost: Dependabot no longer signals that a new stdlib line exists.
     ignore:
       - dependency-name: "freenet-stdlib"

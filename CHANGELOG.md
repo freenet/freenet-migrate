@@ -42,7 +42,7 @@ own graph holds more than one stdlib.
 **What moving to stdlib 0.12 means for an adopting app** (stdlib's own
 changes, summarised here because this is where an adopter decides). This
 covers stdlib 0.8.5 to 0.12.1 only. An app on an earlier stdlib (crate 0.7
-accepts 0.8.2 and later) should also read stdlib's CHANGELOG back to its own
+accepts 0.8.2 and later 0.8.x) should also read stdlib's CHANGELOG back to its own
 version; an app not yet on this crate is doing a first adoption (see the
 README's adoption sections) and should do the same.
 
@@ -70,6 +70,13 @@ README's adoption sections) and should do the same.
 
 An app still on crate 0.6 also takes 0.7.0's delegate-walk behaviour change
 when it moves; read that entry first.
+
+**Packaging.** The published crate no longer ships the repo-only tests (the
+pointer parity test, the two doc-consistency tests and the codegen tests): they
+read files outside the package or need the path-only `freenet-migrate-build`
+dev-dependency that publishing strips, so they failed in an unpacked crate.
+They still run in this repo's CI. Dependabot no longer proposes a new stdlib
+line as a routine bump.
 
 The frozen pointer contract (`contracts/pointer-contract`, pinned to
 stdlib `=0.8.5` outside the workspace) is untouched: its rebuild still matches

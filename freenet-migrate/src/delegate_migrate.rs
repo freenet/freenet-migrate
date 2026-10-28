@@ -627,8 +627,7 @@ pub trait RegisterAndMigrateIo: PredecessorSecretsIo {
     /// already written and report every predecessor as already-migrated, a no-op,
     /// with no change to this wrapper's signature. No such wire exists today: the
     /// earlier `RegisterDelegateWithPredecessors` variant was removed in
-    /// freenet-stdlib 0.9.0 because its authorization check was not effective
-    /// (freenet-core#5199).
+    /// freenet-stdlib 0.9.0 (freenet-core#5199).
     ///
     /// **`predecessors` is supplied newest-generation-first** (guaranteed by
     /// [`register_delegate_with_migration`]); a node-side copy, if one is ever
