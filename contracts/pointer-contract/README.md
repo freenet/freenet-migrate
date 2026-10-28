@@ -140,8 +140,10 @@ an app on stdlib 0.12 would hold two stdlibs. Use `freenet_migrate::pointer`
 instead (`PointerRecord`, `pointer_params`, `pointer_contract_id`,
 `resolve_app_pointer`); it is the same wire format, pinned against this
 contract by the crate's parity test. The `pointer-record` publisher binary,
-installed with `cargo install`, is unaffected. The dependency below is for apps
-still on stdlib 0.8.
+installed with `cargo install`, is unaffected. The dependency below, and the
+code below that uses it (`PointerParams`, `ContractKey::from_params`
+via stdlib 0.8), is for apps still on stdlib 0.8; on 0.12 the equivalents are
+`freenet_migrate::pointer::pointer_params` and `pointer_contract_id`.
 
 ```toml
 [dependencies]

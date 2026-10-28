@@ -53,7 +53,7 @@ jobs:
       # to a range: that unifies here and duplicates only in an adopter's graph
       # (see CHANGELOG 0.8.0).
       - name: exactly one freenet-stdlib in the graph
-        run: cargo tree --workspace --all-features -e normal,build,dev -i freenet-stdlib
+        run: cargo tree --workspace --all-features --target all -e normal,build,dev -i freenet-stdlib
       - run: cargo test --all-features
 
   docs:

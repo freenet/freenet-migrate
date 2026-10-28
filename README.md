@@ -22,7 +22,7 @@ Horizon-A step A3 of the graceful-upgrades design,
 **Design & rationale: [docs/design.md](./docs/design.md)** — why the crate is
 shaped this way (backward-probe over signed-pointer, preconditions as
 compile-time bounds, the `SecretTransport` seam) and the field-validated River
-0.6 → 0.8 re-key outcome.
+stdlib 0.6 → 0.8 re-key outcome.
 
 ## The problem
 
@@ -918,7 +918,7 @@ and still hand-rolls its build-time registry codegen.
 freenet-git takes the build half only, and the reason is a hard constraint
 rather than a scheduling one. The runtime half is built against
 freenet-stdlib 0.8.x (crate 0.7) or 0.12.x (crate 0.8) while that workspace is
-on 0.6.0, and stdlib exports `__frnt_set_id` as an unconditional
+on stdlib 0.6.0, and stdlib exports `__frnt_set_id` as an unconditional
 `#[no_mangle] extern "C"` symbol (`rust/src/global.rs:4-5`), so a binary that
 uses two stdlib versions fails to link with a duplicate-symbol error under
 rust-lld. (One that merely has a second, unused copy in its graph links
@@ -935,23 +935,30 @@ delegate the app builds. So the upgrade is
 the app's ordinary re-key procedure, done once for both crates:
 
 1. **Before anything rebuilds**, record the outgoing generation of every
-   contract and delegate in its legacy registry (the committed WASM's code
-   hash, not a fresh build's).
-2. Move `freenet-stdlib` to 0.12 and `freenet-migrate` to 0.8 together, then
+   contract and delegate in its legacy registry: the code hash (and, for a
+   delegate, the delegate key and any params) of what is published now, which
+   should equal the committed WASM. Check each predecessor still instantiates
+   on current nodes (its WASM imports only host functions current nodes
+   provide); one that does not cannot export its secrets.
+2. Identify every artifact whose key must NOT move: a web container whose
+   contract id is the app's URL, a frozen pointer contract. Keep those on their
+   committed WASM and publish them from the committed bytes, never a rebuild,
+   or move them out of the workspace pinned to their old stdlib (which also
+   keeps their build reproducible).
+3. Move `freenet-stdlib` to 0.12 and `freenet-migrate` to 0.8 together, then
    check that nothing that ships holds two stdlibs:
-   `cargo tree --workspace -e normal,build --target all -d | grep '^freenet-stdlib'`
-   must print nothing. (`-e normal,build` leaves out dev-dependencies, which may
-   legitimately pin an older stdlib for native tests; plain
+   `cargo tree --workspace --all-features -e normal,build --target all -d | grep '^freenet-stdlib'`
+   must print nothing. (`-e normal,build` leaves out dev-dependencies, which
+   may legitimately pin an older stdlib for native tests; plain
    `cargo tree -i freenet-stdlib` fails with "specification `freenet-stdlib` is
-   ambiguous" on those too.) Run it once per lockfile: a crate excluded from the
-   workspace has its own.
-3. Keep every artifact whose key must NOT move on its committed WASM: a web
-   container whose contract id is the app's URL, a frozen pointer contract.
-   Publish those from the committed bytes, never a rebuild, or move them out of
-   the workspace pinned to their old stdlib.
+   ambiguous" on those too. `--all-features` matters because contract and
+   delegate builds use non-default features.) Run it once per lockfile: a
+   crate excluded from the workspace has its own.
 4. Rebuild the WASM, re-sign any pointer records naming it, then rehearse the
-   migration on an isolated network-mode node before publishing, as for any
-   re-key.
+   migration on an isolated network-mode node.
+5. Publish in order: the new artifacts and the UI first, then the pointer
+   records once the new UI is live. Open tabs reload when a newer pointer
+   lands, so a pointer published first reloads them into the old UI.
 
 An app that is not ready to re-key stays on 0.7.
 

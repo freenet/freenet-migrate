@@ -269,7 +269,7 @@ journal, and one behaviour change in the delegate walk (an empty export after
 data was seen is a silence, not a seal). 0.8.0 (unreleased) is the same crate
 on stdlib 0.12.
 The two halves version independently. The reusable core machinery + tests,
-**field-validated by River's 0.6 → 0.8 re-key** (above).
+**field-validated by River's stdlib 0.6 → 0.8 re-key** (above).
 
 Section 5's adoption has largely landed, with deviations worth recording.
 River took both halves: `ui/build.rs` and `common/build.rs` call

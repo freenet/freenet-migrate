@@ -3,11 +3,12 @@
 ## freenet-migrate 0.8.0 (unreleased)
 
 **Dependency bump only: `freenet-stdlib` 0.8 -> 0.12.** No code change from
-0.7.0 (one doc comment was corrected), so there is no behaviour change. It is still breaking: the public
-API names stdlib types (`DelegateKey`, `ContractInstanceId`, `Parameters`,
-`OutboundDelegateMsg`, the `SecretStore` impl for `DelegateCtx`, ...), so an
-app's call sites compile unchanged only once the app itself is on stdlib 0.12.
-The full test suite passes unmodified against stdlib 0.12.1. `freenet-migrate-build` does not depend on stdlib and stays at 0.2.0.
+0.7.0 (only doc comments were corrected), so there is no behaviour change. It
+is still breaking: the public API names stdlib types (`DelegateKey`,
+`ContractInstanceId`, `Parameters`, `OutboundDelegateMsg`, the `SecretStore`
+impl for `DelegateCtx`, ...), so an app's call sites compile unchanged only
+once the app itself is on stdlib 0.12. The full test suite passes unmodified
+against stdlib 0.12.1.
 
 | freenet-migrate | freenet-stdlib |
 |-----------------|----------------|
@@ -38,7 +39,10 @@ there. CI now fails if this crate's
 own graph holds more than one stdlib.
 
 **What moving to stdlib 0.12 means for an adopting app** (stdlib's own
-changes, summarised here because this is where an adopter decides):
+changes, summarised here because this is where an adopter decides). This
+covers stdlib 0.8.5 to 0.12.1 only. An app on an older stdlib, or not yet on
+this crate, is doing a first adoption: follow the adoption procedure and read
+stdlib's CHANGELOG back to its own version.
 
 * *Wire, towards older nodes.* The contract interface code is unchanged between
   stdlib 0.8.5 and 0.12.1; its doc comments now state stricter obligations

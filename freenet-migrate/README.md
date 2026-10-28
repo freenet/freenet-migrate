@@ -9,7 +9,9 @@ preconditions made mechanical.
 **Pick the line matching your app's freenet-stdlib:** freenet-migrate 0.8.x
 requires stdlib 0.12.x; 0.7.x and older require stdlib 0.8.x. An app must not
 hold two stdlib versions, and changing stdlib re-keys its contracts and
-delegates; see the repository CHANGELOG before moving between lines.
+delegates; see the
+[CHANGELOG](https://github.com/freenet/freenet-migrate/blob/main/CHANGELOG.md)
+before moving between lines.
 
 Part of the [`freenet-migrate`](https://github.com/freenet/freenet-migrate)
 workspace; pair it with the build-dependency

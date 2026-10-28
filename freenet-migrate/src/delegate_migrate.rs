@@ -2761,9 +2761,10 @@ fn resolve_outcomes(
 ///
 /// 1. [`register_delegate_with_migration`] passes the predecessor list
 ///    (**newest-first**) + authorization to [`RegisterAndMigrateIo::register_successor`].
-/// 2. On a node with the copy-forward primitive, registration copies each
+/// 2. On a node with a copy-forward primitive (none exists today; see below),
+///    registration would copy each
 ///    predecessor's secrets into the successor **internally, without executing
-///    old code**, and writes the **same** public `pred-done` marker
+///    old code**, and write the **same** public `pred-done` marker
 ///    ([`crate::predecessor_done_marker`]) for each predecessor it *fully* copies.
 /// 3. The subsequent [`migrate_delegate_secrets`] then finds every completed
 ///    predecessor already marked and short-circuits each to `AlreadyMigrated` — a
@@ -2778,7 +2779,7 @@ fn resolve_outcomes(
 /// ## What the removed v1 node copy did — and did NOT — guarantee
 ///
 /// History, kept because it constrains any successor design. The v1 wire
-/// (`RegisterDelegateWithPredecessors`, stdlib 0.8.4 to 0.8.x, removed in 0.9.0)
+/// (`RegisterDelegateWithPredecessors`, stdlib 0.8.4 and 0.8.5, removed in 0.9.0)
 /// carried only `Vec<DelegateKey>` (no generations, no policy). The node copied
 /// in the supplied order, **first-writer-wins**, so with a newest-first list it
 /// was **union-with-newest-precedence**: every predecessor copied, the newest
@@ -2789,8 +2790,9 @@ fn resolve_outcomes(
 /// round-trip is the only path, so `policy` always applies.
 ///
 /// So the app-facing entry points are unchanged, the shared `pred-done` markers
-/// are the interoperability contract, and this interim app-side round-trip is the
-/// **fallback** for nodes that predate the copy-forward primitive. Intentionally
+/// are the interoperability contract, and the app-side round-trip is the only
+/// path today: no node offers a copy-forward primitive, and none is planned
+/// until a new authorization design exists (freenet-core#5199). Intentionally
 /// `pub(crate)`: the transport is not the app-facing contract (the entry points
 /// and the markers are).
 pub(crate) trait SecretTransport<W: SuccessorSecretsIo> {
