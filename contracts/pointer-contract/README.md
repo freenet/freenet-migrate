@@ -134,16 +134,11 @@ pointer belonging to the same author.
 
 ### Step 0 — depend on this crate
 
-**On freenet-stdlib 0.12 (freenet-migrate 0.8), do not.** This crate pins
-`freenet-stdlib = "=0.8.5"` as a normal dependency, frozen with its bytes, so
-an app on stdlib 0.12 would hold two stdlibs. Use `freenet_migrate::pointer`
-instead (`PointerRecord`, `pointer_params`, `pointer_contract_id`,
-`resolve_app_pointer`); it is the same wire format, pinned against this
-contract by the crate's parity test. The `pointer-record` publisher binary,
-installed with `cargo install`, is unaffected. The dependency below, and the
-code below that uses it (`PointerParams`, `ContractKey::from_params`
-via stdlib 0.8), is for apps still on stdlib 0.8; on 0.12 the equivalents are
-`freenet_migrate::pointer::pointer_params` and `pointer_contract_id`.
+**On freenet-stdlib 0.12, do not depend on this crate:** it pins
+`freenet-stdlib = "=0.8.5"` (frozen with its bytes), so the app would hold two
+stdlibs. Use the `freenet-migrate` resolver in the box above instead (same wire
+format, pinned by its parity test); the steps below are for apps still on
+stdlib 0.8. The `pointer-record` publisher binary is unaffected.
 
 ```toml
 [dependencies]

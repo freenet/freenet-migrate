@@ -931,8 +931,9 @@ this crate targets, which re-keys every repo and is its own migration event.
 
 0.8.0 has no code change; it moves the app to stdlib 0.12 (the stdlib types in
 this crate's signatures change with it), which re-keys every contract and
-delegate the app builds. So the upgrade is
-the app's ordinary re-key procedure, done once for both crates:
+delegate the app builds. (`freenet-migrate-build` has no stdlib dependency and
+stays at 0.2.) So the upgrade is the app's ordinary re-key procedure, done once
+for the stdlib and freenet-migrate together:
 
 1. **Before anything rebuilds**, record the outgoing generation of every
    contract and delegate in its legacy registry: the code hash (and, for a
@@ -946,19 +947,27 @@ the app's ordinary re-key procedure, done once for both crates:
    or move them out of the workspace pinned to their old stdlib (which also
    keeps their build reproducible).
 3. Move `freenet-stdlib` to 0.12 and `freenet-migrate` to 0.8 together, then
-   check that nothing that ships holds two stdlibs:
-   `cargo tree --workspace --all-features -e normal,build --target all -d | grep '^freenet-stdlib'`
-   must print nothing. (`-e normal,build` leaves out dev-dependencies, which
-   may legitimately pin an older stdlib for native tests; plain
-   `cargo tree -i freenet-stdlib` fails with "specification `freenet-stdlib` is
-   ambiguous" on those too. `--all-features` matters because contract and
-   delegate builds use non-default features.) Run it once per lockfile: a
-   crate excluded from the workspace has its own.
-4. Rebuild the WASM, re-sign any pointer records naming it, then rehearse the
-   migration on an isolated network-mode node.
+   check that nothing that ships holds two stdlibs. This must print exactly
+   one version:
+
+   ```sh
+   cargo tree --workspace --all-features -e normal,build --target all \
+       --prefix none --format '{p}' | awk '$1=="freenet-stdlib"{print $2}' | sort -u
+   ```
+
+   `-e normal,build` leaves out dev-dependencies, which may legitimately pin an
+   older stdlib for native tests (plain `cargo tree -i freenet-stdlib` fails
+   with "specification `freenet-stdlib` is ambiguous" on those too), and
+   `--all-features` matters because contract and delegate builds use
+   non-default features. Run it once per lockfile: a crate excluded from the
+   workspace has its own.
+4. Rebuild the WASM of every artifact that re-keys (not the fixed-key ones from
+   step 2), sign a new pointer record at a higher version for each pointed-at
+   artifact, then rehearse the migration on an isolated network-mode node.
 5. Publish in order: the new artifacts and the UI first, then the pointer
-   records once the new UI is live. Open tabs reload when a newer pointer
-   lands, so a pointer published first reloads them into the old UI.
+   records once the new UI is live. In an app whose open tabs reload on a
+   newer pointer (River does), a pointer published first reloads them into the
+   old UI.
 
 An app that is not ready to re-key stays on 0.7.
 

@@ -70,10 +70,10 @@ updates:
     # adopter's stdlib, and a stdlib change re-keys the adopter's contracts and
     # delegates, so a new line ships as a new minor version of this crate,
     # deliberately (see CHANGELOG 0.8.0; #36 was the bump that showed why).
-    # Both labels are listed because Dependabot has labelled 0.x line bumps
-    # either way across our repos; 0.12.x patches are `semver-patch` and are not
-    # ignored (with no committed lockfile here they resolve rather than arrive
-    # as PRs).
+    # Cargo semver makes 0.12 -> 0.13 a major bump (header above), but some of
+    # our repos' Dependabot PRs have labelled 0.x line bumps `semver-minor`, so
+    # both are listed. 0.12.x patches are `semver-patch` and are not ignored.
+    # The cost: Dependabot no longer signals that a new stdlib line exists.
     ignore:
       - dependency-name: "freenet-stdlib"
         update-types: ["version-update:semver-major", "version-update:semver-minor"]

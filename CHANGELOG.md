@@ -8,7 +8,8 @@ is still breaking: the public API names stdlib types (`DelegateKey`,
 `ContractInstanceId`, `Parameters`, `OutboundDelegateMsg`, the `SecretStore`
 impl for `DelegateCtx`, ...), so an app's call sites compile unchanged only
 once the app itself is on stdlib 0.12. The full test suite passes unmodified
-against stdlib 0.12.1.
+against stdlib 0.12.1. `freenet-migrate-build` does not depend on stdlib and
+stays at 0.2.0.
 
 | freenet-migrate | freenet-stdlib |
 |-----------------|----------------|
@@ -40,9 +41,10 @@ own graph holds more than one stdlib.
 
 **What moving to stdlib 0.12 means for an adopting app** (stdlib's own
 changes, summarised here because this is where an adopter decides). This
-covers stdlib 0.8.5 to 0.12.1 only. An app on an older stdlib, or not yet on
-this crate, is doing a first adoption: follow the adoption procedure and read
-stdlib's CHANGELOG back to its own version.
+covers stdlib 0.8.5 to 0.12.1 only. An app on an earlier stdlib (crate 0.7
+accepts 0.8.2 and later) should also read stdlib's CHANGELOG back to its own
+version; an app not yet on this crate is doing a first adoption (see the
+README's adoption sections) and should do the same.
 
 * *Wire, towards older nodes.* The contract interface code is unchanged between
   stdlib 0.8.5 and 0.12.1; its doc comments now state stricter obligations

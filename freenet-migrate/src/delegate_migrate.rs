@@ -2791,8 +2791,9 @@ fn resolve_outcomes(
 ///
 /// So the app-facing entry points are unchanged, the shared `pred-done` markers
 /// are the interoperability contract, and the app-side round-trip is the only
-/// path today: no node offers a copy-forward primitive, and none is planned
-/// until a new authorization design exists (freenet-core#5199). Intentionally
+/// path today: current nodes do not offer a copy-forward primitive (it was
+/// disabled in freenet-core#5199). The seam is kept so one can slot in once its
+/// authorization input can be trusted (freenet-core#2776). Intentionally
 /// `pub(crate)`: the transport is not the app-facing contract (the entry points
 /// and the markers are).
 pub(crate) trait SecretTransport<W: SuccessorSecretsIo> {

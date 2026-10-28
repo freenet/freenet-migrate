@@ -44,7 +44,7 @@ aspirational model — is the single decision that shaped everything below.
 
 ## Field-validated (2026-07-12)
 
-River's live **0.6 → 0.8** re-key used exactly this pattern and was
+River's live **stdlib 0.6 → 0.8** re-key used exactly this pattern and was
 **transparent** to users. `freenet-migrate` 0.1.0 (published to crates.io) plus
 stdlib 0.8.3 shipped to the live network, both `room_contract.wasm` and
 `chat_delegate.wasm` re-keyed, and:

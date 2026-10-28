@@ -10,11 +10,19 @@ repository = "https://github.com/freenet/freenet-migrate"
 readme = "README.md"
 keywords = ["freenet", "migration", "upgrade", "contract", "delegate"]
 categories = ["cryptography::cryptocurrencies", "web-programming"]
-# The parity test pins this crate's pointer wire format against the frozen
-# contract at ../contracts/pointer-contract, which is outside this package. It
-# is a repo-CI guard, so it ships nowhere: left in, `cargo test` on an unpacked
-# published crate would panic on the missing files.
-exclude = ["tests/pointer_contract_parity.rs"]
+# Repo-CI guards that cannot run from an unpacked published crate, so they ship
+# nowhere: the parity test and the two doc-consistency tests read files outside
+# this package (../contracts/pointer-contract, ../README.md, ../CHANGELOG.md),
+# and the codegen tests need `freenet-migrate-build`, a path-only dev-dependency
+# that publishing strips. They all still run in this repo's CI.
+exclude = [
+    "tests/pointer_contract_parity.rs",
+    "tests/absence_caveat_consistency.rs",
+    "tests/pointer_docs_consistency.rs",
+    "tests/codegen_stdlib_consistency.rs",
+    "tests/generated_output_compiles.rs",
+    "tests/fixtures",
+]
 
 [features]
 # Target profiles, mirroring freenet-stdlib's wasm/native split.
