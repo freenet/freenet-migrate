@@ -43,6 +43,17 @@ jobs:
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@v2
+      # One stdlib in the graph, normal and dev deps alike. An app cannot sanely
+      # hold two (`__frnt_set_id` is an unconditional #[no_mangle] export: using
+      # both fails to link, and an unused second copy links and hides), and this
+      # crate's requirement is every adopter's stdlib. `cargo tree -i` exits
+      # non-zero ("specification `freenet-stdlib` is ambiguous") as soon as a
+      # second version appears in THIS crate's resolve, e.g. the dev-dep
+      # drifting from the normal dep. It does not catch a requirement widened
+      # to a range: that unifies here and duplicates only in an adopter's graph
+      # (see CHANGELOG 0.8.0).
+      - name: exactly one freenet-stdlib in the graph
+        run: cargo tree --workspace --all-features -e normal,build,dev -i freenet-stdlib
       - run: cargo test --all-features
 
   docs:
@@ -74,7 +85,8 @@ jobs:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
       # The WASM target profiles must all compile; the `delegate` build also
-      # exercises the wasm-only `DelegateCtx` SecretStore bridge.
+      # type-checks (does not link or run) the wasm-only `DelegateCtx`
+      # SecretStore bridge, so a removed or re-signed secrets call goes red.
       - name: contract feature
         run: cargo build -p freenet-migrate --no-default-features --features contract --target wasm32-unknown-unknown
       - name: delegate feature

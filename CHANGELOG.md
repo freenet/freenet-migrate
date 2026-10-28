@@ -1,5 +1,74 @@
 # Changelog
 
+## freenet-migrate 0.8.0 (unreleased)
+
+**Dependency bump only: `freenet-stdlib` 0.8 -> 0.12.** No code change from
+0.7.0 (one doc comment was corrected), so there is no behaviour change. It is still breaking: the public
+API names stdlib types (`DelegateKey`, `ContractInstanceId`, `Parameters`,
+`OutboundDelegateMsg`, the `SecretStore` impl for `DelegateCtx`, ...), so an
+app's call sites compile unchanged only once the app itself is on stdlib 0.12.
+The full test suite passes unmodified against stdlib 0.12.1. `freenet-migrate-build` does not depend on stdlib and stays at 0.2.0.
+
+| freenet-migrate | freenet-stdlib |
+|-----------------|----------------|
+| 0.8.x           | 0.12.x         |
+| 0.7.x and older | 0.8.x          |
+
+**Why a minor bump for a dependency change.** An app cannot link two
+freenet-stdlib versions: stdlib exports `__frnt_set_id` as an unconditional
+`#[no_mangle]` symbol. So this crate's stdlib requirement decides the stdlib of
+every app that uses it, and rebuilding a contract or delegate against a
+different stdlib changes its WASM and therefore its key. Taking 0.8.0 is a
+re-key event for the adopting app; adopt it deliberately, with the outgoing
+generations recorded in your legacy registries first (see "Upgrading to 0.8.0"
+in the README). Apps not ready to move stay on 0.7 (stdlib 0.8), which keeps
+working. There is no 0.7 maintenance branch; a 0.7.x fix would be cut from the
+commit 0.7.0 was published from (`ff45729`).
+
+**Why not a range covering both.** A requirement such as `>=0.8.2, <0.13` was
+considered and rejected. Cargo resolves each requirement to its newest match,
+so an app pinning stdlib 0.8.5 that takes such a range gets **both** 0.8.5 and
+0.12.1 in its graph (measured with `cargo generate-lockfile`). What happens
+next depends on the code, not the manifest: a wasm32 release build that
+actually uses both copies fails with `rust-lld: error: duplicate symbol:
+__frnt_set_id`, while one where the second copy is linked but unused builds
+cleanly, so the problem can stay hidden until an unrelated change starts using
+it. 0.8.0 adds nothing an app on stdlib 0.8 needs, so 0.7 is the right pin
+there. CI now fails if this crate's
+own graph holds more than one stdlib.
+
+**What moving to stdlib 0.12 means for an adopting app** (stdlib's own
+changes, summarised here because this is where an adopter decides):
+
+* *Wire, towards older nodes.* The contract interface code is unchanged between
+  stdlib 0.8.5 and 0.12.1; its doc comments now state stricter obligations
+  (merges idempotent as well as commutative, a negligible `get_state_delta` to
+  an up-to-date peer), so check your contract against them. The delegate
+  message enums only gained appended variants (`InboundDelegateMsg` tags 8-10,
+  `OutboundDelegateMsg` tag 8), so an older node's messages still decode. The
+  direction that breaks is the other one: a delegate that *emits* a new
+  outbound variant (`UnsubscribeContractRequest`) sends a tag an older node
+  cannot decode, and since a delegate's outbound messages are decoded as one
+  batch, the `ApplicationMessage` replies beside it are lost too. The client-request variant 0.9.0 removed
+  (`DelegateRequest::RegisterDelegateWithPredecessors`) was the last one, so no
+  other tag moved. 0.12 adds no host import, so a delegate that does not call
+  new APIs imports nothing an older node lacks.
+* *Source.* `DelegateCtx::put_contract_state`, `update_contract_state` and
+  `subscribe_contract` are removed (0.11.0), as is
+  `RegisterDelegateWithPredecessors` (0.9.0). `OutboundDelegateMsg` is not
+  `#[non_exhaustive]`, so an exhaustive `match` over it needs the new arm.
+  `#[delegate]` (freenet-macros 0.3) rejects arguments it does not recognise.
+* *Behaviour.* `InboundDelegateMsg::get_context()` and `get_mut_context()` now
+  return `Some` for `UserResponse` (they returned `None` in 0.8.5); a delegate
+  that branches on either changes behaviour silently.
+
+An app still on crate 0.6 also takes 0.7.0's delegate-walk behaviour change
+when it moves; read that entry first.
+
+The frozen pointer contract (`contracts/pointer-contract`, pinned to
+stdlib `=0.8.5` outside the workspace) is untouched: its rebuild still matches
+`CODEHASH`, so no pointer address moves.
+
 ## freenet-migrate 0.7.0 (2026-10-12)
 
 **Delegate half only.** Two features and one behaviour change:

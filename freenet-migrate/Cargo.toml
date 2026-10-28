@@ -1,6 +1,6 @@
 [package]
 name = "freenet-migrate"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 # u64::is_multiple_of (and CI clippy expects it) — needs 1.87+.
 rust-version = "1.87"
@@ -37,10 +37,14 @@ delegate = []
 ui = []
 
 [dependencies]
-# Pin 0.8.2: DelegateCtx::list_secrets (used by the delegate SecretStore bridge)
-# does not exist before 0.8.2, so a lockfile resolving 0.8.1 would fail the
-# `--features delegate --target wasm32` build.
-freenet-stdlib = { version = "0.8.2", default-features = false }
+# Crate 0.8.x is the stdlib 0.12 line (crate 0.7.x is stdlib 0.8). An app
+# must not hold two stdlib versions (`__frnt_set_id` is an unconditional
+# `#[no_mangle]` export), so this requirement IS every adopter's stdlib, and a
+# stdlib change re-keys the adopter's contracts and delegates. Never widen it
+# to a range spanning lines; see CHANGELOG 0.8.0. 0.12.1 is the floor because
+# it is the release current freenet-core links. Keep the dev-dependency below
+# in lockstep (CI's single-stdlib check fails otherwise).
+freenet-stdlib = { version = "0.12.1", default-features = false }
 freenet-scaffold = "0.2.2"
 serde = { version = "1", features = ["derive"] }
 serde_with = { version = "3", default-features = false, features = ["macros", "alloc"] }
@@ -53,6 +57,6 @@ ed25519-dalek = { version = "2.1.1", default-features = false, features = ["allo
 # The real stdlib key-derivation functions, used to generate known test vectors
 # that our from-scratch reconstruction must reproduce. Kept in lockstep with the
 # pinned normal dependency above.
-freenet-stdlib = { version = "0.8.2", default-features = false }
+freenet-stdlib = { version = "0.12.1", default-features = false }
 # The build-side hashing, cross-checked against stdlib + our runtime reconstruction.
 freenet-migrate-build = { path = "../freenet-migrate-build" }

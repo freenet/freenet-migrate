@@ -194,11 +194,12 @@ breaks — River V4–V6 / #204). The crate does not eliminate that fragility; i
   short-circuits every predecessor to `AlreadyMigrated` — **no API break, no app
   re-adoption**, with the app-side round-trip as the pre-primitive fallback.
 
-**What the v1 node copy does NOT guarantee:** the v1 wire carries only
-`Vec<DelegateKey>` (no generations/policy), so the node copy is
-union-with-newest-precedence and does not implement `NewestSnapshotWins`'s
-delete-by-absence preservation — that stays app-side-only in v1 (a future wire
-evolution could carry generations/policy). The earlier "`NodeCopyForward: impl
+**What the removed v1 node copy did NOT guarantee:** the v1 wire
+(`RegisterDelegateWithPredecessors`, removed in stdlib 0.9.0) carried only
+`Vec<DelegateKey>` (no generations/policy), so its node copy was
+union-with-newest-precedence and did not implement `NewestSnapshotWins`'s
+delete-by-absence preservation. A future node-side copy would need a wire that
+carries generations/policy; today only the app-side path exists. The earlier "`NodeCopyForward: impl
 SecretTransport` drop-in routed inside migrate" framing was non-viable (the io
 reaches predecessors, not the node) and is retired.
 
@@ -262,10 +263,11 @@ predecessor rule is manual-only today — a real hardening). Its "cover every
 
 ## Status
 
-Published: `freenet-migrate` **0.6.0** and `freenet-migrate-build` **0.2.0**;
-0.7.0 (unreleased) adds `NewestSnapshotWinsContinuePastUnresponsive`, the
-completeness journal, and one behaviour change in the delegate walk (an empty
-export after data was seen is a silence, not a seal).
+Published: `freenet-migrate` **0.7.0** and `freenet-migrate-build` **0.2.0**.
+0.7.0 added `NewestSnapshotWinsContinuePastUnresponsive`, the completeness
+journal, and one behaviour change in the delegate walk (an empty export after
+data was seen is a silence, not a seal). 0.8.0 (unreleased) is the same crate
+on stdlib 0.12.
 The two halves version independently. The reusable core machinery + tests,
 **field-validated by River's 0.6 → 0.8 re-key** (above).
 
@@ -282,5 +284,5 @@ sweeps during a deliberate dual-running period rather than replacing them
 outright.
 
 There are six adopters in total. `README.md`'s Status section carries the
-per-app breakdown of which half each one takes. Targets current stdlib
-**0.8.x**.
+per-app breakdown of which half each one takes. Crate 0.7.x targets stdlib
+**0.8.x**; crate 0.8.x targets stdlib **0.12.x**.

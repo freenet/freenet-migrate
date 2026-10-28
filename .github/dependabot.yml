@@ -65,6 +65,18 @@ updates:
       default-days: 7
     # Set explicitly: omitting this caps at 5 and silently withholds the rest.
     open-pull-requests-limit: 50
+    # A new freenet-stdlib LINE (0.12 -> 0.13, which cargo semver calls major)
+    # is never a routine bump here. This crate's stdlib requirement is every
+    # adopter's stdlib, and a stdlib change re-keys the adopter's contracts and
+    # delegates, so a new line ships as a new minor version of this crate,
+    # deliberately (see CHANGELOG 0.8.0; #36 was the bump that showed why).
+    # Both labels are listed because Dependabot has labelled 0.x line bumps
+    # either way across our repos; 0.12.x patches are `semver-patch` and are not
+    # ignored (with no committed lockfile here they resolve rather than arrive
+    # as PRs).
+    ignore:
+      - dependency-name: "freenet-stdlib"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
     groups:
       cargo-minor-and-patch:
         patterns:

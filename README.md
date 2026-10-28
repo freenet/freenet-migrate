@@ -863,9 +863,12 @@ common case, not the rare one — which disabled migration in practice for any
 lineage longer than one generation ([#14]), and a durable completeness
 journal so an app knows when every predecessor has been dealt with ([#37]).
 
-**Published:** `freenet-migrate` **0.6.0**, `freenet-migrate-build` **0.2.0**.
+**Published:** `freenet-migrate` **0.7.0**, `freenet-migrate-build` **0.2.0**;
+**0.8.0** (unreleased) is the stdlib 0.12 line.
 The two halves version independently, so an app can take one without the other.
-Targets current stdlib **0.8.x**.
+0.8.x targets stdlib **0.12.x**; 0.7.x targets stdlib **0.8.x**. Pick the line
+matching your app's stdlib (an app cannot link two stdlib versions), and treat
+moving between them as a re-key of your contracts and delegates.
 
 **0.6.0** (published 2026-08-13) is breaking on the **contract** half — silence
 is no longer absence ([#19]). See [Upgrading to 0.6.0](#upgrading-to-060) and the
@@ -882,6 +885,11 @@ needs a code change to compile: every known adopter constructs
 `WriterStage::JournalFlag` and `JournalUnavailable` variants join a
 `#[non_exhaustive]` enum, and the journal and `probe_verdict` are new API with
 defaults.
+
+**0.8.0** (unreleased) has no code change of its own: it moves the stdlib
+requirement from 0.8 to 0.12, which changes the stdlib types in its signatures. See the CHANGELOG for why that is a minor
+bump, why there is no range spanning both, and what stdlib 0.12 changes for an
+app, and [Upgrading to 0.8.0](#upgrading-to-080) for the procedure.
 
 ### Adopters
 
@@ -909,12 +917,43 @@ and still hand-rolls its build-time registry codegen.
 
 freenet-git takes the build half only, and the reason is a hard constraint
 rather than a scheduling one. The runtime half is built against
-freenet-stdlib 0.8.x while that workspace is on 0.6.0, and stdlib exports
-`__frnt_set_id` as an unconditional `#[no_mangle] extern "C"` symbol
-(`rust/src/global.rs:4-5`), so linking two stdlib versions into one binary is
-a hard duplicate-symbol error under rust-lld. Adopting the runtime driver
-there is blocked on that workspace moving to stdlib 0.8, which re-keys every
-repo and is its own migration event.
+freenet-stdlib 0.8.x (crate 0.7) or 0.12.x (crate 0.8) while that workspace is
+on 0.6.0, and stdlib exports `__frnt_set_id` as an unconditional
+`#[no_mangle] extern "C"` symbol (`rust/src/global.rs:4-5`), so a binary that
+uses two stdlib versions fails to link with a duplicate-symbol error under
+rust-lld. (One that merely has a second, unused copy in its graph links
+cleanly, so the conflict can surface later than the dependency change that
+caused it.) Adopting
+the runtime driver there is blocked on that workspace moving to a stdlib line
+this crate targets, which re-keys every repo and is its own migration event.
+
+## Upgrading to 0.8.0
+
+0.8.0 has no code change; it moves the app to stdlib 0.12 (the stdlib types in
+this crate's signatures change with it), which re-keys every contract and
+delegate the app builds. So the upgrade is
+the app's ordinary re-key procedure, done once for both crates:
+
+1. **Before anything rebuilds**, record the outgoing generation of every
+   contract and delegate in its legacy registry (the committed WASM's code
+   hash, not a fresh build's).
+2. Move `freenet-stdlib` to 0.12 and `freenet-migrate` to 0.8 together, then
+   check that nothing that ships holds two stdlibs:
+   `cargo tree --workspace -e normal,build --target all -d | grep '^freenet-stdlib'`
+   must print nothing. (`-e normal,build` leaves out dev-dependencies, which may
+   legitimately pin an older stdlib for native tests; plain
+   `cargo tree -i freenet-stdlib` fails with "specification `freenet-stdlib` is
+   ambiguous" on those too.) Run it once per lockfile: a crate excluded from the
+   workspace has its own.
+3. Keep every artifact whose key must NOT move on its committed WASM: a web
+   container whose contract id is the app's URL, a frozen pointer contract.
+   Publish those from the committed bytes, never a rebuild, or move them out of
+   the workspace pinned to their old stdlib.
+4. Rebuild the WASM, re-sign any pointer records naming it, then rehearse the
+   migration on an isolated network-mode node before publishing, as for any
+   re-key.
+
+An app that is not ready to re-key stays on 0.7.
 
 ## Upgrading to 0.6.0
 

@@ -271,10 +271,11 @@ pub enum SecretSelectionPolicy {
     /// the authoritative one stays unrecovered. Use [`UnionAllGenerations`](Self::UnionAllGenerations)
     /// when recovering such stranded data matters more than delete-by-absence.
     ///
-    /// **Scope:** these semantics are **app-side** (the interim round-trip path).
-    /// A Gap-3 copy-forward node copies union-with-newest-precedence and does not
-    /// honor this stop-at-first-data-bearing / delete-by-absence guarantee, because
-    /// the v1 wire carries no generations/policy — see `SecretTransport`.
+    /// **Scope:** these semantics are **app-side** (the round-trip path, the only
+    /// one that exists). A node-side copy-forward, if one is ever added, would
+    /// need a wire that carries generations and policy to honor this
+    /// stop-at-first-data-bearing / delete-by-absence guarantee; the removed v1
+    /// wire carried neither — see `SecretTransport`.
     NewestSnapshotWins,
     /// **Opt-in fall-through.** Same authoritative-newest-data-bearing-wins rule
     /// as [`NewestSnapshotWins`](Self::NewestSnapshotWins), except an
@@ -617,19 +618,21 @@ pub enum ProbeVerdict {
 pub trait RegisterAndMigrateIo: PredecessorSecretsIo {
     /// Register the successor delegate with the node.
     ///
-    /// `predecessors`, `authorization`, and `policy` are passed through so that
-    /// Gap 3's `RegisterDelegateWithPredecessors` wire change can have the node do
-    /// the copy-forward *at registration time* — at which point
-    /// [`migrate_delegate_secrets`] finds the delegate-key markers already
-    /// written and reports every predecessor as already-migrated, a no-op. The
-    /// wrapper's signature does not change.
+    /// Register with a plain `DelegateRequest::RegisterDelegate`; the copy-forward
+    /// is then done client-side by [`migrate_delegate_secrets`].
+    ///
+    /// `predecessors`, `authorization`, and `policy` are passed through so that a
+    /// future node-side copy-forward could run *at registration time*, at which
+    /// point [`migrate_delegate_secrets`] would find the delegate-key markers
+    /// already written and report every predecessor as already-migrated, a no-op,
+    /// with no change to this wrapper's signature. No such wire exists today: the
+    /// earlier `RegisterDelegateWithPredecessors` variant was removed in
+    /// freenet-stdlib 0.9.0 because its authorization check was not effective
+    /// (freenet-core#5199).
     ///
     /// **`predecessors` is supplied newest-generation-first** (guaranteed by
-    /// [`register_delegate_with_migration`]). Send the keys to the node in that
-    /// order: the v1 wire carries only the key list and the node copies with
-    /// first-writer-wins, so newest-first yields newest-precedence. The v1 node
-    /// copy is union-with-newest-precedence and does NOT honor `policy` (which is
-    /// forwarded only for a future wire evolution) — see `SecretTransport`.
+    /// [`register_delegate_with_migration`]); a node-side copy, if one is ever
+    /// added, would need that order for newest-precedence.
     fn register_successor(
         &mut self,
         predecessors: &[DelegateLineageEntry],
@@ -1657,16 +1660,15 @@ where
 /// forward, in one call (plan G1.7).
 ///
 /// A thin wrapper: [`register_successor`](RegisterAndMigrateIo::register_successor)
-/// then [`migrate_delegate_secrets`]. Under Gap 3 the registration itself carries
-/// the predecessor list to the node (which does the copy-forward), and the
-/// migration step becomes a no-op — the signature is unchanged.
+/// then [`migrate_delegate_secrets`]. If a node-side copy-forward is ever added,
+/// the registration would carry the predecessor list to the node and the
+/// migration step would become a no-op, with this signature unchanged. No such
+/// wire exists today (see [`RegisterAndMigrateIo::register_successor`]).
 ///
 /// The predecessors handed to `register_successor` are sorted **newest-first**
-/// here, because a copy-forward node copies in supplied order with
-/// first-writer-wins (newest-first ⇒ newest-precedence). See
-/// [`RegisterAndMigrateIo::register_successor`] and the `SecretTransport` docs
-/// for what the v1 node copy does and does NOT guarantee (it is
-/// union-with-newest-precedence, not `NewestSnapshotWins`).
+/// here, the order a first-writer-wins node copy would need for
+/// newest-precedence. The `SecretTransport` docs record what the removed v1
+/// node copy did and did not guarantee.
 ///
 /// # Errors
 ///
@@ -2773,19 +2775,18 @@ fn resolve_outcomes(
 /// whose entries are interdependent should not adopt the node copy for those
 /// entries until the wire can express "run the successor's import path".
 ///
-/// ## What the v1 node copy does — and does NOT — guarantee
+/// ## What the removed v1 node copy did — and did NOT — guarantee
 ///
-/// The v1 wire carries only `Vec<DelegateKey>` (no generations, no policy). The
-/// node copies in the supplied order, **first-writer-wins**, so with a
-/// newest-first list it is **union-with-newest-precedence**: every predecessor is
-/// copied, the newest value wins a key conflict. It therefore does **not**
-/// implement [`SecretSelectionPolicy::NewestSnapshotWins`]'s
-/// stop-at-first-data-bearing / delete-by-absence preservation — that is an
-/// **app-side-only** semantic in v1. So on a copy-forward node the effective
-/// cross-generation behavior is Union regardless of the `policy` argument;
-/// `policy`'s finer semantics apply only to the app-side fallback path. (A future
-/// wire evolution could carry generations/policy and close the gap.) This does
-/// not promise policy preservation node-side.
+/// History, kept because it constrains any successor design. The v1 wire
+/// (`RegisterDelegateWithPredecessors`, stdlib 0.8.4 to 0.8.x, removed in 0.9.0)
+/// carried only `Vec<DelegateKey>` (no generations, no policy). The node copied
+/// in the supplied order, **first-writer-wins**, so with a newest-first list it
+/// was **union-with-newest-precedence**: every predecessor copied, the newest
+/// value winning a key conflict. It therefore did **not** implement
+/// [`SecretSelectionPolicy::NewestSnapshotWins`]'s stop-at-first-data-bearing /
+/// delete-by-absence preservation. A future node-side copy would need a wire
+/// that carries generations and policy to close that gap. Today the app-side
+/// round-trip is the only path, so `policy` always applies.
 ///
 /// So the app-facing entry points are unchanged, the shared `pred-done` markers
 /// are the interoperability contract, and this interim app-side round-trip is the

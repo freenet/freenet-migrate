@@ -40,7 +40,7 @@ change to the WASM — a bug fix, a dependency bump, even a version-string bump 
 produces a different key.
 
 The author carries their own data forward (freenet-migrate's backward probe and
-fold for contracts, `RegisterDelegateWithPredecessors` for delegate secrets).
+fold for contracts, its client-side secret walk for delegate secrets).
 A **third party** cannot: its reference is a build-time constant, and after the
 upgrade it silently addresses a stale, empty namespace. It cannot even tell
 "this user has no data" apart from "the thing I was built against moved".
@@ -133,6 +133,15 @@ params blob**, so a record signed for one app cannot be replayed into another
 pointer belonging to the same author.
 
 ### Step 0 — depend on this crate
+
+**On freenet-stdlib 0.12 (freenet-migrate 0.8), do not.** This crate pins
+`freenet-stdlib = "=0.8.5"` as a normal dependency, frozen with its bytes, so
+an app on stdlib 0.12 would hold two stdlibs. Use `freenet_migrate::pointer`
+instead (`PointerRecord`, `pointer_params`, `pointer_contract_id`,
+`resolve_app_pointer`); it is the same wire format, pinned against this
+contract by the crate's parity test. The `pointer-record` publisher binary,
+installed with `cargo install`, is unaffected. The dependency below is for apps
+still on stdlib 0.8.
 
 ```toml
 [dependencies]
