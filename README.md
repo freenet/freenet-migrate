@@ -867,8 +867,8 @@ common case, not the rare one — which disabled migration in practice for any
 lineage longer than one generation ([#14]), and a durable completeness
 journal so an app knows when every predecessor has been dealt with ([#37]).
 
-**Published:** `freenet-migrate` **0.7.0**, `freenet-migrate-build` **0.2.0**;
-**0.8.0** (unreleased) is the stdlib 0.12 line.
+**Published:** `freenet-migrate` **0.8.0** (the stdlib 0.12 line) and **0.7.0**
+(the stdlib 0.8 line), `freenet-migrate-build` **0.2.0**.
 The two halves version independently, so an app can take one without the other.
 0.8.x targets stdlib **0.12.x**; 0.7.x targets stdlib **0.8.x**. Pick the line
 matching your app's stdlib (an app cannot link two stdlib versions), and treat
@@ -890,7 +890,7 @@ needs a code change to compile: every known adopter constructs
 `#[non_exhaustive]` enum, and the journal and `probe_verdict` are new API with
 defaults.
 
-**0.8.0** (unreleased) has no code change of its own: it moves the stdlib
+**0.8.0** (published 2026-10-28) has no code change of its own: it moves the stdlib
 requirement from 0.8 to 0.12, which changes the stdlib types in its signatures. See the CHANGELOG for why that is a minor
 bump, why there is no range spanning both, and what stdlib 0.12 changes for an
 app, and [Upgrading to 0.8.0](#upgrading-to-080) for the procedure.

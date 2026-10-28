@@ -264,10 +264,10 @@ predecessor rule is manual-only today — a real hardening). Its "cover every
 
 ## Status
 
-Published: `freenet-migrate` **0.7.0** and `freenet-migrate-build` **0.2.0**.
+Published: `freenet-migrate` **0.8.0** and **0.7.0**, and `freenet-migrate-build` **0.2.0**.
 0.7.0 added `NewestSnapshotWinsContinuePastUnresponsive`, the completeness
 journal, and one behaviour change in the delegate walk (an empty export after
-data was seen is a silence, not a seal). 0.8.0 (unreleased) is the same crate
+data was seen is a silence, not a seal). 0.8.0 (published 2026-10-28) is the same crate
 on stdlib 0.12.
 The two halves version independently. The reusable core machinery + tests,
 **field-validated by River's stdlib 0.6 → 0.8 re-key** (above).

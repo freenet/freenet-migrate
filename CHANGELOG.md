@@ -1,6 +1,6 @@
 # Changelog
 
-## freenet-migrate 0.8.0 (unreleased)
+## freenet-migrate 0.8.0 (2026-10-28)
 
 **Dependency bump only: `freenet-stdlib` 0.8 -> 0.12.** No code change from
 0.7.0 (only doc comments were corrected), so there is no behaviour change. It
